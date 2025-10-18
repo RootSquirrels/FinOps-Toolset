@@ -5639,19 +5639,12 @@ def check_idle_ec2_instances(writer, ec2, cloudwatch,) -> None:
                     "LookbackDays": str(lookback_days),
                 }
 
-                # Use global ACCOUNT_ID
-                owner_id = ""
-                try:
-                    owner_id = str(ACCOUNT_ID)
-                except NameError:
-                    owner_id = ""
-
                 write_resource_to_csv(
                     writer=writer,
                     resource_id=iid,
                     name=name,
                     resource_type="EC2Instance",
-                    owner_id=owner_id,
+                    owner_id=ACCOUNT_ID,
                     state=str(state),
                     creation_date=created_iso,
                     estimated_cost=monthly_compute,  # <= your original monthly compute estimate
