@@ -1593,278 +1593,257 @@ def check_detached_network_interfaces(writer: csv.writer, ec2):
 
 #region EFS CHECK SECTION
 
-@dataclass
-class EFSMetadata:
-    id: str
-    creation_date: str
-    throughput_mode: str
-    provisioned_mibps: float
-    encrypted: bool
-    total_gb: float
-    std_gb: float
-    ia_gb: float
-    archive_gb: float
-    tags: Dict[str, str] = field(default_factory=dict)
-    mount_targets: int = 0
-    lifecycle: List[str] = field(default_factory=list)
-
-@dataclass
-class EFSUtilization:
-    avg_daily_gb: float
-    avg_daily_read_gb: float
-    p95_mibps: float
-    total_series: List[float] = field(default_factory=list)
-    read_series: List[float] = field(default_factory=list)
-    metered_gb_month: float = 0.0
-    min_burst_credits: float = 0.0
-
-def build_metadata(fs: dict, efs_client) -> EFSMetadata:
-    """Extracts metadata (size, throughput, tags, lifecycle, mount targets)."""
-    fs_id = fs.get("FileSystemId", "")
-    creation_time = fs.get("CreationTime")
-    creation_str = creation_time.isoformat() if hasattr(creation_time, "isoformat") else ""
-    throughput_mode = fs.get("ThroughputMode", "") or ""
-    prov_mibps = float(fs.get("ProvisionedThroughputInMibps", 0) or 0.0)
-    encrypted = bool(fs.get("Encrypted", False))
-
-    size_info = fs.get("SizeInBytes", {}) or {}
-    total_gb = round(int(size_info.get("Value", 0) or 0) / (1024**3), 2)
-    std_gb = round(int(size_info.get("ValueInStandard", 0) or 0) / (1024**3), 2)
-    ia_gb = round(int(size_info.get("ValueInIA", 0) or 0) / (1024**3), 2)
-    archive_gb = round(int(size_info.get("ValueInArchive", 0) or 0) / (1024**3), 2)
-
-    # Tags
-    tags = {}
-    try:
-        resource_id = fs.get("FileSystemArn", fs_id)
-        t = efs_client.list_tags_for_resource(ResourceId=resource_id)
-        tags = {kv["Key"]: kv["Value"] for kv in t.get("Tags", [])}
-    except ClientError as e:
-        logging.warning(f"[EFS] list_tags_for_resource failed for {fs_id}: {e.response['Error'].get('Code')}")
-
-    # Mount targets
-    try:
-        mt = efs_client.describe_mount_targets(FileSystemId=fs_id).get("MountTargets", []) or []
-    except ClientError as e:
-        logging.warning(f"[EFS] describe_mount_targets failed for {fs_id}: {e.response['Error'].get('Code')}")
-        mt = []
-
-    # Lifecycle policy → flatten values
-    try:
-        lc = efs_client.describe_lifecycle_configuration(FileSystemId=fs_id).get("LifecyclePolicies", [])
-        lifecycle_policies = [v for p in lc for v in p.values() if v]
-    except ClientError as e:
-        logging.warning(f"[EFS] lifecycle config failed for {fs_id}: {e.response['Error'].get('Code')}")
-        lifecycle_policies = []
-
-    return EFSMetadata(
-        id=fs_id,
-        creation_date=creation_str,
-        throughput_mode=throughput_mode,
-        provisioned_mibps=prov_mibps,
-        encrypted=encrypted,
-        total_gb=total_gb,
-        std_gb=std_gb,
-        ia_gb=ia_gb,
-        archive_gb=archive_gb,
-        tags=tags,
-        mount_targets=len(mt),
-        lifecycle=lifecycle_policies,
-    )
-
-def build_utilization(fs_id: str, cloudwatch_client, start, end, period) -> EFSUtilization:
+def check_unused_efs_filesystems(
+    writer,
+    efs, 
+    cloudwatch,
+) -> None:
     """
-    Collect CloudWatch metrics for an EFS file system and derive utilization statistics.
-
-    This function queries multiple EFS metrics using `get_metric_statistics` and
-    computes derived utilization signals. It is defensive against missing data and
-    CloudWatch errors — failed queries are logged and return an empty list.
-
-    Returns:
-        EFSUtilization dataclass with:
-            - avg_daily_gb: Average GB per day across lookback window
-            - avg_daily_read_gb: Average read GB per day
-            - p95_mibps: 95th percentile throughput in MiB/s
-            - total_series: List of total I/O bytes per day
-            - read_series: List of read I/O bytes per day
-            - metered_gb_month: Monthly metered I/O in GB
-            - min_burst_credits: Minimum burst credits observed
-
-    Error handling:
-        - Each CloudWatch metric query is wrapped in try/except.
-        - On ClientError, logs a warning and returns [] for that series.
-        - BurstCreditBalance fetch is wrapped separately and defaults to 0.0
-          if unavailable.
+    EFS audit using CloudWatch batcher
+    - Batches StorageBytes(Standard/IA) + DataReadIOBytes/DataWriteIOBytes + BurstCreditBalance.
+    - Cost estimate: STANDARD_GB_MONTH + IA_GB_MONTH (+ Provisioned throughput if present).
+    - Writes rows via write_resource_to_csv; returns nothing.
     """
-    def cw_get_series(metric_name: str, stat: str = "Sum") -> list[float]:
-        try:
-            resp = cloudwatch_client.get_metric_statistics(
-                Namespace="AWS/EFS",
-                MetricName=metric_name,
-                Dimensions=[{"Name": "FileSystemId", "Value": fs_id}],
-                StartTime=start,
-                EndTime=end,
-                Period=period,
-                Statistics=[stat],
-            )
-            key = stat
-            dps = sorted(resp.get("Datapoints", []), key=lambda x: x.get("Timestamp", datetime.min))
-            return [float(dp.get(key, 0.0)) for dp in dps]
-        except ClientError as e:
-            logging.warning(f"[EFS] CloudWatch metric {metric_name} failed for {fs_id}: {e}")
-            return []
-
-    metrics = {
-        "total":    cw_get_series("TotalIOBytes", stat="Sum"),
-        "metered":  cw_get_series("MeteredIOBytes", stat="Sum"),
-        "read":     cw_get_series("DataReadIOBytes", stat="Sum"),
-        "write":    cw_get_series("DataWriteIOBytes", stat="Sum"),
-        "metadata": cw_get_series("MetadataIOBytes", stat="Sum"),
-    }
-
-    total_series = metrics["total"] or metrics["metered"]
-    if not total_series:
-        maxlen = max(len(metrics["read"]), len(metrics["write"]), len(metrics["metadata"]), 0)
-        def pad(v): return v + [0.0] * (maxlen - len(v))
-        total_series = [rv + wv + mv for rv, wv, mv in zip(pad(metrics["read"]), pad(metrics["write"]), pad(metrics["metadata"]))]
-
-    total_io_bytes = float(sum(total_series))
-    avg_daily_gb = (total_io_bytes / max(1, len(total_series))) / (1024**3)
-    avg_daily_read_gb = (float(sum(metrics["read"])) / max(1, len(metrics["read"]))) / (1024**3)
-
-    p95_daily_bytes = 0.0
-    if total_series:
-        s = sorted(total_series)
-        idx = int(round(0.95 * (len(s) - 1)))
-        p95_daily_bytes = s[idx]
-    p95_mibps = (p95_daily_bytes / (24 * 3600)) / (1024**2)
-
-    metered_bytes = float(sum(metrics["metered"] or total_series))
-    metered_gb_month = metered_bytes / (1024**3)
-
     try:
-        burst_min_series = cw_get_series("BurstCreditBalance", stat="Minimum")
-        min_burst_credits = min(burst_min_series) if burst_min_series else 0.0
-    except Exception:
-        min_burst_credits = 0.0
+        region = (
+            getattr(getattr(cloudwatch, "meta", None), "region_name", "")
+            or getattr(getattr(efs, "meta", None), "region_name", "")
+            or ""
+        )
 
-    return EFSUtilization(
-        avg_daily_gb=avg_daily_gb,
-        avg_daily_read_gb=avg_daily_read_gb,
-        p95_mibps=p95_mibps,
-        total_series=total_series,
-        read_series=metrics["read"],
-        metered_gb_month=metered_gb_month,
-        min_burst_credits=min_burst_credits
-    )
+        now = datetime.now(timezone.utc)
+        lookback_days = max(1, EFS_LOOKBACK_DAYS)
+        start = now - timedelta(days=lookback_days)
 
-def estimate_efs_cost(metadata: EFSMetadata, utilization: EFSUtilization, region: str) -> float:
-    """Compute monthly cost estimate for storage + provisioned throughput + IO + mount targets (region-aware)."""
-    efs_std     = get_price("EFS", "STANDARD_GB_MONTH")
-    efs_ia      = get_price("EFS", "IA_GB_MONTH")
-    efs_archive = get_price("EFS", "ARCHIVE_GB_MONTH")
-    efs_tput    = get_price("EFS", "PROV_TPUT_MIBPS_MONTH")
-    efs_io_gb   = get_price("EFS", "IO_GB")            
-    mt_hour     = get_price("EFS", "MOUNT_TARGET_HOUR") 
+        # ---------- helpers ----------
+        def _sid(name: str) -> str:
+            s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(name))
+            if not s or not s[0].isalpha():
+                s = "m_" + s
+            return s[:255]
 
-    storage_cost = (
-        metadata.std_gb * efs_std +
-        metadata.ia_gb * efs_ia +
-        metadata.archive_gb * efs_archive
-    )
+        def _tdict(aws_tags):
+            if not aws_tags:
+                return {}
+            return {t.get("Key", ""): t.get("Value", "") for t in aws_tags}
 
-    tput_cost = 0.0
-    if (metadata.throughput_mode or "").lower() == "provisioned" and metadata.provisioned_mibps > 0:
-        tput_cost = metadata.provisioned_mibps * efs_tput
+        # ---------- 1) list file systems ----------
+        filesystems = []
+        marker = None
+        while True:
+            try:
+                args = {"Marker": marker} if marker else {}
+                resp = efs.describe_file_systems(**args)
+            except ClientError as e:
+                logging.error(f"[EFS] describe_file_systems failed in {region}: {e}")
+                break
+            filesystems.extend(resp.get("FileSystems", []) or [])
+            marker = resp.get("NextMarker")
+            if not marker:
+                break
 
-    io_cost = utilization.metered_gb_month * efs_io_gb if efs_io_gb > 0 else 0.0
-    mt_cost = metadata.mount_targets * HOURS_PER_MONTH * mt_hour if mt_hour > 0 else 0.0
+        if not filesystems:
+            return
 
-    return round(storage_cost + tput_cost + io_cost + mt_cost, 2)
+        # ---------- 2) per-FS metadata (tags + lifecycle config) ----------
+        metas = []
+        for fs in filesystems:
+            try:
+                fsid = fs.get("FileSystemId", "")
+                arn  = fs.get("FileSystemArn", fsid)
+                created = fs.get("CreationTime")
+                if isinstance(created, datetime) and created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
 
-@retry_with_backoff()
-def check_unused_efs_filesystems(writer: csv.writer, efs, cloudwatch):
-    try:
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=EFS_LOOKBACK_DAYS)
-        period = 86400  # daily buckets
-
-        region = getattr(getattr(efs, "meta", None), "region_name", "") or ""
-        paginator = efs.get_paginator("describe_file_systems")
-        for page in paginator.paginate():
-            for fs in page.get("FileSystems", []):
+                # tags
                 try:
-                    metadata = build_metadata(fs, efs)
-                    utilization = build_utilization(metadata.id, cloudwatch, start, end, period)
-                    estimated_cost = estimate_efs_cost(metadata, utilization, region)
+                    tags = _tdict(efs.describe_tags(FileSystemId=fsid).get("Tags", []))
+                except ClientError:
+                    tags = {}
+                except Exception:
+                    tags = {}
 
-                    flags: list[str] = []
+                # lifecycle policies (to IA/Archive)
+                lifecycle = []
+                try:
+                    lc = efs.describe_lifecycle_configuration(FileSystemId=fsid)
+                    lifecycle = lc.get("LifecyclePolicies", []) or []
+                except ClientError:
+                    lifecycle = []
+                except Exception:
+                    lifecycle = []
 
-                    # existing flags
-                    if metadata.ia_gb == 0 and metadata.std_gb > 0:
-                        flags.append("OnlyStandardStorage")
+                # throughput mode/provisioned throughput
+                tput_mode = (fs.get("ThroughputMode") or "").lower()  # bursting | provisioned | elastic
+                prov_mibps = float(fs.get("ProvisionedThroughputInMibps") or 0.0)
 
-                    if metadata.std_gb >= EFS_STANDARD_THRESHOLD_GB and not metadata.lifecycle:
-                        flags.append("NoLifecycleToIA")
+                metas.append({
+                    "fsid": fsid,
+                    "arn": arn,
+                    "created": created,
+                    "tags": tags,
+                    "name": tags.get("Name", fsid),
+                    "performance_mode": fs.get("PerformanceMode", ""),
+                    "tput_mode": tput_mode,
+                    "prov_mibps": prov_mibps,
+                    "lifecycle": lifecycle,   # [{'TransitionToIA': 'AFTER_30_DAYS'}, {'TransitionToArchive': 'AFTER_90_DAYS'}, ...]
+                })
+            except Exception as e:
+                logging.warning(f"[EFS] meta failed for {fs.get('FileSystemId','?')} in {region}: {e}")
 
-                    has_archive = any("ARCHIVE" in x.upper() for x in (metadata.lifecycle or []))
-                    if metadata.std_gb >= EFS_STANDARD_ARCHIVE_THRESHOLD_GB and not has_archive:
-                        flags.append("NoLifecycleToArchive")
+        if not metas:
+            return
 
-                    if metadata.mount_targets == 0:
-                        flags.append("UnusedEFS")
+        # ---------- 3) batch CW metrics (use passed CW client) ----------
+        PERIOD_STORAGE = 86400  # daily for StorageBytes
+        PERIOD_IO      = 3600   # hourly for IO/BurstCredit (sum across window)
+        batch = cw.CloudWatchBatcher(region, client=cloudwatch)
 
-                    if metadata.mount_targets > 0 and utilization.avg_daily_gb < EFS_IDLE_THRESHOLD_GB_PER_DAY:
-                        flags.append("IdleEFS")
+        for m in metas:
+            fsid = m["fsid"]
+            sid = _sid(fsid)
+            dims_std = [{"Name": "FileSystemId", "Value": fsid}, {"Name": "StorageClass", "Value": "Standard"}]
+            dims_ia  = [{"Name": "FileSystemId", "Value": fsid}, {"Name": "StorageClass", "Value": "InfrequentAccess"}]
+            dims_fs  = [{"Name": "FileSystemId", "Value": fsid}]
 
-                    if metadata.mount_targets >= 3 and utilization.avg_daily_gb < max(1.0, 0.01 * metadata.total_gb):
-                        flags.append("TooManyMountTargets")
+            # Storage
+            batch.add(cw.MDQ(id=f"efs_std_bytes__{sid}", namespace="AWS/EFS", metric="StorageBytes", dims=dims_std, stat="Average", period=PERIOD_STORAGE))
+            batch.add(cw.MDQ(id=f"efs_ia_bytes__{sid}",  namespace="AWS/EFS", metric="StorageBytes", dims=dims_ia,  stat="Average", period=PERIOD_STORAGE))
 
-                    # Provisioned right-sizing vs Elastic & overage
-                    mode = (metadata.throughput_mode or "").lower()
-                    if mode == "provisioned" and metadata.provisioned_mibps > 0:
-                        prov_monthly = metadata.provisioned_mibps * get_price("EFS","PROV_TPUT_MIBPS_MONTH")
-                        elastic_like = utilization.metered_gb_month * get_price("EFS","IO_GB")
-                        if elastic_like > 0 and elastic_like < 0.7 * prov_monthly:
-                            flags.append(f"ElasticBetterThanProvisioned(estElastic≈{elastic_like:.2f}$ < prov≈{prov_monthly:.2f}$)")
-                        if utilization.metered_gb_month > 0 and get_price("EFS","IO_GB") > 0:
-                            flags.append("ProvisionedOverageIO")
+            # IO bytes (sum over lookback)
+            batch.add(cw.MDQ(id=f"efs_read__{sid}",  namespace="AWS/EFS", metric="DataReadIOBytes",  dims=dims_fs, stat="Sum", period=PERIOD_IO))
+            batch.add(cw.MDQ(id=f"efs_write__{sid}", namespace="AWS/EFS", metric="DataWriteIOBytes", dims=dims_fs, stat="Sum", period=PERIOD_IO))
 
-                    # Bursting hint (avoid future throttling surprises)
-                    if mode == "bursting" and utilization.min_burst_credits < EFS_BURST_CREDIT_LOW_WATERMARK:
-                        flags.append("LowBurstCredits(consider Elastic or Provisioned)")
+            # Burst credits (latest)
+            batch.add(cw.MDQ(id=f"efs_burst__{sid}", namespace="AWS/EFS", metric="BurstCreditBalance", dims=dims_fs, stat="Average", period=PERIOD_IO))
 
-                    if not metadata.encrypted:
-                        flags.append("NotEncrypted")
+        try:
+            series = batch.execute(start, now, scan_by="TimestampDescending")
+        except Exception as e:
+            logging.exception(f"[EFS] CloudWatch batch execute failed in {region}: {e}")
+            series = {}
 
-                    if flags or estimated_cost > 0:
-                        write_resource_to_csv(
-                            writer=writer,
-                            resource_id=metadata.id,
-                            name=metadata.tags.get("Name", ""),
-                            owner_id=ACCOUNT_ID,
-                            resource_type="EFS",
-                            creation_date=metadata.creation_date,
-                            storage_gb=metadata.total_gb,
-                            estimated_cost=estimated_cost,
-                            app_id=metadata.tags.get("ApplicationID", "NULL"),
-                            app=metadata.tags.get("Application", "NULL"),
-                            env=metadata.tags.get("Environment", "NULL"),
-                            flags=flags
-                        )
+        # ---------- 4) pricing ----------
+        try:
+            p_std = get_price("EFS", "STANDARD_GB_MONTH")
+        except Exception:
+            p_std = 0.25
+        try:
+            p_ia = get_price("EFS", "IA_GB_MONTH")
+        except Exception:
+            p_ia = 0.025
+        try:
+            p_prov = get_price("EFS", "PROV_TPUT_MIBPS_MONTH")
+        except Exception:
+            p_prov = 6.0
+        # IO/Arch/MT prices exist in your pricebook but are not used here to avoid regressions
 
-                    logging.info(
-                        f"[EFS] {metadata.id} size={metadata.total_gb}GB std={metadata.std_gb}GB ia={metadata.ia_gb}GB "
-                        f"arch={metadata.archive_gb}GB mode={metadata.throughput_mode} prov={metadata.provisioned_mibps}MiBps "
-                        f"avgGBd≈{utilization.avg_daily_gb:.3f} readGBd≈{utilization.avg_daily_read_gb:.3f} "
-                        f"p95MiBps≈{utilization.p95_mibps:.2f} meteredGB≈{utilization.metered_gb_month:.2f} "
-                        f"mTargets={metadata.mount_targets} flags={flags} cost≈{estimated_cost}$"
-                    )
+        # ---------- 5) emit rows ----------
+        for m in metas:
+            try:
+                fsid = m["fsid"]
+                sid  = _sid(fsid)
 
-                except Exception as e:
-                    logging.error(f"[check_unused_efs_filesystems] error on fs {fs.get('FileSystemId','?')}: {e}")
+                created = m["created"] or now
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                created_iso = created.astimezone(timezone.utc).isoformat()
+
+                # latest storage (GB)
+                std_bytes = cw.CloudWatchBatcher.latest(series.get(f"efs_std_bytes__{sid}", []), 0.0)
+                ia_bytes  = cw.CloudWatchBatcher.latest(series.get(f"efs_ia_bytes__{sid}",  []), 0.0)
+                std_gb = round(float(std_bytes) / (1024.0 ** 3), 3)
+                ia_gb  = round(float(ia_bytes)  / (1024.0 ** 3), 3)
+
+                # IO sums over window (GB/day)
+                read_sum  = float(sum(v for _, v in series.get(f"efs_read__{sid}", [])))
+                write_sum = float(sum(v for _, v in series.get(f"efs_write__{sid}", [])))
+                total_io_gb = (read_sum + write_sum) / (1024.0 ** 3)
+                avg_io_gb_per_day = total_io_gb / float(lookback_days) if lookback_days > 0 else 0.0
+
+                # Burst credits (latest)
+                burst_latest = cw.CloudWatchBatcher.latest(series.get(f"efs_burst__{sid}", []), 0.0)
+
+                # cost estimate (storage + provisioned throughput if any)
+                est_monthly = round(std_gb * p_std + ia_gb * p_ia, 2)
+                if m["tput_mode"] == "provisioned" and m["prov_mibps"] > 0:
+                    est_monthly = round(est_monthly + (m["prov_mibps"] * p_prov), 2)
+
+                # flags (conservative, no destructive claims)
+                flags: List[str] = []
+                missing = [k for k in REQUIRED_TAG_KEYS if not m["tags"].get(k)]
+                if missing:
+                    flags.append(f"MissingRequiredTags={','.join(missing)}")
+
+                # Lifecycle recommendation to IA when large & low daily reads
+                has_ia_policy = any("TransitionToIA" in d for d in (m["lifecycle"] or []))
+                if std_gb >= EFS_IA_LARGE_THRESHOLD_GB and avg_io_gb_per_day <= EFS_IA_READS_HIGH_GB_PER_DAY and not has_ia_policy:
+                    flags.append("efs_lifecycle_to_ia_recommended")
+
+                # Idle-ish FS (very low IO/day)
+                if avg_io_gb_per_day <= EFS_IDLE_THRESHOLD_GB_PER_DAY:
+                    flags.append("efs_low_io")
+
+                # Low burst credits
+                try:
+                    if burst_latest > 0 and burst_latest <= float(EFS_BURST_CREDIT_LOW_WATERMARK):
+                        flags.append("efs_burst_credits_low")
+                except Exception:
+                    pass
+
+                # potential saving (heuristic similar to S3: move 70% of std to IA)
+                potential = None
+                if "efs_lifecycle_to_ia_recommended" in flags:
+                    delta = max(0.0, p_std - p_ia)
+                    potential = round(std_gb * 0.7 * delta, 2)
+
+                # signals
+                signals = {
+                    "Region": region,
+                    "PerfMode": m.get("performance_mode", ""),
+                    "ThroughputMode": m["tput_mode"],
+                    "ProvisionedMiBps": f"{m['prov_mibps']:.2f}",
+                    "LifecyclePolicies": ",".join(sorted({list(p.keys())[0] for p in (m['lifecycle'] or [])})) if m["lifecycle"] else "",
+                    "StorageStandardGB": f"{std_gb:.3f}",
+                    "StorageIAGB": f"{ia_gb:.3f}",
+                    f"AvgIOGBPerDay{lookback_days}d": f"{avg_io_gb_per_day:.4f}",
+                    "BurstCreditBalance": f"{burst_latest:.0f}",
+                    "LookbackDays": str(lookback_days),
+                }
+
+                # owner/account
+                try:
+                    owner_id = str(ACCOUNT_ID)
+                except NameError:
+                    owner_id = ""
+
+                write_resource_to_csv(
+                    writer=writer,
+                    resource_id=m["arn"] or fsid,
+                    name=m["name"],
+                    resource_type="EFS",
+                    owner_id=owner_id,
+                    state="",  # EFS doesn't expose a simple 'state' here
+                    creation_date=created_iso,
+                    storage_gb=round(std_gb + ia_gb, 3),
+                    estimated_cost=est_monthly,
+                    app_id=m["tags"].get("ApplicationID", "NULL"),
+                    app=m["tags"].get("Application", "NULL"),
+                    env=m["tags"].get("Environment", "NULL"),
+                    referenced_in="",
+                    flags=flags,
+                    object_count="",    # n/a
+                    potential_saving=potential,
+                    confidence=None,    # no auto-delete here
+                    signals=signals,
+                )
+            except Exception as e:
+                logging.exception(f"[EFS] emit failed for {m.get('fsid','?')} in {region}: {e}")
+
     except Exception as e:
-        logging.error(f"[check_unused_efs_filesystems] fatal error: {e}")
+        logging.exception(f"[EFS] check_efs_filesystems_refactored failed: {e}")
+        return
+
 
 #endregion --- END EFS SECTION ----------------------------------------------------------
 
@@ -5806,7 +5785,7 @@ def check_kms_customer_managed_keys(writer: csv.writer, cloudtrail, kms, lookbac
 
 #region CloudFront SECTION
 
-def check_cloudfront_distributions_refactored(
+def check_cloudfront_idle_distributions(
     writer,
     cloudfront,
     cloudwatch,
@@ -5956,8 +5935,9 @@ def check_cloudfront_distributions_refactored(
                 if uses_dedicated_ip:
                     # Dedicated-IP custom SSL carries ~$600/mo even if idle; SNI has $0 base fee.
                     flags.append("UsesDedicatedIPCustomSSL")
-                    potential = 600
                     est_monthly = 600
+                    if is_idle:
+                        potential = 600
 
                 confidence = 100 if is_idle else None
 
