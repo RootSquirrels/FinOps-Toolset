@@ -6262,7 +6262,7 @@ def main():
                 check_private_certificate_authorities, writer)
 
                 run_check(profiler=profiler, check_name="check_kms_customer_managed_keys", region=region,
-                fn=check_kms_customer_managed_keys, writer=writer, cloudtrail=clients["cloudtrail"], kms=clients["kms"])
+                fn=check_kms_customer_managed_keys, writer=writer, cloudtrail=clients['cloudtrail'], kms=clients['kms'])
 
 
         profiler.dump_csv()
