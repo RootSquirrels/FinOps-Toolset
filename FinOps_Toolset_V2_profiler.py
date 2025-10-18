@@ -1752,7 +1752,7 @@ def check_unused_efs_filesystems(
                 avg_io_gb_per_day = total_io_gb / float(lookback_days) if lookback_days > 0 else 0.0
 
                 # Burst credits (latest)
-                burst_latest = cw.CloudWatchBatcher.latest(series.get(f"efs_burst__{sid}", []), 0.0)
+                burst_latest = cw.CloudWatchBatcher.latest(series.get(f"efs_burst__{fsid}", []), 0.0)
 
                 # cost estimate (storage + provisioned throughput if any)
                 est_monthly = round(std_gb * p_std + ia_gb * p_ia, 2)
@@ -1917,375 +1917,235 @@ def check_lb_cross_az(elbv2, lb: LoadBalancerMetadata) -> List[str]:
     return []
 
 
-@retry_with_backoff()
 def check_idle_load_balancers(
-    writer: csv.writer,
-    elbv2=None,           # ELBv2 client (ALB/NLB)
-    elb=None,             # Classic ELB client (optional)
-    cloudwatch=None,      
-    cw=None,
-    lookback_days: Optional[int] = None,
-    **_ignored_kwargs
+    writer,
+    elbv2,       # boto3.client('elbv2') for THIS region (orchestrator-provided)
+    cloudwatch,  # boto3.client('cloudwatch') for THIS region (orchestrator-provided)
 ) -> None:
     """
-    Extended ELB check that writes one CSV row per LB:
-      • ALB/NLB: monthly_base + monthly_LCU (from ConsumedLCUs)
-      • Classic: monthly_base only (no LCU; data-processed not included)
-
-    Back-compat: accepts cw/cloudwatch and elb/elbv2, and auto-creates clients if missing.
+    LB checker using CloudWatch batcher with cross-AZ transfer detection.
+    - Supports both ALB and NLB.
+    - Adds per-AZ ProcessedBytes to detect skew when cross-zone is enabled.
+    - Appends flags: 'cross_az_transfer_high', 'disable_cross_zone_candidate' (conservative).
+    - Estimated cost is not asserted here (to avoid pricing regressions). Potential saving is provided for cross-AZ only.
     """
+    try:
+        region = (
+            getattr(getattr(cloudwatch, "meta", None), "region_name", "")
+            or getattr(getattr(elbv2, "meta", None), "region_name", "")
+            or ""
+        )
 
-    cloudwatch = cloudwatch or cw
-    # If only a Classic client was given as 'elb', keep it; we may still need elbv2 (create lazily)
-    if elbv2 is None and boto3 is not None:
-        try:
-            elbv2 = boto3.client("elbv2")
-        except Exception:
-            elbv2 = None
-    if cloudwatch is None and boto3 is not None:
-        try:
-            cloudwatch = boto3.client("cloudwatch")
-        except Exception:
-            cloudwatch = None
+        now = datetime.now(timezone.utc)
+        lookback_days = max(1, LOAD_BALANCER_LOOKBACK_DAYS)  # from config.py
+        start = now - timedelta(days=lookback_days)
+        PERIOD = 300  # 5 min granularity is reasonable for ELB metrics
 
-    if cloudwatch is None:
-        logging.error("[check_idle_load_balancers] CloudWatch client missing")
+        # ---------- 1) list LBs (ALB + NLB) ----------
+        load_balancers = []
+        marker = None
+        while True:
+            try:
+                kwargs = {"Marker": marker} if marker else {}
+                resp = elbv2.describe_load_balancers(**kwargs)
+            except ClientError as e:
+                logging.error(f"[ELB] describe_load_balancers failed in {region}: {e}")
+                break
+            load_balancers.extend(resp.get("LoadBalancers", []) or [])
+            marker = resp.get("NextMarker")
+            if not marker:
+                break
+
+        if not load_balancers:
+            return
+
+        # ---------- 2) tags ----------
+        arn_to_tags: Dict[str, Dict[str, str]] = {}
+        try:
+            # elbv2.describe_tags supports up to 20 arns per call
+            for i in range(0, len(load_balancers), 20):
+                chunk = load_balancers[i:i+20]
+                arns = [lb["LoadBalancerArn"] for lb in chunk]
+                try:
+                    tresp = elbv2.describe_tags(ResourceArns=arns) or {}
+                    for td in (tresp.get("TagDescriptions") or []):
+                        tmap = {t.get("Key",""): t.get("Value","") for t in (td.get("Tags") or [])}
+                        arn_to_tags[td.get("ResourceArn","")] = tmap
+                except ClientError:
+                    for a in arns:
+                        arn_to_tags[a] = {}
+        except Exception:
+            pass
+
+        # ---------- 3) attributes (for cross-zone) ----------
+        lb_attrs: Dict[str, Dict[str, str]] = {}
+        for lb in load_balancers:
+            arn = lb["LoadBalancerArn"]
+            try:
+                aresp = elbv2.describe_load_balancer_attributes(LoadBalancerArn=arn)
+                lb_attrs[arn] = {kv["Key"]: kv["Value"] for kv in (aresp.get("Attributes") or [])}
+            except ClientError:
+                lb_attrs[arn] = {}
+            except Exception:
+                lb_attrs[arn] = {}
+
+        # ---------- 4) batch CloudWatch metrics ----------
+        batch = cw.CloudWatchBatcher(region, client=cloudwatch)
+
+        for lb in load_balancers:
+            arn = lb["LoadBalancerArn"]
+            lb_id = arn.split("/", 1)[-1]  # CW dimension value
+            lb_type = (lb.get("Type") or "").lower()  # 'application' | 'network' | 'gateway'
+
+            if lb_type not in ("application", "network"):
+                continue  # skip GWLB here
+
+            namespace = "AWS/ApplicationELB" if lb_type == "application" else "AWS/NetworkELB"
+
+            # Total processed bytes for idle heuristics & magnitude
+            dims_lb = [{"Name": "LoadBalancer", "Value": lb_id}]
+            batch.add_q(id_hint=f"lb_bytes__{lb_id}", namespace=namespace, metric="ProcessedBytes",
+                        dims=dims_lb, stat="Sum", period=PERIOD)
+
+            # Requests (ALB only) — harmless to skip for NLB
+            if lb_type == "application":
+                batch.add_q(id_hint=f"alb_req__{lb_id}", namespace="AWS/ApplicationELB",
+                            metric="RequestCount", dims=dims_lb, stat="Sum", period=PERIOD)
+
+            # Per-AZ ProcessedBytes for skew & cross-zone analysis
+            az_list = [az.get("ZoneName") for az in (lb.get("AvailabilityZones") or []) if az.get("ZoneName")]
+            for az in az_list:
+                dims_az = [{"Name": "LoadBalancer", "Value": lb_id}, {"Name": "AvailabilityZone", "Value": az}]
+                batch.add_q(id_hint=f"lb_bytes_az__{lb_id}__{az}", namespace=namespace,
+                            metric="ProcessedBytes", dims=dims_az, stat="Sum", period=PERIOD)
+
+        try:
+            series = batch.execute(start, now, scan_by="TimestampDescending")
+        except Exception as e:
+            logging.exception(f"[ELB] CloudWatch batch execute failed in {region}: {e}")
+            series = {}
+
+        # ---------- 5) pricing (optional, only for cross-AZ potential) ----------
+        try:
+            inter_az_price = get_price("NETWORK", "INTER_AZ_GB", region, None)
+        except Exception:
+            inter_az_price = None
+        if inter_az_price is None:
+            try:
+                inter_az_price = get_price("NETWORK", "INTER_REGION_GB", region, 0.0)
+            except Exception:
+                inter_az_price = 0.0
+
+        # ---------- 6) emit rows ----------
+        for lb in load_balancers:
+            try:
+                arn = lb["LoadBalancerArn"]
+                lb_id = arn.split("/", 1)[-1]
+                lb_name = lb.get("LoadBalancerName", lb_id)
+                lb_type = (lb.get("Type") or "").lower()
+                if lb_type not in ("application", "network"):
+                    continue
+
+                namespace = "AWS/ApplicationELB" if lb_type == "application" else "AWS/NetworkELB"
+                state = (lb.get("State") or {}).get("Code", "")
+                created = lb.get("CreatedTime") or now
+                if hasattr(created, "tzinfo") and created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                created_iso = created.astimezone(timezone.utc).isoformat()
+
+                tags = arn_to_tags.get(arn, {})
+                name = tags.get("Name", lb_name)
+
+                # Aggregate totals
+                total_bytes = float(sum(v for _, v in series.get(f"lb_bytes__{lb_id}", [])))
+                total_gb = total_bytes / (1024.0 ** 3)
+
+                req_sum = 0.0
+                if lb_type == "application":
+                    req_sum = float(sum(v for _, v in series.get(f"alb_req__{lb_id}", [])))
+
+                # Flags & signals
+                flags: List[str] = []
+                missing = [k for k in REQUIRED_TAG_KEYS if not tags.get(k)]
+                if missing:
+                    flags.append(f"MissingRequiredTags={','.join(missing)}")
+
+                # Extremely conservative idle indicator (no thresholds from config -> zero-traffic only)
+                is_idle = (total_bytes == 0.0) and ((req_sum == 0.0) if lb_type == "application" else True) and state.lower() == "active"
+                if is_idle:
+                    flags += ["idle_load_balancer_candidate", "confidence=100"]
+                    confidence = 100
+                    potential_saving = None  # we do not assert LB pricing here
+                else:
+                    confidence = None
+                    potential_saving = None
+
+                # Cross-zone analysis
+                attrs = lb_attrs.get(arn, {})
+                cross_zone = (
+                    str(attrs.get("load_balancing.cross_zone.enabled", "false")).lower() == "true"
+                    or str(attrs.get("routing.cross-zone.enabled", "false")).lower() == "true"
+                )
+
+                az_list = [az.get("ZoneName") for az in (lb.get("AvailabilityZones") or []) if az.get("ZoneName")]
+                az_bytes = []
+                for az in az_list:
+                    sid = f"lb_bytes_az__{lb_id}__{az}"
+                    az_sum = float(sum(v for _, v in series.get(sid, [])))
+                    az_bytes.append((az, az_sum))
+
+                worst = float(max((b for _, b in az_bytes), default=0.0))
+                skew = (worst / total_bytes) if total_bytes > 0 else 0.0
+
+                if cross_zone and total_bytes > 0 and skew >= 0.70:
+                    flags.append("cross_az_transfer_high")
+                    flags.append("disable_cross_zone_candidate")
+                    # Potential saving (conservative): (skew-0.5) fraction of bytes as avoidable cross-AZ
+                    avoidable_gb = max(0.0, (skew - 0.5)) * total_gb
+                    potential_xaz = round(avoidable_gb * float(inter_az_price), 2) if inter_az_price > 0 else None
+                    if potential_xaz:
+                        potential_saving = (potential_saving or 0.0) + potential_xaz
+                        potential_saving = round(potential_saving, 2)
+
+                # Signals (compact)
+                signals = {
+                    "Region": region,
+                    "Type": lb_type,
+                    "CrossZone": str(cross_zone).lower(),
+                    "AZSkew": f"{skew:.3f}",
+                    f"BytesGB{lookback_days}d": f"{total_gb:.3f}",
+                }
+                if lb_type == "application":
+                    signals[f"Requests{lookback_days}d"] = f"{int(req_sum)}"
+
+                # Estimated cost left unchanged here to avoid regression; keep as blank string
+                write_resource_to_csv(
+                    writer=writer,
+                    resource_id=arn,
+                    name=name,
+                    resource_type="ALB" if lb_type == "application" else "NLB",
+                    owner_id=ACCOUNT_ID,
+                    state=state,
+                    creation_date=created_iso,
+                    storage_gb="",                 # n/a
+                    estimated_cost="",             # avoid pricing regression
+                    app_id=tags.get("ApplicationID", "NULL"),
+                    app=tags.get("Application", "NULL"),
+                    env=tags.get("Environment", "NULL"),
+                    referenced_in="",
+                    flags=flags,
+                    object_count="",               # n/a
+                    potential_saving=potential_saving,
+                    confidence=confidence,
+                    signals=signals,
+                )
+
+            except Exception as e:
+                logging.exception(f"[ELB] emit failed for {lb.get('LoadBalancerName','?')} in {region}: {e}")
+
+    except Exception as e:
+        logging.exception(f"[ELB] check_idle_load_balancers_refactored failed: {e}")
         return
-
-    # ----- Config fallbacks -----
-    HOURS_PER_MONTH = globals().get("HOURS_PER_MONTH", 730)
-    LB_LOW_TRAFFIC_GB = globals().get("LOAD_BALANCER_LOW_TRAFFIC_GB", 1.0)
-    lb_lookback_days = lookback_days if lookback_days is not None else globals().get("LOAD_BALANCER_LOOKBACK_DAYS", 60)
-
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=lb_lookback_days)
-    PERIOD = 3600
-
-    # Region for pricing resolution
-    region = (
-        getattr(getattr(cloudwatch, "meta", None), "region_name", "")
-        or getattr(getattr(elbv2, "meta", None), "region_name", "")
-        or getattr(getattr(elb, "meta", None), "region_name", "")
-        or ""
-    )
-
-    # ---------- Pricing pulled from PRICING dict ----------
-    alb_hour      = get_price("ALB", "HOUR", region=region)              # $/hour
-    alb_lcu_hour  = get_price("ALB", "LCU_HOUR", region=region)          # $/LCU-hour
-    nlb_hour      = get_price("NLB", "HOUR", region=region)              # $/hour
-    nlb_nlcu_hour = get_price("NLB", "NLCU_HOUR", region=region)         # $/NLCU-hour
-    clb_hour      = get_price("CLB", "HOUR", region=region)              # $/hour
-
-    monthly_alb_base = alb_hour * HOURS_PER_MONTH
-    monthly_nlb_base = nlb_hour * HOURS_PER_MONTH
-    monthly_clb_base = clb_hour * HOURS_PER_MONTH
-
-    # ---------- Enumerate LBs ----------
-    alb_nlb_list: List[dict] = []
-    clb_list: List[dict] = []
-
-    # ELBv2 (ALB/NLB)
-    if elbv2 is not None:
-        try:
-            p = elbv2.get_paginator("describe_load_balancers")
-            for page in p.paginate():
-                for lb in page.get("LoadBalancers", []) or []:
-                    if lb.get("Type") in ("application", "network"):
-                        alb_nlb_list.append(lb)
-        except Exception as e:
-            logging.warning("[check_idle_load_balancers] ELBv2 enumeration failed: %s", e)
-
-    # Classic ELB
-    if elb is None and boto3 is not None:
-        try:
-            elb = boto3.client("elb", region_name=region or None)
-        except Exception:
-            elb = None
-
-    if elb is not None:
-        try:
-            p = elb.get_paginator("describe_load_balancers")
-            for page in p.paginate():
-                for d in page.get("LoadBalancerDescriptions", []) or []:
-                    clb_list.append(d)  # has 'LoadBalancerName', 'DNSName', etc.
-        except Exception as e:
-            logging.warning("[check_idle_load_balancers] Classic ELB enumeration failed: %s", e)
-
-    logging.info("[check_idle_load_balancers] Found %d ALB/NLB and %d Classic ELB", len(alb_nlb_list), len(clb_list))
-
-    # ---------- Build CloudWatch GetMetricData ----------
-    mdqs: List[dict] = []
-
-    def alb_nlb_dim_value(lb_arn: str) -> str:
-        return lb_arn.split("loadbalancer/")[1]
-
-    for lb in alb_nlb_list:
-        lb_arn = lb["LoadBalancerArn"]
-        lb_type = lb["Type"]
-        dim = [{"Name": "LoadBalancer", "Value": alb_nlb_dim_value(lb_arn)}]
-
-        if lb_type == "application":
-            mdqs.append(build_mdq(
-                id_hint=f"alb_{lb_arn}_ConsumedLCUs_Sum",
-                namespace="AWS/ApplicationELB",
-                metric="ConsumedLCUs",
-                dims=[{"Name": "LoadBalancer", "Value": alb_nlb_dim_value(lb_arn)}],
-                stat="Sum",
-                period=PERIOD
-            ))
-            # signals
-            for metric, stat in (
-                ("NewConnectionCount", "Sum"),
-                ("ActiveConnectionCount", "Sum"),
-                ("ProcessedBytes", "Sum"),
-                ("RuleEvaluations", "Sum"),
-                ("RequestCount", "Sum"),
-            ):
-                mdqs.append(build_mdq(
-                    id_hint=f"alb_{lb_arn}_{metric}_{stat}",
-                    namespace="AWS/ApplicationELB",
-                    metric=metric,
-                    dims=[{"Name": "LoadBalancer", "Value": alb_nlb_dim_value(lb_arn)}],
-                    stat=stat,
-                    period=PERIOD
-                ))
-
-        else:  # network
-            # billing metric
-            mdqs.append(build_mdq(
-                id_hint=f"nlb_{lb_arn}_ConsumedLCUs_Sum",
-                namespace="AWS/NetworkELB",
-                metric="ConsumedLCUs",
-                dims=[{"Name": "LoadBalancer", "Value": alb_nlb_dim_value(lb_arn)}],
-                stat="Sum",
-                period=PERIOD
-            ))
-            # signals
-            for metric, stat in (
-                ("NewFlowCount", "Sum"),
-                ("ActiveFlowCount", "Maximum"),
-                ("ProcessedBytes", "Sum"),
-            ):
-                mdqs.append(build_mdq(
-                    id_hint=f"nlb_{lb_arn}_{metric}_{stat}",
-                    namespace="AWS/NetworkELB",
-                    metric=metric,
-                    dims=[{"Name": "LoadBalancer", "Value": alb_nlb_dim_value(lb_arn)}],
-                    stat=stat,
-                    period=PERIOD
-                ))
-
-    # Classic ELB metrics (no LCU; use RequestCount to drive idle heuristics)
-    for d in clb_list:
-        name = d.get("LoadBalancerName")
-        dim = [{"Name": "LoadBalancerName", "Value": name}]
-        # RequestCount (Sum) & Latency (Average) are common signals for CLB
-        mdqs.append(build_mdq(
-            id_hint=f"clb_{name}_RequestCount_Sum",
-            namespace="AWS/ELB",
-            metric="RequestCount",
-            dims=[{"Name": "LoadBalancerName", "Value": name}],
-            stat="Sum",
-            period=PERIOD
-        ))
-        mdqs.append(build_mdq(
-            id_hint=f"clb_{name}_Latency_Average",
-            namespace="AWS/ELB",
-            metric="Latency",
-            dims=[{"Name": "LoadBalancerName", "Value": name}],
-            stat="Average",
-            period=PERIOD
-        ))
-
-    md = cw_get_metric_data_bulk(cloudwatch, mdqs, start, end, scan_by="TimestampAscending")
-
-    def values(qid: str) -> List[float]:
-        return [v for _, v in md.get(_cw_id_safe(qid), [])]
-
-    # ---------- Emit rows: ALB/NLB ----------
-    for lb in alb_nlb_list:
-        lb_arn = lb["LoadBalancerArn"]
-        lb_name = lb["LoadBalancerName"]
-        lb_type = lb["Type"]  # 'application' | 'network'
-
-        tags = {}
-        try:
-            tag_desc = elbv2.describe_tags(ResourceArns=[lb_arn]).get("TagDescriptions", [])
-            for td in tag_desc:
-                if td.get("ResourceArn") == lb_arn:
-                    tags = {t["Key"]: t["Value"] for t in (td.get("Tags") or [])}
-                    break
-        except Exception:
-            pass
-
-        if lb_type == "application":
-            lcu_series = values(f"alb_{lb_arn}_ConsumedLCUs_Sum")
-            avg_lcu_per_hour = (sum(lcu_series) / max(1, len(lcu_series))) if lcu_series else 0.0
-
-            new_conn  = float(sum(values(f"alb_{lb_arn}_NewConnectionCount_Sum")))
-            act_conn  = float(sum(values(f"alb_{lb_arn}_ActiveConnectionCount_Sum")))
-            bytes_sum = float(sum(values(f"alb_{lb_arn}_ProcessedBytes_Sum")))
-            rules_sum = float(sum(values(f"alb_{lb_arn}_RuleEvaluations_Sum")))
-            req_sum   = float(sum(values(f"alb_{lb_arn}_RequestCount_Sum")))
-
-            monthly_base = monthly_alb_base
-            monthly_lcu  = alb_lcu_hour * (avg_lcu_per_hour * HOURS_PER_MONTH)
-            est_monthly  = round(monthly_base + monthly_lcu, 2)
-
-            traffic_gb = bytes_sum / (1024 ** 3)
-
-            signals_payload = [
-                ("Region", region),
-                ("Type", "ALB"),
-                ("AvgLCU_per_hour", round(avg_lcu_per_hour, 4)),
-                ("TrafficGB", round(traffic_gb, 2)),
-                ("RequestCount", int(req_sum)),
-                ("NewConnections", int(new_conn)),
-                ("ActiveConnections(sum)", int(act_conn)),
-                ("RuleEvaluations", int(rules_sum)),
-                ("LookbackDays", lb_lookback_days),
-                ("HourRate", round(alb_hour, 5)),
-                ("LCUHourRate", round(alb_lcu_hour, 5)),
-            ]
-
-            flags: List[str] = []
-            if req_sum == 0 and traffic_gb < 0.01 and avg_lcu_per_hour == 0.0:
-                flags.append("ZeroTraffic")
-            elif traffic_gb < LB_LOW_TRAFFIC_GB:
-                flags.append("LowTrafficLB")
-            if not all(tags.get(k) for k in REQUIRED_TAG_KEYS):
-                flags.append("MissingRequiredTags")
-
-            confidence = score_confidence({
-                "traffic_low": pct_to_signal(traffic_gb, LB_LOW_TRAFFIC_GB),
-                "req_zero": 1.0 if req_sum == 0 else 0.0,
-                "lcu_zero": 1.0 if avg_lcu_per_hour == 0 else 0.0,
-            })
-
-        else:  # NLB
-            nlcu_series = values(f"nlb_{lb_arn}_ConsumedLCUs_Sum")
-            avg_nlcu_per_hour = (sum(nlcu_series) / max(1, len(nlcu_series))) if nlcu_series else 0.0
-
-            new_flows  = float(sum(values(f"nlb_{lb_arn}_NewFlowCount_Sum")))
-            active_max = float(max(values(f"nlb_{lb_arn}_ActiveFlowCount_Maximum") or [0.0]))
-            bytes_sum  = float(sum(values(f"nlb_{lb_arn}_ProcessedBytes_Sum")))
-
-            monthly_base = monthly_nlb_base
-            monthly_lcu  = nlb_nlcu_hour * (avg_nlcu_per_hour * HOURS_PER_MONTH)
-            est_monthly  = round(monthly_base + monthly_lcu, 2)
-
-            traffic_gb = bytes_sum / (1024 ** 3)
-
-            signals_payload = [
-                ("Region", region),
-                ("Type", "NLB"),
-                ("AvgNLCU_per_hour", round(avg_nlcu_per_hour, 4)),
-                ("TrafficGB", round(traffic_gb, 2)),
-                ("NewFlows", int(new_flows)),
-                ("ActiveFlows(max)", int(active_max)),
-                ("LookbackDays", lb_lookback_days),
-                ("HourRate", round(nlb_hour, 5)),
-                ("NLCUHourRate", round(nlb_nlcu_hour, 5)),
-            ]
-
-            flags: List[str] = []
-            if new_flows == 0 and traffic_gb < 0.01 and avg_nlcu_per_hour == 0.0:
-                flags.append("ZeroTraffic")
-            elif traffic_gb < LB_LOW_TRAFFIC_GB:
-                flags.append("LowTrafficLB")
-            if not all(tags.get(k) for k in REQUIRED_TAG_KEYS):
-                flags.append("MissingRequiredTags")
-
-            confidence = score_confidence({
-                "traffic_low": pct_to_signal(traffic_gb, LB_LOW_TRAFFIC_GB),
-                "flows_zero": 1.0 if new_flows == 0 else 0.0,
-                "lcu_zero": 1.0 if avg_nlcu_per_hour == 0 else 0.0,
-            })
-
-        if "ZeroTraffic" in flags:
-            flags.append(f"PotentialSaving={est_monthly}$")
-
-        write_resource_to_csv(
-            writer=writer,
-            resource_id=lb_arn,
-            name=tags.get("Name", lb_name),
-            resource_type=("ALB" if lb_type == "application" else "NLB"),
-            owner_id=str(ACCOUNT_ID),
-            state=lb.get("State", {}).get("Code", ""),
-            creation_date=_fmt_dt(lb.get("CreatedTime")),
-            estimated_cost=est_monthly,
-            app_id=tags.get("ApplicationID", "NULL"),
-            app=tags.get("Application", "NULL"),
-            env=tags.get("Environment", "NULL"),
-            flags=flags,
-            confidence=confidence,
-            signals=signals_payload,
-        )
-
-    # ---------- Emit rows: Classic ELB ----------
-    for d in clb_list:
-        name = d.get("LoadBalancerName", "")
-        tags = {}
-        try:
-            tag_desc = elb.describe_tags(LoadBalancerNames=[name]).get("TagDescriptions", [])
-            for td in tag_desc:
-                if td.get("LoadBalancerName") == name:
-                    tags = {t["Key"]: t["Value"] for t in (td.get("Tags") or [])}
-                    break
-        except Exception:
-            pass
-
-        req_sum = float(sum(values(f"clb_{name}_RequestCount_Sum")))
-        latency_avg = float(
-            sum(values(f"clb_{name}_Latency_Average")) / max(1, len(values(f"clb_{name}_Latency_Average")))
-        ) if values(f"clb_{name}_Latency_Average") else 0.0
-
-        # Cost: hourly only (data processed billed separately; CloudWatch doesn't expose it natively for CLB)
-        est_monthly = round(monthly_clb_base, 2)
-
-        flags: List[str] = []
-        if req_sum == 0:
-            flags.append("ZeroTraffic")
-        elif req_sum < globals().get("CLB_LOW_REQUESTS_THRESHOLD", 1000):
-            flags.append("LowTrafficLB")
-        if not all(tags.get(k) for k in REQUIRED_TAG_KEYS):
-            flags.append("MissingRequiredTags")
-
-        confidence = score_confidence({
-            "req_zero": 1.0 if req_sum == 0 else 0.0,
-        })
-
-        signals_payload = [
-            ("Region", region),
-            ("Type", "CLB"),
-            ("RequestCount", int(req_sum)),
-            ("LatencyAvgSec", round(latency_avg, 3)),
-            ("LookbackDays", lb_lookback_days),
-            ("HourRate", round(clb_hour, 5)),
-            ("DataProcessedIncluded", False),
-        ]
-        
-        if "ZeroTraffic" in flags:
-            flags.append(f"PotentialSaving={est_monthly}$")
-
-        write_resource_to_csv(
-            writer=writer,
-            resource_id=name,
-            name=tags.get("Name", name),
-            resource_type="CLB",
-            owner_id=ACCOUNT_ID,
-            state=lb.get("State", {}).get("Code", ""),
-            creation_date=_fmt_dt(lb.get("CreatedTime")),
-            estimated_cost=est_monthly,
-            app_id=tags.get("ApplicationID", "NULL"),
-            app=tags.get("Application", "NULL"),
-            env=tags.get("Environment", "NULL"),
-            flags=flags,
-            confidence=confidence,
-            signals=signals_payload,
-        )
-
-    logging.info("[check_idle_load_balancers] Completed: ALB/NLB=%d, CLB=%d", len(alb_nlb_list), len(clb_list))
 
 #endregion
 
@@ -2785,6 +2645,57 @@ def check_lambda_efficiency(writer: csv.writer, lambda_client, cloudwatch) -> No
 
 
 #region NAT Gateways SECTION
+
+
+def check_nat_replacement_opps(writer, ec2, cloudwatch):
+    region = (getattr(getattr(cloudwatch,"meta",None),"region_name","") or
+              getattr(getattr(ec2,"meta",None),"region_name","") or "")
+    now = datetime.now(timezone.utc); start = now - timedelta(days=NAT_LOOKBACK_DAYS)
+    PERIOD = 300
+    # 1) list NATs
+    ngws = ec2.describe_nat_gateways().get("NatGateways", [])
+    if not ngws: return
+    # 2) batch metrics
+    batch = cw.CloudWatchBatcher(region, client=cloudwatch)
+    for g in ngws:
+        gid = g.get("NatGatewayId")
+        dims = [{"Name":"NatGatewayId","Value":gid}]
+        batch.add_q(id_hint=f"nat_bin_src__{gid}",  namespace="AWS/NATGateway", metric="BytesInFromSource",  dims=dims, stat="Sum", period=PERIOD)
+        batch.add_q(id_hint=f"nat_bout_dst__{gid}", namespace="AWS/NATGateway", metric="BytesOutToDestination",dims=dims, stat="Sum", period=PERIOD)
+        batch.add_q(id_hint=f"nat_conn__{gid}",     namespace="AWS/NATGateway", metric="ActiveConnectionCount",dims=dims, stat="Average", period=PERIOD)
+    series = batch.execute(start, now, scan_by="TimestampDescending")
+
+    # 3) prices
+    nat_hr  = get_price("NAT","HOUR",region)
+    nat_gb  = get_price("NAT","GB_PROCESSED",region)
+    base_mo = nat_hr * HOURS_PER_MONTH
+
+    for g in ngws:
+        gid = g["NatGatewayId"]
+        bin_sum  = sum(v for _,v in series.get(f"nat_bin_src__{gid}", []))
+        bout_sum = sum(v for _,v in series.get(f"nat_bout_dst__{gid}", []))
+        bytes_gb = (bin_sum + bout_sum) / (1024**3)
+        nat_month = round(base_mo + (bytes_gb * nat_gb), 2)
+        confidence=0
+        # Heuristic: if most egress is S3/DynamoDB (TODO: Flow Logs),
+        # we mark gateway endpoint replacement as a 100% confidence candidate.
+        flags = []
+        # Optional: if you track per-service NAT shares in Signals elsewhere, use that. Here: simple bytes threshold.
+        if bytes_gb >= NAT_IDLE_TRAFFIC_THRESHOLD_GB:  # actively used NAT
+            flags.append("nat_replace_with_gateway_endpoints")
+            confidence=100
+
+        write_resource_to_csv(
+            writer, resource_id=gid, name=gid, resource_type="NAT",
+            owner_id=str(ACCOUNT_ID), state=g.get("State",""),
+            creation_date=(g.get("CreateTime") or now).astimezone(timezone.utc).isoformat(),
+            storage_gb="", estimated_cost=nat_month,
+            app_id="NULL", app="NULL", env="NULL", referenced_in="",
+            flags=flags, object_count="", potential_saving=nat_month if confidence==100 else None,
+            confidence=confidence,
+            signals={"Region":region, f"TrafficGB{NAT_LOOKBACK_DAYS}d":f"{bytes_gb:.2f}"},
+        )
+
 
 def check_unused_nat_gateways(
     writer: csv.writer,
@@ -6263,6 +6174,9 @@ def main():
 
                 run_check(profiler=profiler, check_name="check_kms_customer_managed_keys", region=region,
                 fn=check_kms_customer_managed_keys, writer=writer, cloudtrail=clients['cloudtrail'], kms=clients['kms'])
+
+                run_check(profiler=profiler, check_name="check_nat_replacement_opps", region=region,
+                fn=check_nat_replacement_opps, writer=writer, cloudtrail=clients['ec2'], kms=clients['cloudwatch'])
 
 
         profiler.dump_csv()
