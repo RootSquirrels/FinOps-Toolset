@@ -5806,8 +5806,11 @@ def check_kms_customer_managed_keys(writer: csv.writer, cloudtrail, kms, lookbac
 
 #region CloudFront SECTION
 
-@retry_with_backoff()
-def check_cloudfront_idle_distributions(writer: csv.writer, cf_client) -> None:
+def check_cloudfront_distributions_refactored(
+    writer,
+    cloudfront,
+    cloudwatch,
+) -> None:
     """
     Identify CloudFront distributions with near-zero usage and surface any
     recurring monthly charges (e.g., Dedicated IP custom SSL at ~$600/month).
@@ -5823,104 +5826,179 @@ def check_cloudfront_idle_distributions(writer: csv.writer, cf_client) -> None:
             AND total_bytes_gb < CLOUDFRONT_IDLE_BYTES_GB
       • If the distribution uses Dedicated IP custom SSL (ViewerCertificate.SSLSupportMethod == "vip"),
         add "UsesDedicatedIPCustomSSL" and "PotentialSaving=600$" to flags (AWS charges ~$600/mo).  # See pricing page.
-
-    Output (CSV):
-      - ResourceType="CloudFrontDistribution"
-      - State = distribution Status (e.g., "Deployed")
-      - Estimated_Cost_USD = 600.00 for dedicated-IP SSL idle dists, else 0
-      - Potential_Saving_USD auto-parsed from "PotentialSaving=..." flag by write_resource_to_csv
-
-    Error handling:
-      • Uses retry/backoff wrappers and continues on per-item errors.
-      • Missing metrics default to zero series.
     """
     try:
-        # CloudWatch for CloudFront must be us-east-1
-        cw = boto3.client("cloudwatch", region_name="us-east-1")
+        region = (
+            getattr(getattr(cloudwatch, "meta", None), "region_name", "")
+            or getattr(getattr(cloudfront, "meta", None), "region_name", "")
+            or ""
+        )
 
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=CLOUDFRONT_LOOKBACK_DAYS)
-        period = CLOUDFRONT_PERIOD
+        now = datetime.now(timezone.utc)
+        lookback_days = max(1, CLOUDFRONT_LOOKBACK_DAYS)
+        start = now - timedelta(days=lookback_days)
+        PERIOD = max(60, CLOUDFRONT_PERIOD)  # keep your original period setting
 
-        paginator = cf_client.get_paginator("list_distributions")
-        for page in paginator.paginate():
-            dist_list = (page.get("DistributionList") or {}).get("Items", []) or []
-            if not dist_list:
-                continue
+        # 1) List distributions (paginated)
+        dists = []
+        marker = None
+        while True:
+            try:
+                args = {"Marker": marker} if marker else {}
+                resp = cloudfront.list_distributions(**args)
+            except ClientError as e:
+                logging.error(f"[CF] list_distributions failed ({region}): {e}")
+                break
 
-            mdqs: List[Dict[str, Any]] = []
-            for d in dist_list:
-                dist_id = d.get("Id", "")
-                dims = [
-                    {"Name": "DistributionId", "Value": dist_id},
-                    {"Name": "Region", "Value": "Global"},
-                ]
-                for metric, stat in [("Requests", "Sum"), ("BytesDownloaded", "Sum")]:
-                    mdqs.append(build_mdq(
-                        id_hint=_cw_make_id("cf", dist_id, metric, stat),
-                        namespace="AWS/CloudFront",
-                        metric=metric,
-                        dims=dims,
-                        stat=stat,
-                        period=period
-                    ))
+            summary_list = ((resp.get("DistributionList") or {}).get("Items") or [])
+            dists.extend(summary_list)
+            marker = (resp.get("DistributionList") or {}).get("NextMarker")
+            if not marker:
+                break
 
-            md = cw_get_metric_data_bulk(cw, mdqs, start, end, scan_by="TimestampAscending")
+        if not dists:
+            return
 
-            def vals(dist_id: str, metric: str, stat: str) -> List[float]:
-                qid = _cw_make_id("cf", dist_id, metric, stat)
-                return [v for _, v in md.get(qid, [])]
+        # 2) Tags (best effort)
+        def _tdict(aws_tags):
+            if not aws_tags:
+                return {}
+            items = (aws_tags.get("Items") if isinstance(aws_tags, dict) else None) or []
+            return {t.get("Key", ""): t.get("Value", "") for t in items}
 
-            for d in dist_list:
+        dist_tags: Dict[str, Dict[str, str]] = {}
+        for d in dists:
+            arn = d.get("ARN") or ""
+            t = {}
+            if arn:
                 try:
-                    dist_id = d.get("Id", "")
-                    #arn = d.get("ARN", "")
-                    status = d.get("Status", "")
-                    enabled = d.get("Enabled", False)
-                    vc = (d.get("ViewerCertificate") or {})
-                    ssl_method = (vc.get("SSLSupportMethod") or "").lower()  # "sni-only" | "vip" | ""
+                    t = cloudfront.list_tags_for_resource(Resource=arn).get("Tags", {})
+                except ClientError:
+                    t = {}
+                except Exception:
+                    t = {}
+            dist_tags[arn or d.get("Id", "")] = _tdict(t)
 
-                    reqs = vals(dist_id, "Requests", "Sum")
-                    bytes_dl = vals(dist_id, "BytesDownloaded", "Sum")
-                    total_requests = int(sum(reqs))
-                    total_bytes_gb = float(sum(bytes_dl)) / (1024 ** 3)
+        # 3) Batch CloudWatch metrics (use passed CW client)
+        def _sid(name: str) -> str:
+            s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(name))
+            if not s or not s[0].isalpha():
+                s = "m_" + s
+            return s[:255]
 
-                    flags: List[str] = []
-                    flags.append(f"Requests≈{total_requests}/{CLOUDFRONT_LOOKBACK_DAYS}d")
-                    flags.append(f"Bytes≈{total_bytes_gb:.2f}GB/{CLOUDFRONT_LOOKBACK_DAYS}d")
+        batch = cw.CloudWatchBatcher(region, client=cloudwatch)
+        for d in dists:
+            did = d.get("Id", "")
+            sid = _sid(did)
+            # CloudFront metrics require Region='Global' dimension
+            dims = [{"Name": "DistributionId", "Value": did}, {"Name": "Region", "Value": "Global"}]
 
-                    is_idle = (total_requests < CLOUDFRONT_IDLE_REQUESTS and total_bytes_gb < CLOUDFRONT_IDLE_BYTES_GB)
-                    est_cost = 0.0
+            batch.add(cw.MDQ(id=f"cf_req__{sid}",  namespace="AWS/CloudFront", metric="Requests",       dims=dims, stat="Sum",     period=PERIOD))
+            batch.add(cw.MDQ(id=f"cf_bdn__{sid}",  namespace="AWS/CloudFront", metric="BytesDownloaded", dims=dims, stat="Sum",     period=PERIOD))
+            batch.add(cw.MDQ(id=f"cf_bup__{sid}",  namespace="AWS/CloudFront", metric="BytesUploaded",   dims=dims, stat="Sum",     period=PERIOD))
+            batch.add(cw.MDQ(id=f"cf_4xx__{sid}",  namespace="AWS/CloudFront", metric="4xxErrorRate",    dims=dims, stat="Average", period=PERIOD))
+            batch.add(cw.MDQ(id=f"cf_5xx__{sid}",  namespace="AWS/CloudFront", metric="5xxErrorRate",    dims=dims, stat="Average", period=PERIOD))
 
-                    if is_idle:
-                        flags.append("IdleDistribution")
+        try:
+            series = batch.execute(start, now, scan_by="TimestampDescending")
+        except Exception as e:
+            logging.exception(f"[CF] CloudWatch batch execute failed ({region}): {e}")
+            series = {}
 
+        # 4) Emit rows
+        for d in dists:
+            try:
+                did      = d.get("Id", "")
+                arn      = d.get("ARN", did)
+                domain   = d.get("DomainName", "")
+                status   = d.get("Status", "")
+                enabled  = bool(d.get("Enabled", True))
+                comment  = d.get("Comment", "")
+                last_mod = d.get("LastModifiedTime")
+
+                if isinstance(last_mod, datetime) and last_mod.tzinfo is None:
+                    last_mod = last_mod.replace(tzinfo=timezone.utc)
+                created_iso = (last_mod or now).astimezone(timezone.utc).isoformat()
+
+                tags = dist_tags.get(arn, {})
+                name = tags.get("Name", domain or did)
+
+                sid = _sid(did)
+
+                # metrics
+                req_sum   = float(sum(v for _, v in series.get(f"cf_req__{sid}", [])))
+                bdn_sum   = float(sum(v for _, v in series.get(f"cf_bdn__{sid}", [])))
+                bup_sum   = float(sum(v for _, v in series.get(f"cf_bup__{sid}", [])))
+                e4_vals   = [v for _, v in series.get(f"cf_4xx__{sid}", [])]
+                e5_vals   = [v for _, v in series.get(f"cf_5xx__{sid}", [])]
+                e4_avg    = (sum(e4_vals) / len(e4_vals)) if e4_vals else 0.0
+                e5_avg    = (sum(e5_vals) / len(e5_vals)) if e5_vals else 0.0
+
+                bytes_gb  = (bdn_sum + bup_sum) / (1024.0 ** 3)
+
+                # ViewerCertificate → detect Dedicated-IP custom SSL (no-regression)
+                vc = d.get("ViewerCertificate", {}) or {}
+                ssl_method = (vc.get("SSLSupportMethod") or "").lower()  # 'sni-only' | 'vip' | ''
+                uses_dedicated_ip = (ssl_method == "vip")
+
+                flags: List[str] = []
+                missing = [k for k in REQUIRED_TAG_KEYS if not tags.get(k)]
+                if missing:
+                    flags.append(f"MissingRequiredTags={','.join(missing)}")
+
+                potential = None
+                est_monthly = ""
+                # "Idle" heuristic — keep your thresholds from config
+                is_idle = (req_sum <= CLOUDFRONT_IDLE_REQUESTS) and (bytes_gb <= CLOUDFRONT_IDLE_BYTES_GB) and enabled and (status.lower() == "deployed")
+                if is_idle:
+                    flags += ["idle_cloudfront_candidate", "confidence=100"]
+
+                if uses_dedicated_ip:
                     # Dedicated-IP custom SSL carries ~$600/mo even if idle; SNI has $0 base fee.
-                    if ssl_method == "vip":
-                        flags.append("UsesDedicatedIPCustomSSL")
-                        if is_idle:
-                            flags.append("PotentialSaving=600$")
-                        est_cost = 600.00 if is_idle else 0.0  # reflect recurring cost only when idle
+                    flags.append("UsesDedicatedIPCustomSSL")
+                    potential = 600
+                    est_monthly = 600
 
-                    # Owner & tagging are not available from list_distributions; leave app tags empty.
-                    if is_idle:
-                        write_resource_to_csv(
-                            writer=writer,
-                            resource_id=dist_id,
-                            name=dist_id,
-                            resource_type="CloudFrontDistribution",
-                            owner_id=ACCOUNT_ID,
-                            state=("Enabled" if enabled else "Disabled") + (f"/{status}" if status else ""),
-                            estimated_cost=est_cost,
-                            flags=flags
-                        )
-                        logging.info(f"[check_cloudfront_idle_distributions] {dist_id} flags={flags}")
+                confidence = 100 if is_idle else None
 
-                except Exception as de:
-                    logging.error(f"[check_cloudfront_idle_distributions] Distribution {d.get('Id','?')} error: {de}")
+                signals = {
+                    "Region": region,                   
+                    "Scope": "Global",
+                    "Enabled": str(enabled).lower(),
+                    "Status": status,
+                    "DomainName": domain,
+                    "SSLSupportMethod": ssl_method or "",
+                    "CommentLen": str(len(comment or "")),
+                    f"Requests{lookback_days}d": f"{int(req_sum)}",
+                    f"BytesGB{lookback_days}d": f"{bytes_gb:.3f}",
+                    "Avg4xxRate": f"{e4_avg:.4f}",
+                    "Avg5xxRate": f"{e5_avg:.4f}",
+                    "LookbackDays": str(lookback_days),
+                }
+
+                write_resource_to_csv(
+                    writer=writer,
+                    resource_id=arn or did,
+                    name=name,
+                    resource_type="CloudFront",
+                    owner_id=ACCOUNT_ID,
+                    state=status,
+                    creation_date=created_iso,
+                    estimated_cost=est_monthly,    # left blank to avoid pricing regression
+                    app_id=tags.get("ApplicationID", "NULL"),
+                    app=tags.get("Application", "NULL"),
+                    env=tags.get("Environment", "NULL"),
+                    flags=flags,
+                    potential_saving=potential,
+                    confidence=confidence,
+                    signals=signals,
+                )
+            except Exception as e:
+                logging.exception(f"[CF] emit failed for {d.get('Id','?')}: {e}")
 
     except Exception as e:
-        logging.error(f"[check_cloudfront_idle_distributions] Fatal error: {e}")
+        logging.exception(f"[CF] check_cloudfront_distributions_refactored failed: {e}")
+        return
 
 #endregion
 
