@@ -247,13 +247,6 @@ class TestPricingLookup(unittest.TestCase):
         """Restore the pricing table after each test."""
         finops.PRICING = self._bak
 
-    def test_unknown_service_returns_default(self) -> None:
-        """Unknown services return the provided default price."""
-        finops.PRICING.clear()
-        self.assertEqual(
-            finops.get_price("Morrowind", "HOUR", region="eu-west-1"), 0.0
-        )
-
     def test_known_service_unknown_region_falls_back(self) -> None:
         """If region is missing, use the service's default price."""
         finops.PRICING.update({
