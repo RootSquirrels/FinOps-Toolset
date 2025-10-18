@@ -1065,8 +1065,6 @@ def check_s3_buckets_refactored(
             region_to_buckets.setdefault(m["Region"], []).append(bn)
 
         # 4) Per-region batch metrics & emit rows
-        def _sid(bn: str) -> str:
-            return bn.replace(".", "_").replace("-", "_")[:255]
 
         for region, buckets in region_to_buckets.items():
             if not buckets:
@@ -1079,9 +1077,8 @@ def check_s3_buckets_refactored(
 
             batch = cw.CloudWatchBatcher(region)
             for bn in buckets:
-                sid = _sid(bn)
                 batch.add(cw.MDQ(
-                    id=f"s3_size_std__{sid}",
+                    id=f"s3_size_std__{bn}",
                     namespace="AWS/S3",
                     metric="BucketSizeBytes",
                     dims=[{"Name": "BucketName", "Value": bn},
@@ -1090,7 +1087,7 @@ def check_s3_buckets_refactored(
                     period=86400,
                 ))
                 batch.add(cw.MDQ(
-                    id=f"s3_obj__{sid}",
+                    id=f"s3_obj__{bn}",
                     namespace="AWS/S3",
                     metric="NumberOfObjects",
                     dims=[{"Name": "BucketName", "Value": bn},
@@ -1108,10 +1105,9 @@ def check_s3_buckets_refactored(
             for bn in buckets:
                 try:
                     m = bucket_meta[bn]
-                    sid = _sid(bn)
 
-                    size_bytes = cw.CloudWatchBatcher.latest(series.get(f"s3_size_std__{sid}", []), 0.0)
-                    obj_count  = cw.CloudWatchBatcher.latest(series.get(f"s3_obj__{sid}", []), 0.0)
+                    size_bytes = cw.CloudWatchBatcher.latest(series.get(f"s3_size_std__{bn}", []), 0.0)
+                    obj_count  = cw.CloudWatchBatcher.latest(series.get(f"s3_obj__{bn}", []), 0.0)
 
                     size_gb = round(float(size_bytes) / (1024.0 ** 3), 3)
                     objects = int(obj_count)
@@ -1616,11 +1612,6 @@ def check_unused_efs_filesystems(
         start = now - timedelta(days=lookback_days)
 
         # ---------- helpers ----------
-        def _sid(name: str) -> str:
-            s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(name))
-            if not s or not s[0].isalpha():
-                s = "m_" + s
-            return s[:255]
 
         def _tdict(aws_tags):
             if not aws_tags:
@@ -1701,21 +1692,21 @@ def check_unused_efs_filesystems(
 
         for m in metas:
             fsid = m["fsid"]
-            sid = _sid(fsid)
+
             dims_std = [{"Name": "FileSystemId", "Value": fsid}, {"Name": "StorageClass", "Value": "Standard"}]
             dims_ia  = [{"Name": "FileSystemId", "Value": fsid}, {"Name": "StorageClass", "Value": "InfrequentAccess"}]
             dims_fs  = [{"Name": "FileSystemId", "Value": fsid}]
 
             # Storage
-            batch.add(cw.MDQ(id=f"efs_std_bytes__{sid}", namespace="AWS/EFS", metric="StorageBytes", dims=dims_std, stat="Average", period=PERIOD_STORAGE))
-            batch.add(cw.MDQ(id=f"efs_ia_bytes__{sid}",  namespace="AWS/EFS", metric="StorageBytes", dims=dims_ia,  stat="Average", period=PERIOD_STORAGE))
+            batch.add(cw.MDQ(id=f"efs_std_bytes__{fsid}", namespace="AWS/EFS", metric="StorageBytes", dims=dims_std, stat="Average", period=PERIOD_STORAGE))
+            batch.add(cw.MDQ(id=f"efs_ia_bytes__{fsid}",  namespace="AWS/EFS", metric="StorageBytes", dims=dims_ia,  stat="Average", period=PERIOD_STORAGE))
 
             # IO bytes (sum over lookback)
-            batch.add(cw.MDQ(id=f"efs_read__{sid}",  namespace="AWS/EFS", metric="DataReadIOBytes",  dims=dims_fs, stat="Sum", period=PERIOD_IO))
-            batch.add(cw.MDQ(id=f"efs_write__{sid}", namespace="AWS/EFS", metric="DataWriteIOBytes", dims=dims_fs, stat="Sum", period=PERIOD_IO))
+            batch.add(cw.MDQ(id=f"efs_read__{fsid}",  namespace="AWS/EFS", metric="DataReadIOBytes",  dims=dims_fs, stat="Sum", period=PERIOD_IO))
+            batch.add(cw.MDQ(id=f"efs_write__{fsid}", namespace="AWS/EFS", metric="DataWriteIOBytes", dims=dims_fs, stat="Sum", period=PERIOD_IO))
 
             # Burst credits (latest)
-            batch.add(cw.MDQ(id=f"efs_burst__{sid}", namespace="AWS/EFS", metric="BurstCreditBalance", dims=dims_fs, stat="Average", period=PERIOD_IO))
+            batch.add(cw.MDQ(id=f"efs_burst__{fsid}", namespace="AWS/EFS", metric="BurstCreditBalance", dims=dims_fs, stat="Average", period=PERIOD_IO))
 
         try:
             series = batch.execute(start, now, scan_by="TimestampDescending")
@@ -1742,7 +1733,6 @@ def check_unused_efs_filesystems(
         for m in metas:
             try:
                 fsid = m["fsid"]
-                sid  = _sid(fsid)
 
                 created = m["created"] or now
                 if created.tzinfo is None:
@@ -1750,14 +1740,14 @@ def check_unused_efs_filesystems(
                 created_iso = created.astimezone(timezone.utc).isoformat()
 
                 # latest storage (GB)
-                std_bytes = cw.CloudWatchBatcher.latest(series.get(f"efs_std_bytes__{sid}", []), 0.0)
-                ia_bytes  = cw.CloudWatchBatcher.latest(series.get(f"efs_ia_bytes__{sid}",  []), 0.0)
+                std_bytes = cw.CloudWatchBatcher.latest(series.get(f"efs_std_bytes__{fsid}", []), 0.0)
+                ia_bytes  = cw.CloudWatchBatcher.latest(series.get(f"efs_ia_bytes__{fsid}",  []), 0.0)
                 std_gb = round(float(std_bytes) / (1024.0 ** 3), 3)
                 ia_gb  = round(float(ia_bytes)  / (1024.0 ** 3), 3)
 
                 # IO sums over window (GB/day)
-                read_sum  = float(sum(v for _, v in series.get(f"efs_read__{sid}", [])))
-                write_sum = float(sum(v for _, v in series.get(f"efs_write__{sid}", [])))
+                read_sum  = float(sum(v for _, v in series.get(f"efs_read__{fsid}", [])))
+                write_sum = float(sum(v for _, v in series.get(f"efs_write__{fsid}", [])))
                 total_io_gb = (read_sum + write_sum) / (1024.0 ** 3)
                 avg_io_gb_per_day = total_io_gb / float(lookback_days) if lookback_days > 0 else 0.0
 
@@ -2595,13 +2585,6 @@ def check_lambda_efficiency(writer: csv.writer, lambda_client, cloudwatch) -> No
             or ""
         )
 
-        def _sid(name: str) -> str:
-            s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(name))
-            if not s or not s[0].isalpha():
-                s = "m_" + s
-            return s[:255]
-
-
         now = datetime.now(timezone.utc)
         lookback_days = max(1, LAMBDA_LOOKBACK_DAYS)
         start = now - timedelta(days=lookback_days)
@@ -2640,12 +2623,11 @@ def check_lambda_efficiency(writer: csv.writer, lambda_client, cloudwatch) -> No
         batch = cw.CloudWatchBatcher(region, client=cloudwatch)
         for f in funcs:
             fname = f.get("FunctionName", "")
-            sid = _sid(fname)
             dims = [{"Name": "FunctionName", "Value": fname}]
-            batch.add(cw.MDQ(id=f"lam_inv__{sid}", namespace="AWS/Lambda", metric="Invocations", dims=dims, stat="Sum",     period=PERIOD))
-            batch.add(cw.MDQ(id=f"lam_err__{sid}", namespace="AWS/Lambda", metric="Errors",      dims=dims, stat="Sum",     period=PERIOD))
-            batch.add(cw.MDQ(id=f"lam_thr__{sid}", namespace="AWS/Lambda", metric="Throttles",   dims=dims, stat="Sum",     period=PERIOD))
-            batch.add(cw.MDQ(id=f"lam_dur__{sid}", namespace="AWS/Lambda", metric="Duration",    dims=dims, stat="Average", period=PERIOD))
+            batch.add_q(id_hint=f"lam_inv__{fname}", namespace="AWS/Lambda", metric="Invocations", dims=dims, stat="Sum",     period=PERIOD)
+            batch.add_q(id_hint=f"lam_err__{fname}", namespace="AWS/Lambda", metric="Errors",      dims=dims, stat="Sum",     period=PERIOD)
+            batch.add_q(id_hint=f"lam_thr__{fname}", namespace="AWS/Lambda", metric="Throttles",   dims=dims, stat="Sum",     period=PERIOD)
+            batch.add_q(id_hint=f"lam_dur__{fname}", namespace="AWS/Lambda", metric="Duration",    dims=dims, stat="Average", period=PERIOD)
 
 
         try:
@@ -2693,12 +2675,11 @@ def check_lambda_efficiency(writer: csv.writer, lambda_client, cloudwatch) -> No
 
                 # Metrics
                 fname = f.get("FunctionName", "")
-                sid = _sid(fname)
 
-                inv_sum  = sum(v for _, v in series.get(f"lam_inv__{sid}", []))
-                err_sum  = sum(v for _, v in series.get(f"lam_err__{sid}", []))
-                thr_sum  = sum(v for _, v in series.get(f"lam_thr__{sid}", []))
-                dur_vals = [v for _, v in series.get(f"lam_dur__{sid}", [])]
+                inv_sum  = sum(v for _, v in series.get(f"lam_inv__{fname}", []))
+                err_sum  = sum(v for _, v in series.get(f"lam_err__{fname}", []))
+                thr_sum  = sum(v for _, v in series.get(f"lam_thr__{fname}", []))
+                dur_vals = [v for _, v in series.get(f"lam_dur__{fname}", [])]
                 avg_ms   = (sum(dur_vals) / len(dur_vals)) if dur_vals else 0.0
 
                 try:
@@ -2820,13 +2801,6 @@ def check_unused_nat_gateways(
             or ""
         )
 
-        def _sid(x: str) -> str:
-            s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(x))
-            if not s or not s[0].isalpha():
-                s = "m_" + s
-            return s[:255]
-
-
         lookback_days = max(1, NAT_LOOKBACK_DAYS)
         now = datetime.now(timezone.utc)
         start = now - timedelta(days=lookback_days)
@@ -2865,19 +2839,19 @@ def check_unused_nat_gateways(
         batch = cw.CloudWatchBatcher(region, client=cloudwatch)
         for nat in nats:
             nat_id = nat["NatGatewayId"]
-            sid = _sid(nat_id)
+
             dims = [{"Name": "NatGatewayId", "Value": nat_id}]
             # bytes (sum) — convert to GB later
-            batch.add(cw.MDQ(id=f"nat_bin_src__{sid}",  namespace="AWS/NATGateway",
+            batch.add(cw.MDQ(id=f"nat_bin_src__{nat_id}",  namespace="AWS/NATGateway",
                              metric="BytesInFromSource",      dims=dims, stat="Sum", period=3600))
-            batch.add(cw.MDQ(id=f"nat_bout_dst__{sid}", namespace="AWS/NATGateway",
+            batch.add(cw.MDQ(id=f"nat_bout_dst__{nat_id}", namespace="AWS/NATGateway",
                              metric="BytesOutToDestination",  dims=dims, stat="Sum", period=3600))
-            batch.add(cw.MDQ(id=f"nat_bin_dst__{sid}",  namespace="AWS/NATGateway",
+            batch.add(cw.MDQ(id=f"nat_bin_dst__{nat_id}",  namespace="AWS/NATGateway",
                              metric="BytesInFromDestination", dims=dims, stat="Sum", period=3600))
-            batch.add(cw.MDQ(id=f"nat_bout_src__{sid}", namespace="AWS/NATGateway",
+            batch.add(cw.MDQ(id=f"nat_bout_src__{nat_id}", namespace="AWS/NATGateway",
                              metric="BytesOutToSource",       dims=dims, stat="Sum", period=3600))
             # connections (sum)
-            batch.add(cw.MDQ(id=f"nat_conn__{sid}",     namespace="AWS/NATGateway",
+            batch.add(cw.MDQ(id=f"nat_conn__{nat_id}",     namespace="AWS/NATGateway",
                              metric="ActiveConnectionCount", dims=dims, stat="Sum", period=3600))
 
         try:
@@ -3817,11 +3791,6 @@ def check_dynamodb_cost_optimization(
         LOOKBACK_SECONDS = lookback_days * 24 * 3600
 
         # ---------- helpers ----------
-        def _sid(name: str) -> str:
-            s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(name))
-            if not s or not s[0].isalpha():
-                s = "m_" + s
-            return s[:255]
 
         def _tdict(aws_tags):
             if not aws_tags:
@@ -3944,14 +3913,14 @@ def check_dynamodb_cost_optimization(
 
         for m in metas:
             tname = m["name"]
-            sid = _sid(tname)
+
             dims = [{"Name": "TableName", "Value": tname}]
             # Table-level consumption
-            batch.add(cw.MDQ(id=f"ddb_rcu__{sid}", namespace="AWS/DynamoDB",
+            batch.add(cw.MDQ(id=f"ddb_rcu__{tname}", namespace="AWS/DynamoDB",
                              metric="ConsumedReadCapacityUnits",  dims=dims, stat="Sum", period=PERIOD))
-            batch.add(cw.MDQ(id=f"ddb_wcu__{sid}", namespace="AWS/DynamoDB",
+            batch.add(cw.MDQ(id=f"ddb_wcu__{tname}", namespace="AWS/DynamoDB",
                              metric="ConsumedWriteCapacityUnits", dims=dims, stat="Sum", period=PERIOD))
-            batch.add(cw.MDQ(id=f"ddb_thr__{sid}", namespace="AWS/DynamoDB",
+            batch.add(cw.MDQ(id=f"ddb_thr__{tname}", namespace="AWS/DynamoDB",
                              metric="ThrottledRequests",          dims=dims, stat="Sum", period=PERIOD))
 
             # Optional GSIs (respect cap)
@@ -3966,12 +3935,11 @@ def check_dynamodb_cost_optimization(
                     selected_gsis = gsis
 
             for idx_name in selected_gsis:
-                isid = _sid(f"{tname}__{idx_name}")
                 idims = [{"Name": "TableName", "Value": tname},
                          {"Name": "GlobalSecondaryIndexName", "Value": idx_name}]
-                batch.add(cw.MDQ(id=f"ddb_rcu_gsi__{isid}", namespace="AWS/DynamoDB",
+                batch.add(cw.MDQ(id=f"ddb_rcu_gsi__{idx_name}", namespace="AWS/DynamoDB",
                                  metric="ConsumedReadCapacityUnits",  dims=idims, stat="Sum", period=PERIOD))
-                batch.add(cw.MDQ(id=f"ddb_wcu_gsi__{isid}", namespace="AWS/DynamoDB",
+                batch.add(cw.MDQ(id=f"ddb_wcu_gsi__{idx_name}", namespace="AWS/DynamoDB",
                                  metric="ConsumedWriteCapacityUnits", dims=idims, stat="Sum", period=PERIOD))
 
         try:
@@ -3998,7 +3966,6 @@ def check_dynamodb_cost_optimization(
         for m in metas:
             try:
                 tname = m["name"]
-                sid = _sid(tname)
 
                 created = m["created"] or now
                 if isinstance(created, datetime) and created.tzinfo is None:
@@ -4012,9 +3979,9 @@ def check_dynamodb_cost_optimization(
                 item_count = int(m["item_count"] or 0)
 
                 # Consumption (table + limited GSI)
-                rcu_sum = float(sum(v for _, v in series.get(f"ddb_rcu__{sid}", [])))
-                wcu_sum = float(sum(v for _, v in series.get(f"ddb_wcu__{sid}", [])))
-                thr_sum = float(sum(v for _, v in series.get(f"ddb_thr__{sid}", [])))
+                rcu_sum = float(sum(v for _, v in series.get(f"ddb_rcu__{tname}", [])))
+                wcu_sum = float(sum(v for _, v in series.get(f"ddb_wcu__{tname}", [])))
+                thr_sum = float(sum(v for _, v in series.get(f"ddb_thr__{tname}", [])))
 
                 gsis = m["gsi"] or []
                 if gsi_limit is None:
@@ -4026,9 +3993,8 @@ def check_dynamodb_cost_optimization(
                     except Exception:
                         selected_gsis = gsis
                 for idx_name in selected_gsis:
-                    isid = _sid(f"{tname}__{idx_name}")
-                    rcu_sum += float(sum(v for _, v in series.get(f"ddb_rcu_gsi__{isid}", [])))
-                    wcu_sum += float(sum(v for _, v in series.get(f"ddb_wcu_gsi__{isid}", [])))
+                    rcu_sum += float(sum(v for _, v in series.get(f"ddb_rcu_gsi__{idx_name}", [])))
+                    wcu_sum += float(sum(v for _, v in series.get(f"ddb_wcu_gsi__{idx_name}", [])))
 
                 compute_month = 0.0
                 if billing == "PROVISIONED":
@@ -5394,10 +5360,6 @@ def check_idle_ec2_instances(writer, ec2, cloudwatch,) -> None:
         start = now - timedelta(days=lookback_days)
         period = EC2_CW_PERIOD  # e.g., 86400
 
-        def _sid(inst_id: str) -> str:
-            return inst_id.replace("-", "_").replace(".", "_")
-
-
         # 1) List instances in this region
         instances = []
         token = None
@@ -5426,14 +5388,12 @@ def check_idle_ec2_instances(writer, ec2, cloudwatch,) -> None:
         batch = cw.CloudWatchBatcher(region, client=cloudwatch)
         for it in instances:
             iid = it["InstanceId"]
-            sid = _sid(iid)
             dims = [{"Name": "InstanceId", "Value": iid}]
-
-            batch.add(cw.MDQ(id=f"ec2_cpu__{sid}",  namespace="AWS/EC2", metric="CPUUtilization", dims=dims, stat="Average", period=period))
-            batch.add(cw.MDQ(id=f"ec2_nin__{sid}",  namespace="AWS/EC2", metric="NetworkIn",      dims=dims, stat="Sum",     period=period))
-            batch.add(cw.MDQ(id=f"ec2_nout__{sid}", namespace="AWS/EC2", metric="NetworkOut",     dims=dims, stat="Sum",     period=period))
-            batch.add(cw.MDQ(id=f"ec2_drd__{sid}",  namespace="AWS/EC2", metric="DiskReadOps",    dims=dims, stat="Sum",     period=period))
-            batch.add(cw.MDQ(id=f"ec2_dwr__{sid}",  namespace="AWS/EC2", metric="DiskWriteOps",   dims=dims, stat="Sum",     period=period))
+            batch.add_q(id_hint=f"ec2_cpu__{iid}",  namespace="AWS/EC2", metric="CPUUtilization", dims=dims, stat="Average", period=period)
+            batch.add_q(id_hint=f"ec2_nin__{iid}",  namespace="AWS/EC2", metric="NetworkIn",      dims=dims, stat="Sum",     period=period)
+            batch.add_q(id_hint=f"ec2_nout__{iid}", namespace="AWS/EC2", metric="NetworkOut",     dims=dims, stat="Sum",     period=period)
+            batch.add_q(id_hint=f"ec2_drd__{iid}",  namespace="AWS/EC2", metric="DiskReadOps",    dims=dims, stat="Sum",     period=period)
+            batch.add_q(id_hint=f"ec2_dwr__{iid}",  namespace="AWS/EC2", metric="DiskWriteOps",   dims=dims, stat="Sum",     period=period)
 
         try:
             series = batch.execute(start, now, scan_by="TimestampDescending")
@@ -5456,12 +5416,11 @@ def check_idle_ec2_instances(writer, ec2, cloudwatch,) -> None:
                 name = tdict.get("Name", iid)
 
                 # Extract metrics
-                sid = _sid(iid)
-                cpu_vals = [v for _, v in series.get(f"ec2_cpu__{sid}", [])]
-                nin_sum  = sum(v for _, v in series.get(f"ec2_nin__{sid}", []))
-                nout_sum = sum(v for _, v in series.get(f"ec2_nout__{sid}", []))
-                drd_sum  = sum(v for _, v in series.get(f"ec2_drd__{sid}", []))
-                dwr_sum  = sum(v for _, v in series.get(f"ec2_dwr__{sid}", [])) 
+                cpu_vals = [v for _, v in series.get(f"ec2_cpu__{iid}", [])]
+                nin_sum  = sum(v for _, v in series.get(f"ec2_nin__{iid}", []))
+                nout_sum = sum(v for _, v in series.get(f"ec2_nout__{iid}", []))
+                drd_sum  = sum(v for _, v in series.get(f"ec2_drd__{iid}", []))
+                dwr_sum  = sum(v for _, v in series.get(f"ec2_dwr__{iid}", []))
 
                 avg_cpu  = (sum(cpu_vals) / len(cpu_vals)) if cpu_vals else 0.0
                 net_gb   = float(nin_sum + nout_sum) / (1024.0 ** 3)
@@ -5860,24 +5819,19 @@ def check_cloudfront_idle_distributions(
             dist_tags[arn or d.get("Id", "")] = _tdict(t)
 
         # 3) Batch CloudWatch metrics (use passed CW client)
-        def _sid(name: str) -> str:
-            s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(name))
-            if not s or not s[0].isalpha():
-                s = "m_" + s
-            return s[:255]
 
         batch = cw.CloudWatchBatcher(region, client=cloudwatch)
         for d in dists:
             did = d.get("Id", "")
-            sid = _sid(did)
+
             # CloudFront metrics require Region='Global' dimension
             dims = [{"Name": "DistributionId", "Value": did}, {"Name": "Region", "Value": "Global"}]
 
-            batch.add(cw.MDQ(id=f"cf_req__{sid}",  namespace="AWS/CloudFront", metric="Requests",       dims=dims, stat="Sum",     period=PERIOD))
-            batch.add(cw.MDQ(id=f"cf_bdn__{sid}",  namespace="AWS/CloudFront", metric="BytesDownloaded", dims=dims, stat="Sum",     period=PERIOD))
-            batch.add(cw.MDQ(id=f"cf_bup__{sid}",  namespace="AWS/CloudFront", metric="BytesUploaded",   dims=dims, stat="Sum",     period=PERIOD))
-            batch.add(cw.MDQ(id=f"cf_4xx__{sid}",  namespace="AWS/CloudFront", metric="4xxErrorRate",    dims=dims, stat="Average", period=PERIOD))
-            batch.add(cw.MDQ(id=f"cf_5xx__{sid}",  namespace="AWS/CloudFront", metric="5xxErrorRate",    dims=dims, stat="Average", period=PERIOD))
+            batch.add(cw.MDQ(id=f"cf_req__{did}",  namespace="AWS/CloudFront", metric="Requests",       dims=dims, stat="Sum",     period=PERIOD))
+            batch.add(cw.MDQ(id=f"cf_bdn__{did}",  namespace="AWS/CloudFront", metric="BytesDownloaded", dims=dims, stat="Sum",     period=PERIOD))
+            batch.add(cw.MDQ(id=f"cf_bup__{did}",  namespace="AWS/CloudFront", metric="BytesUploaded",   dims=dims, stat="Sum",     period=PERIOD))
+            batch.add(cw.MDQ(id=f"cf_4xx__{did}",  namespace="AWS/CloudFront", metric="4xxErrorRate",    dims=dims, stat="Average", period=PERIOD))
+            batch.add(cw.MDQ(id=f"cf_5xx__{did}",  namespace="AWS/CloudFront", metric="5xxErrorRate",    dims=dims, stat="Average", period=PERIOD))
 
         try:
             series = batch.execute(start, now, scan_by="TimestampDescending")
@@ -5903,14 +5857,12 @@ def check_cloudfront_idle_distributions(
                 tags = dist_tags.get(arn, {})
                 name = tags.get("Name", domain or did)
 
-                sid = _sid(did)
-
                 # metrics
-                req_sum   = float(sum(v for _, v in series.get(f"cf_req__{sid}", [])))
-                bdn_sum   = float(sum(v for _, v in series.get(f"cf_bdn__{sid}", [])))
-                bup_sum   = float(sum(v for _, v in series.get(f"cf_bup__{sid}", [])))
-                e4_vals   = [v for _, v in series.get(f"cf_4xx__{sid}", [])]
-                e5_vals   = [v for _, v in series.get(f"cf_5xx__{sid}", [])]
+                req_sum   = float(sum(v for _, v in series.get(f"cf_req__{did}", [])))
+                bdn_sum   = float(sum(v for _, v in series.get(f"cf_bdn__{did}", [])))
+                bup_sum   = float(sum(v for _, v in series.get(f"cf_bup__{did}", [])))
+                e4_vals   = [v for _, v in series.get(f"cf_4xx__{did}", [])]
+                e5_vals   = [v for _, v in series.get(f"cf_5xx__{did}", [])]
                 e4_avg    = (sum(e4_vals) / len(e4_vals)) if e4_vals else 0.0
                 e5_avg    = (sum(e5_vals) / len(e5_vals)) if e5_vals else 0.0
 
