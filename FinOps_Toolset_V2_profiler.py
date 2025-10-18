@@ -5425,6 +5425,7 @@ def check_idle_ec2_instances(writer, ec2, cloudwatch,) -> None:
         # 2) Batch CloudWatch metrics for all instances (passed CW client)
         batch = cw.CloudWatchBatcher(region, client=cloudwatch)
         for it in instances:
+            iid = it["InstanceId"]
             sid = _sid(iid)
             dims = [{"Name": "InstanceId", "Value": iid}]
 
@@ -6300,7 +6301,7 @@ def main():
                 # CloudFront is global; no impact to put it in the region loop
                 run_check(profiler, check_name="check_cloudfront_idle_distributions", region=region,
                           fn=check_cloudfront_idle_distributions, writer=writer,
-                          cf_client=clients['cloudfront'])
+                          cloudfront=clients['cloudfront'], cloudwatch=clients['cloudwatch'])
 
                 run_check(profiler, check_name="check_rds_extended_support_mysql", region=region,
                           fn=check_rds_extended_support_mysql, writer=writer, rds=clients['rds'])
