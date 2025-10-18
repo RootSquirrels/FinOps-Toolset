@@ -2103,29 +2103,6 @@ def estimate_lb_cost(lb_type: str, region: Optional[str] = None) -> float:
     return round(float(hourly_price) * 24 * 30, 2)
 
 
-
-def build_lb_metadata(lb: Dict[str, Any]) -> LoadBalancerMetadata:
-    """Build structured metadata for a single load balancer."""
-    lb_name = lb.get("LoadBalancerName", "")
-    lb_arn = lb.get("LoadBalancerArn", "")
-    lb_type = (lb.get("Type") or "").lower()
-    lb_state = lb.get("State", {}).get("Code", "")
-    created = lb.get("CreatedTime")
-    created_str = created.isoformat() if hasattr(created, "isoformat") else str(created or "")
-
-    monthly_cost = estimate_lb_cost(lb_type, region=region)
-
-    return LoadBalancerMetadata(
-        name=lb_name,
-        arn=lb_arn,
-        lb_type=lb_type,
-        state=lb_state,
-        creation_date=created_str,
-        hourly_price=monthly_cost/HOURS_PER_MONTH,
-        monthly_cost=monthly_cost,
-    )
-
-
 def check_lb_listeners(elbv2, lb: LoadBalancerMetadata) -> List[str]:
     listeners = safe_aws_call(
         lambda: elbv2.describe_listeners(LoadBalancerArn=lb.arn).get("Listeners", []),
@@ -2190,11 +2167,6 @@ def check_idle_load_balancers(
 
     Back-compat: accepts cw/cloudwatch and elb/elbv2, and auto-creates clients if missing.
     """
-    # ----- Back-compat arg mapping / fallbacks -----
-    try:
-        import boto3
-    except Exception:
-        boto3 = None
 
     cloudwatch = cloudwatch or cw
     # If only a Classic client was given as 'elb', keep it; we may still need elbv2 (create lazily)
