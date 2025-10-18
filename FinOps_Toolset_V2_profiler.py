@@ -5492,20 +5492,7 @@ def _ec2_hourly_price(instance_type: str, region: str) -> float:
         return 0.0
 
 
-def _ec2_tagmap(tags):
-    """Convert AWS tag list to {Key: Value}."""
-    out = {}
-    if not tags:
-        return out
-    for t in tags:
-        k, v = t.get("Key"), t.get("Value")
-        if k is not None and v is not None:
-            out[k] = v
-    return out
-
-
-@retry_with_backoff()
-def check_idle_ec2_instances(writer: csv.writer, ec2, cloudwatch, lookback_days: int = EC2_LOOKBACK_DAYS) -> None:
+def check_idle_ec2_instances(writer, ec2, cloudwatch,) -> None:
     """
     Identify EC2 instances that appear **idle** and estimate potential monthly savings
     if they are stopped/terminated.
@@ -5539,123 +5526,151 @@ def check_idle_ec2_instances(writer: csv.writer, ec2, cloudwatch, lookback_days:
       • Missing metrics default to safe values (treated as 0 traffic/CPU).
       • Processing continues on per-page or per-instance errors, logged at INFO/ERROR.
     """
+
     try:
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=lookback_days)
-        period = EC2_CW_PERIOD
-        region = ec2.meta.region_name
+        region = (
+            getattr(getattr(cloudwatch, "meta", None), "region_name", "")
+            or getattr(getattr(ec2, "meta", None), "region_name", "")
+            or ""
+        )
 
-        paginator = ec2.get_paginator("describe_instances")
-        for page in paginator.paginate():
-            reservations = page.get("Reservations", []) or []
-            instances = []
-            for res in reservations:
-                for inst in res.get("Instances", []) or []:
-                    if (inst.get("State") or {}).get("Name") == "running":
-                        instances.append(inst)
-            if not instances:
-                continue
+        now = datetime.now(timezone.utc)
+        lookback_days = max(1, EC2_LOOKBACK_DAYS)
+        start = now - timedelta(days=lookback_days)
+        period = EC2_CW_PERIOD  # e.g., 86400
 
-            mdqs = []
-            for inst in instances:
-                iid = inst.get("InstanceId", "")
-                dims = [{"Name": "InstanceId", "Value": iid}]
-                for metric, stat in [
-                    ("CPUUtilization", "Average"),
-                    ("NetworkIn", "Sum"), ("NetworkOut", "Sum"),
-                    ("DiskReadOps", "Sum"), ("DiskWriteOps", "Sum"),
-                    ("StatusCheckFailed", "Maximum"),
-                ]:
-                    mdqs.append(build_mdq(
-                        id_hint=_cw_make_id("ec2", iid, metric, stat),
-                        namespace="AWS/EC2",
-                        metric=metric,
-                        dims=dims,
-                        stat=stat,
-                        period=period
-                    ))
+        # 1) List instances in this region
+        instances = []
+        token = None
+        while True:
+            try:
+                resp = ec2.describe_instances(NextToken=token) if token else ec2.describe_instances()
+            except ClientError as e:
+                logging.error(f"[EC2] describe_instances failed in {region}: {e}")
+                break
 
-            md = cw_get_metric_data_bulk(cloudwatch, mdqs, start, end, scan_by="TimestampAscending")
+            for r in resp.get("Reservations", []):
+                instances.extend(r.get("Instances", []))
+            token = resp.get("NextToken")
+            if not token:
+                break
 
-            def vals(iid, metric, stat):
-                qid = _cw_make_id("ec2", iid, metric, stat)
-                return [v for _, v in md.get(qid, [])]
+        if not instances:
+            return
 
-            for inst in instances:
+        def tags_dict(aws_tags):
+            if not aws_tags:
+                return {}
+            return {t.get("Key", ""): t.get("Value", "") for t in aws_tags}
+
+        # 2) Batch CloudWatch metrics for all instances (passed CW client)
+        batch = cw.CloudWatchBatcher(region, client=cloudwatch)
+        for it in instances:
+            iid = it["InstanceId"]
+            dims = [{"Name": "InstanceId", "Value": iid}]
+            batch.add(cw.MDQ(id=f"ec2_cpu__{iid}",  namespace="AWS/EC2", metric="CPUUtilization", dims=dims, stat="Average", period=period))
+            batch.add(cw.MDQ(id=f"ec2_nin__{iid}",  namespace="AWS/EC2", metric="NetworkIn",      dims=dims, stat="Sum",     period=period))
+            batch.add(cw.MDQ(id=f"ec2_nout__{iid}", namespace="AWS/EC2", metric="NetworkOut",     dims=dims, stat="Sum",     period=period))
+            batch.add(cw.MDQ(id=f"ec2_drd__{iid}",  namespace="AWS/EC2", metric="DiskReadOps",    dims=dims, stat="Sum",     period=period))
+            batch.add(cw.MDQ(id=f"ec2_dwr__{iid}",  namespace="AWS/EC2", metric="DiskWriteOps",   dims=dims, stat="Sum",     period=period))
+
+        try:
+            series = batch.execute(start, now, scan_by="TimestampDescending")
+        except Exception as e:
+            logging.exception(f"[EC2] CloudWatch batch execute failed in {region}: {e}")
+            series = {}
+
+        # 3) Emit rows
+        for it in instances:
+            try:
+                iid = it["InstanceId"]
+                itype = it.get("InstanceType", "")
+                state = (it.get("State", {}) or {}).get("Name", "")
+                launch_time = it.get("LaunchTime")
+                if isinstance(launch_time, datetime) and launch_time.tzinfo is None:
+                    launch_time = launch_time.replace(tzinfo=timezone.utc)
+                created_iso = (launch_time or now).astimezone(timezone.utc).isoformat()
+
+                tdict = tags_dict(it.get("Tags", []))
+                name = tdict.get("Name", iid)
+
+                # Extract metrics
+                cpu_vals = [v for _, v in series.get(f"ec2_cpu__{iid}", [])]
+                nin_sum  = sum(v for _, v in series.get(f"ec2_nin__{iid}", []))
+                nout_sum = sum(v for _, v in series.get(f"ec2_nout__{iid}", []))
+                drd_sum  = sum(v for _, v in series.get(f"ec2_drd__{iid}", []))
+                dwr_sum  = sum(v for _, v in series.get(f"ec2_dwr__{iid}", []))
+
+                avg_cpu  = (sum(cpu_vals) / len(cpu_vals)) if cpu_vals else 0.0
+                net_gb   = float(nin_sum + nout_sum) / (1024.0 ** 3)
+                disk_ops = float(drd_sum + dwr_sum)
+
+                # Thresholds from config
+                idle_cpu  = avg_cpu  <= EC2_IDLE_CPU_PCT
+                idle_net  = net_gb   <= EC2_IDLE_NET_GB
+                idle_disk = disk_ops <= EC2_IDLE_DISK_OPS
+                is_idle   = idle_cpu and idle_net and idle_disk and state == "running"
+
+                # Estimated monthly compute using your helper & math
                 try:
-                    iid = inst.get("InstanceId", "")
-                    itype = inst.get("InstanceType", "")
-                    state = (inst.get("State") or {}).get("Name", "")
-                    launch = inst.get("LaunchTime")
-                    launch_str = launch.isoformat() if hasattr(launch, "isoformat") else ""
-                    tags = _ec2_tagmap(inst.get("Tags", []))
-                    name = tags.get("Name", iid)
-
-                    cpu_series = vals(iid, "CPUUtilization", "Average")
-                    cpu_avg = (sum(cpu_series) / max(1, len(cpu_series))) if cpu_series else 0.0
-                    net_gb = (sum(vals(iid, "NetworkIn", "Sum")) + sum(vals(iid, "NetworkOut", "Sum"))) / (1024 ** 3)
-                    disk_ops = (sum(vals(iid, "DiskReadOps", "Sum")) + sum(vals(iid, "DiskWriteOps", "Sum")))
-                    scf = vals(iid, "StatusCheckFailed", "Maximum")
-                    max_scf = max(scf) if scf else 0.0
-
-                    is_idle = (cpu_avg < EC2_IDLE_CPU_PCT and net_gb < EC2_IDLE_NET_GB and
-                               disk_ops < EC2_IDLE_DISK_OPS and max_scf == 0.0)
-
                     hourly = _ec2_hourly_price(itype, region)
-                    monthly_compute = round(hourly * 24 * 30, 2) if hourly > 0 else 0.0
+                except Exception:
+                    hourly = 0.0
+                monthly_compute = round(hourly * 24 * 30, 2) if hourly > 0 else 0.0
 
-                    # Signals + confidence
-                    signals = {
-                        "CPUAvgPct": round(cpu_avg, 2),
-                        "NetGB": round(net_gb, 3),
-                        "DiskOps": int(disk_ops),
-                        "StatusChkFailed": int(max_scf),
-                        "LookbackDays": lookback_days,
-                    }
-                    w = {
-                        "cpu_quiet": 1.0 if cpu_avg < EC2_IDLE_CPU_PCT else 0.0,
-                        "net_quiet": 1.0 if net_gb < EC2_IDLE_NET_GB else 0.0,
-                        "disk_quiet": 0.5 if disk_ops < EC2_IDLE_DISK_OPS else 0.0,
-                        "health_ok": 1.0 if max_scf == 0 else 0.0,
-                    }
-                    conf = score_confidence(w, evidence_ok=True)
+                # Flags, confidence, potential
+                flags = []
+                missing = [k for k in REQUIRED_TAG_KEYS if not tdict.get(k)]
+                if missing:
+                    flags.append(f"MissingRequiredTags={','.join(missing)}")
+                if is_idle:
+                    flags.append("idle_ec2_candidate")
 
-                    flags = [
-                        f"CPUAvg≈{cpu_avg:.2f}%/{lookback_days}d",
-                        f"Net≈{net_gb:.2f}GB/{lookback_days}d",
-                        f"DiskOps≈{int(disk_ops)}"
-                    ]
-                    if max_scf > 0:
-                        flags.append("StatusCheckFailedSeen")
-                    if is_idle:
-                        flags.append("IdleInstance")
-                        if monthly_compute > 0:
-                            flags.append(f"PotentialSaving={monthly_compute}$")
+                confidence = 100 if is_idle else None
+                potential  = monthly_compute if is_idle else None
 
-                    if is_idle:
-                        write_resource_to_csv(
-                            writer=writer,
-                            resource_id=iid,
-                            name=name,
-                            resource_type="EC2Instance",
-                            owner_id=ACCOUNT_ID,
-                            state=state,
-                            creation_date=launch_str,
-                            estimated_cost=monthly_compute,
-                            app_id=tags.get("ApplicationID", "NULL"),
-                            app=tags.get("Application", "NULL"),
-                            env=tags.get("Environment", "NULL"),
-                            flags=flags,
-                            confidence=conf,
-                            signals=signals
-                        )
-                        logging.info(f"[check_idle_ec2_instances] Idle {iid} ({itype}) flags={flags}")
+                signals = {
+                    "Region": region,
+                    "InstanceType": itype,
+                    "State": state,
+                    "AvgCPUPercent": f"{avg_cpu:.2f}",
+                    f"NetGB{lookback_days}d": f"{net_gb:.3f}",
+                    f"DiskOps{lookback_days}d": str(int(disk_ops)),
+                    "LookbackDays": str(lookback_days),
+                }
 
-                except Exception as ie:
-                    logging.error(f"[check_idle_ec2_instances] Instance error {inst.get('InstanceId','?')}: {ie}")
+                # Use global ACCOUNT_ID
+                owner_id = ""
+                try:
+                    owner_id = str(ACCOUNT_ID)
+                except NameError:
+                    owner_id = ""
+
+                write_resource_to_csv(
+                    writer=writer,
+                    resource_id=iid,
+                    name=name,
+                    resource_type="EC2Instance",
+                    owner_id=owner_id,
+                    state=str(state),
+                    creation_date=created_iso,
+                    estimated_cost=monthly_compute,  # <= your original monthly compute estimate
+                    app_id=tdict.get("ApplicationID", "NULL"),
+                    app=tdict.get("Application", "NULL"),
+                    env=tdict.get("Environment", "NULL"),
+                    referenced_in="",
+                    flags=flags,
+                    object_count="",
+                    potential_saving=potential,
+                    confidence=confidence,
+                    signals=signals,
+                )
+            except Exception as e:
+                logging.exception(f"[EC2] emit failed for {it.get('InstanceId','?')} in {region}: {e}")
 
     except Exception as e:
-        logging.error(f"[check_idle_ec2_instances] Fatal error: {e}")
+        logging.exception(f"[EC2] check_ec2_idle_instances_refactored failed: {e}")
+        return
 
 #endregion
 
