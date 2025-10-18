@@ -1,13 +1,31 @@
-"""
-Generic tests for FinOps_Toolset_V2_profiler.py
+"""Generic tests for :mod:`FinOps_Toolset_V2_profiler` checkers.
 
-- Discovers and runs all check_* functions using safe stubs (no AWS calls).
-- Validates CSV invariants (Signals stays in one cell; Potential_Saving_USD derived from flags).
-- Adapts to the real writer signature (no potential_saving_usd kw).
+This module provides *offline* unit tests that do not call AWS. It does so by
+patching helper functions and injecting null AWS clients/paginators to satisfy
+the signatures of all ``check_*`` functions discovered in the target module.
 
-Run:
-  python -m unittest -v
+Test coverage highlights:
+- CSV invariants (delimiter, Signals cell, Potential_Saving_USD derivation).
+- ``get_price`` region/default resolution logic.
+- ``safe_aws_call`` happy path and exception behavior.
+- Smoke-run of every ``check_*`` with stubs to catch obvious regressions.
+- Determinism: repeated runs write the same number of rows.
+- Absence of error logs when checkers run on empty/no-op inputs.
+
+Run these tests locally with::
+
+    python -m unittest -v
+
+They are designed to work without credentials and without network access.
+
+Notes for maintainers
+---------------------
+To keep noise low, tests prefer broad compatibility (e.g., they accept either
+empty string or ``0`` for missing values where the implementation may differ)
+and avoid enforcing presentation micro-details.
 """
+
+from __future__ import annotations
 
 import csv
 import io
@@ -16,39 +34,76 @@ import unittest
 import copy
 import logging
 from contextlib import contextmanager
+from inspect import Parameter
+from typing import Dict, Iterable, Iterator, List, Mapping, Tuple
 
 import FinOps_Toolset_V2_profiler as finops
+
+
+__all__ = [
+    "capture_errors",
+    "NullPaginator",
+    "NullAWSClient",
+    "_signals_ok",
+    "Patcher",
+    "TestSafeAwsCall",
+    "TestPricingLookup",
+    "TestAllClientsCovered",
+    "TestAllCheckersRun",
+    "TestGetPriceResolution",
+    "TestCheckerDeterminism",
+    "TestNoErrorLogsFromCheckers",
+    "TestWriterBackCompat",
+    "TestCSVInvariants",
+]
 
 
 # -------------------- Stubs & utilities --------------------
 
 @contextmanager
-def capture_errors():
-    seen = {"errors": [], "exceptions": []}
+def capture_errors() -> Iterator[Dict[str, List[str]]]:
+    """Context manager that captures ``logging.error`` and ``logging.exception``.
+
+    Returns a dict with two lists under the keys ``"errors"`` and ``"exceptions"``,
+    populated with formatted log messages emitted while the context is active.
+    """
+    seen: Dict[str, List[str]] = {"errors": [], "exceptions": []}
     orig_err = logging.error
     orig_exc = logging.exception
     try:
-        def _err(msg, *a, **k): seen["errors"].append(msg); orig_err(msg, *a, **k)
-        def _exc(msg, *a, **k): seen["exceptions"].append(msg); orig_exc(msg, *a, **k)
-        logging.error = _err
-        logging.exception = _exc
+        def _err(msg, *args, **kwargs):  # type: ignore[no-untyped-def]
+            seen["errors"].append(str(msg))
+            orig_err(msg, *args, **kwargs)
+
+        def _exc(msg, *args, **kwargs):  # type: ignore[no-untyped-def]
+            seen["exceptions"].append(str(msg))
+            orig_exc(msg, *args, **kwargs)
+
+        logging.error = _err  # type: ignore[assignment]
+        logging.exception = _exc  # type: ignore[assignment]
         yield seen
     finally:
-        logging.error = orig_err
-        logging.exception = orig_exc
+        logging.error = orig_err  # type: ignore[assignment]
+        logging.exception = orig_exc  # type: ignore[assignment]
 
 
 class _Meta:
-    def __init__(self, region_name="eu-west-1"):
+    """Minimal object exposing a ``region_name`` attribute used by boto3 clients."""
+    def __init__(self, region_name: str = "eu-west-1") -> None:
         self.region_name = region_name
 
+
 class NullPaginator:
-    """Paginator that yields a page-shaped dict matching the requested API, so code that indexes
-    into keys like 'LoadBalancers' or 'Reservations' won't KeyError."""
-    def __init__(self, name: str):
+    """Paginator that yields a dict matching the requested API's typical shape.
+
+    This prevents ``KeyError`` in code that indexes into e.g., ``LoadBalancers``,
+    ``Reservations``, etc.
+    """
+    def __init__(self, name: str) -> None:
         self.name = name
 
-    def paginate(self, *args, **kwargs):
+    def paginate(self) -> Iterable[Mapping[str, object]]:  # noqa: D401
+        """Yield a single empty page for the requested paginator name."""
         n = self.name
         if n == "describe_instances":
             yield {"Reservations": []}
@@ -56,45 +111,42 @@ class NullPaginator:
             yield {"RouteTables": []}
         elif n == "describe_nat_gateways":
             yield {"NatGateways": []}
-        elif n == "describe_load_balancers":          
+        elif n == "describe_load_balancers":
             yield {"LoadBalancers": []}
-        elif n == "describe_load_balancers_elb":      
+        elif n == "describe_load_balancers_elb":
             yield {"LoadBalancerDescriptions": []}
         elif n == "describe_parameters":
             yield {"Parameters": []}
         elif n == "describe_images":
             yield {"Images": []}
         elif n == "list_web_acls":
-            yield {"WebACLs": []}     
+            yield {"WebACLs": []}
         elif n == "list_distributions":
             yield {"DistributionList": {"Items": []}}
         elif n == "list_streaming_distributions":
             yield {"StreamingDistributionList": {"Items": []}}
-        elif n == "list_distributions":
-            yield {"DistributionList": {"Items": []}}
-            return
-        elif n == "list_streaming_distributions":
-            yield {"StreamingDistributionList": {"Items": []}}
-            return
         elif n == "list_hosted_zones":
             yield {"HostedZones": []}
-            return
-
         else:
             yield {}
 
+
 class NullAWSClient:
-    """No-op client returning dicts with the keys most checkers index into."""
-    def __init__(self, region_name="eu-west-1"):
+    """No-op boto3-like client returning dicts with expected top-level keys.
+
+    Only implements the minimal subset used by the checkers under test.
+    """
+    def __init__(self, region_name: str = "eu-west-1") -> None:
         self.meta = _Meta(region_name)
 
-    def get_paginator(self, name):
+    def get_paginator(self, name: str) -> NullPaginator:
+        """Return a :class:`NullPaginator` for the given operation name."""
         return NullPaginator(name)
 
-    # Common describe/get/list methods (non-paginated)
-    def __getattr__(self, name):
-        # Return a function that yields a dict with appropriate top-level keys
-        def _f(*args, **kwargs):
+    # pylint: disable=too-many-return-statements, too-many-branches
+    def __getattr__(self, name: str):  # noqa: D401
+        """Return a function emulating common ``describe/get/list`` operations."""
+        def _f():  # type: ignore[no-untyped-def]
             # ELBv2
             if name == "describe_load_balancers":
                 return {"LoadBalancers": []}
@@ -127,7 +179,7 @@ class NullAWSClient:
             # CloudWatch
             if name == "get_metric_data":
                 return {"MetricDataResults": []}
-            # CloudFront (non-paginated variants, just in case)
+            # Route53 / CloudFront
             if name == "list_hosted_zones":
                 return {"HostedZones": []}
             if name == "list_resource_record_sets":
@@ -144,11 +196,83 @@ class NullAWSClient:
 
 
 def _signals_ok(cell: str) -> bool:
-    """Heuristic: cell should include multiple key=value pairs separated by ' | '"""
-    return " | " in cell or ("=" in cell and ";" in cell)  # tolerate legacy formats too
+    """Heuristic validation for the ``Signals`` CSV cell.
+
+    The cell should include multiple ``key=value`` pairs separated by ``" | "``
+    in the newest format, or it may contain legacy separators (e.g., semicolons).
+    """
+    return " | " in cell or ("=" in cell and ";" in cell)
+
+
+class TestSafeAwsCall(unittest.TestCase):
+    """Unit tests for :func:`finops.safe_aws_call`."""
+
+    def test_returns_default_on_exception(self) -> None:
+        """When the function raises, the provided default is returned."""
+        def boom():
+            raise RuntimeError("kaboom")
+        out = finops.safe_aws_call(boom, default={"ok": False}, context="unit")
+        self.assertEqual(out, {"ok": False})
+
+    def test_prefers_explicit_default_over_fallback(self) -> None:
+        """Explicit ``default`` takes precedence over any ``fallback`` kwarg."""
+        def boom():
+            raise RuntimeError("kaboom")
+        # Some implementations support `fallback=` kw; tolerate absence by ignoring it.
+        try:
+            out = finops.safe_aws_call(  # type: ignore[call-arg]
+                boom, default=123, context="unit", fallback={"x": 1}
+            )
+        except TypeError:
+            # Older signature without fallback; still pass
+            out = finops.safe_aws_call(boom, default=123, context="unit")
+        self.assertEqual(out, 123)
+
+    def test_success_path_returns_function_value(self) -> None:
+        """If the function succeeds, its value is returned unchanged."""
+        def ok():
+            return {"answer": 42}
+        out = finops.safe_aws_call(ok, default=None, context="unit")
+        self.assertEqual(out, {"answer": 42})
+
+
+class TestPricingLookup(unittest.TestCase):
+    """Unit tests for :func:`finops.get_price`."""
+
+    def setUp(self) -> None:
+        """Backup the pricing table before each test."""
+        self._bak = copy.deepcopy(finops.PRICING)
+
+    def tearDown(self) -> None:
+        """Restore the pricing table after each test."""
+        finops.PRICING = self._bak
+
+    def test_unknown_service_returns_default(self) -> None:
+        """Unknown services return the provided default price."""
+        finops.PRICING.clear()
+        self.assertEqual(
+            finops.get_price("Nope", "HOUR", region="eu-west-1", default=0.0), 0.0
+        )
+
+    def test_known_service_unknown_region_falls_back(self) -> None:
+        """If region is missing, use the service's default price."""
+        finops.PRICING.update({
+            "EIP": {"HOUR": {"default": 0.005}},
+        })
+        self.assertEqual(finops.get_price("EIP", "HOUR", region="eu-central-7"), 0.005)
+
+    def test_numeric_types_are_float(self) -> None:
+        """Returned prices must be numeric for math downstream."""
+        finops.PRICING.update({
+            "ALB": {"HOUR": {"default": 0.02}},
+        })
+        val = finops.get_price("ALB", "HOUR", region="eu-west-1")
+        self.assertIsInstance(val, (int, float))
 
 
 class TestAllClientsCovered(unittest.TestCase):
+    """Verify every checker signature's AWS clients are stubbed in the harness."""
+
     NON_CLIENT_PARAMS = {
         # Scalars / config
         "lookback_days", "days", "window", "threshold", "max_table_workers",
@@ -172,24 +296,25 @@ class TestAllClientsCovered(unittest.TestCase):
         "lambda", "lambda_", "awslambda", "lambda_client",
     }
 
-    def test_all_client_params_are_stubbed(self):
-        unknown = {}
+    def test_all_client_params_are_stubbed(self) -> None:
+        """Fail if any checker parameter *looks like* a client but isn't stubbed."""
+        unknown: Dict[str, List[str]] = {}
         for name, func in inspect.getmembers(finops, inspect.isfunction):
             if not name.startswith("check_"):
                 continue
             sig = inspect.signature(func)
-            for p in sig.parameters.values():
-                param = p.name
-                if param in self.NON_CLIENT_PARAMS:
+            for param in sig.parameters.values():
+                pname = param.name
+                if pname in self.NON_CLIENT_PARAMS:
                     continue
                 # Decide whether this looks like an AWS client param
                 looks_like_client = (
-                    param.endswith("_client")
-                    or param in TestAllCheckersRun.AWS_PARAM_NAMES
-                    or param in self.KNOWN_SERVICE_NAMES
+                    pname.endswith("_client")
+                    or pname in TestAllCheckersRun.AWS_PARAM_NAMES
+                    or pname in self.KNOWN_SERVICE_NAMES
                 )
-                if looks_like_client and param not in TestAllCheckersRun.AWS_PARAM_NAMES:
-                    unknown.setdefault(name, []).append(param)
+                if looks_like_client and pname not in TestAllCheckersRun.AWS_PARAM_NAMES:
+                    unknown.setdefault(name, []).append(pname)
 
         if unknown:
             details = "\n".join(f"- {k}: {v}" for k, v in unknown.items())
@@ -199,24 +324,28 @@ class TestAllClientsCovered(unittest.TestCase):
 # -------------------- Module patching --------------------
 
 class Patcher:
-    """Context manager that patches the finops module for the duration of tests."""
-    def __enter__(self):
+    """Patch the :mod:`finops` module to guarantee offline, deterministic behavior."""
+
+    def __enter__(self) -> "Patcher":
+        """Apply patches before a test block begins."""
         # 1) Patch cw_get_metric_data_bulk to never hit AWS
         self._orig_cw = getattr(finops, "cw_get_metric_data_bulk", None)
         finops.cw_get_metric_data_bulk = lambda *a, **k: {}
 
-        # 2) Patch safe_aws_call to accept fallback kw and always return default/fallback on error
+        # 2) Patch safe_aws_call: prefer default, then fallback on exceptions
         self._orig_safe = getattr(finops, "safe_aws_call", None)
+
         def _safe_aws_call(func, default=None, context="", fallback=None):
             try:
                 return func()
-            except Exception:
-                # prefer explicit default; else fallback if provided; else {}
+            except Exception:  # pylint: disable=broad-exception-caught
                 return default if default is not None else (fallback if fallback is not None else {})
-        finops.safe_aws_call = _safe_aws_call
+
+        finops.safe_aws_call = _safe_aws_call  # type: ignore[assignment]
 
         # 3) Patch get_price to never throw (return 0.0 if missing)
         self._orig_get_price = getattr(finops, "get_price", None)
+
         def _get_price(service, key, region=None, default=0.0):
             try:
                 table = finops.PRICING.get(service, {})
@@ -226,9 +355,10 @@ class Patcher:
                 if val is None:
                     return default
                 return val
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 return default
-        finops.get_price = _get_price
+
+        finops.get_price = _get_price  # type: ignore[assignment]
 
         # 4) Default constants in case they are missing
         finops.HOURS_PER_MONTH = getattr(finops, "HOURS_PER_MONTH", 730)
@@ -238,19 +368,20 @@ class Patcher:
 
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type, exc, tb) -> None:
+        """Revert patches when a test block ends."""
         if self._orig_cw is not None:
-            finops.cw_get_metric_data_bulk = self._orig_cw
+            finops.cw_get_metric_data_bulk = self._orig_cw  # type: ignore[assignment]
         if self._orig_safe is not None:
-            finops.safe_aws_call = self._orig_safe
+            finops.safe_aws_call = self._orig_safe  # type: ignore[assignment]
         if self._orig_get_price is not None:
-            finops.get_price = self._orig_get_price
+            finops.get_price = self._orig_get_price  # type: ignore[assignment]
 
 
 # -------------------- Test suites --------------------
 
 class TestAllCheckersRun(unittest.TestCase):
-    """Discover all check_* functions and run them with NullAWSClient + in-memory CSV writer."""
+    """Discover all ``check_*`` functions and run them with null clients and CSV writer."""
 
     AWS_PARAM_NAMES = {
         # CW + ELB + Route53
@@ -265,21 +396,25 @@ class TestAllCheckersRun(unittest.TestCase):
         "lambda_client", "lambda_", "awslambda",
         # Transit/RAM/Other
         "tgw", "ram", "emr", "cfn",
-
     }
 
-    def _make_kwargs(self, sig: inspect.Signature):
-        """Build kwargs per checker: in-memory csv.writer + Null clients + harmless defaults."""
+    def _make_kwargs(self, sig: inspect.Signature) -> Tuple[Dict[str, object], io.StringIO]:
+        """Construct kwargs for a checker based on its signature.
+
+        Provides an in-memory CSV writer and a :class:`NullAWSClient` for client-like
+        parameters. Required scalars like lookback/window/region/account receive
+        harmless defaults.
+        """
         buf = io.StringIO()
         writer = csv.writer(buf, delimiter=';', lineterminator='\n')
 
-        kwargs = {}
+        kwargs: Dict[str, object] = {}
         for name, param in sig.parameters.items():
             if name == "writer":
                 kwargs[name] = writer
             elif name in self.AWS_PARAM_NAMES:
                 kwargs[name] = NullAWSClient()
-            elif param.default is inspect._empty:
+            elif param.default is Parameter.empty:
                 # Required arg—provide safe default
                 if "days" in name or "lookback" in name or "window" in name:
                     kwargs[name] = 7
@@ -292,7 +427,8 @@ class TestAllCheckersRun(unittest.TestCase):
             # otherwise, let checker use its default
         return kwargs, buf
 
-    def test_every_check_function_runs(self):
+    def test_every_check_function_runs(self) -> None:
+        """Smoke test: call every checker and validate basic CSV properties."""
         with Patcher():
             failures = []
             for name, func in inspect.getmembers(finops, inspect.isfunction):
@@ -304,16 +440,16 @@ class TestAllCheckersRun(unittest.TestCase):
                 kwargs, buf = self._make_kwargs(sig)
                 try:
                     func(**kwargs)
-                except Exception as e:
-                    failures.append((name, repr(e)))
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    failures.append((name, repr(exc)))
                     continue
 
                 # Re-parse CSV to ensure shape remains intact for ';' delimiter
                 csv_text = buf.getvalue()
                 rows = list(csv.reader(io.StringIO(csv_text), delimiter=';'))
-                for r in rows[1:]:
-                    if len(r) > 0:
-                        signals_cell = r[-1]
+                for row in rows[1:]:
+                    if row:
+                        signals_cell = row[-1]
                         self.assertTrue(
                             signals_cell == "" or " | " in signals_cell or "=" in signals_cell,
                             f"{name}: Signals cell looks empty/invalid: '{signals_cell}'"
@@ -325,8 +461,10 @@ class TestAllCheckersRun(unittest.TestCase):
 
 
 class TestGetPriceResolution(unittest.TestCase):
-    def test_region_and_default_resolution(self):
+    """Validation for region-specific and default fallback price resolution."""
 
+    def test_region_and_default_resolution(self) -> None:
+        """Ensure region override beats default; missing region falls back to default."""
         bak = copy.deepcopy(finops.PRICING)
         try:
             finops.PRICING.update({
@@ -352,9 +490,12 @@ class TestGetPriceResolution(unittest.TestCase):
 
 
 class TestCheckerDeterminism(unittest.TestCase):
-    def test_checker_writes_same_count_twice(self):
+    """Ensure that re-running a checker yields the same number of CSV rows."""
+
+    def test_checker_writes_same_count_twice(self) -> None:
+        """Pick a subset of checkers and compare row counts across two runs."""
         candidate_names = [
-            n for n, f in inspect.getmembers(finops, inspect.isfunction) if n.startswith("check_")
+            n for n, _ in inspect.getmembers(finops, inspect.isfunction) if n.startswith("check_")
         ]
         to_test = candidate_names[:5]  # keep it light; or pass all if fast
 
@@ -367,15 +508,21 @@ class TestCheckerDeterminism(unittest.TestCase):
                 # first run
                 buf1 = io.StringIO()
                 w1 = csv.writer(buf1, delimiter=';', lineterminator='\n')
-                kwargs1 = {}
-                for p, prm in sig.parameters.items():
-                    if p == "writer": kwargs1[p] = w1
-                    elif p in TestAllCheckersRun.AWS_PARAM_NAMES: kwargs1[p] = NullAWSClient()
-                    elif prm.default is inspect._empty:
-                        if "days" in p or "lookback" in p or "window" in p: kwargs1[p] = 7
-                        elif "region" in p: kwargs1[p] = "eu-west-1"
-                        elif "account" in p or "owner" in p: kwargs1[p] = "423183760907"
-                        else: kwargs1[p] = None
+                kwargs1: Dict[str, object] = {}
+                for pname, prm in sig.parameters.items():
+                    if pname == "writer":
+                        kwargs1[pname] = w1
+                    elif pname in TestAllCheckersRun.AWS_PARAM_NAMES:
+                        kwargs1[pname] = NullAWSClient()
+                    elif prm.default is Parameter.empty:
+                        if "days" in pname or "lookback" in pname or "window" in pname:
+                            kwargs1[pname] = 7
+                        elif "region" in pname:
+                            kwargs1[pname] = "eu-west-1"
+                        elif "account" in pname or "owner" in pname:
+                            kwargs1[pname] = "423183760907"
+                        else:
+                            kwargs1[pname] = None
                 fn(**kwargs1)
                 rows1 = list(csv.reader(io.StringIO(buf1.getvalue()), delimiter=';'))
                 # second run
@@ -388,8 +535,10 @@ class TestCheckerDeterminism(unittest.TestCase):
 
 
 class TestNoErrorLogsFromCheckers(unittest.TestCase):
-    def test_run_all_checkers_no_errors_logged(self):
-        # Reuse the “AllCheckers” harness with our Patcher
+    """Ensure no error/exception logs are emitted by checkers on empty inputs."""
+
+    def test_run_all_checkers_no_errors_logged(self) -> None:
+        """Run all checkers and assert the error/exception logs remain empty."""
         with Patcher():
             failures = []
             with capture_errors() as seen:
@@ -402,36 +551,44 @@ class TestNoErrorLogsFromCheckers(unittest.TestCase):
                     # Build kwargs like in the main harness
                     buf = io.StringIO()
                     writer = csv.writer(buf, delimiter=';', lineterminator='\n')
-                    kwargs = {}
-                    for p, prm in sig.parameters.items():
-                        if p == "writer": kwargs[p] = writer
-                        elif p in TestAllCheckersRun.AWS_PARAM_NAMES: kwargs[p] = NullAWSClient()
-                        elif prm.default is inspect._empty:
-                            if "days" in p or "lookback" in p or "window" in p: kwargs[p] = 7
-                            elif "region" in p: kwargs[p] = "eu-west-1"
-                            elif "account" in p or "owner" in p: kwargs[p] = "423183760907"
-                            else: kwargs[p] = None
+                    kwargs: Dict[str, object] = {}
+                    for pname, prm in sig.parameters.items():
+                        if pname == "writer":
+                            kwargs[pname] = writer
+                        elif pname in TestAllCheckersRun.AWS_PARAM_NAMES:
+                            kwargs[pname] = NullAWSClient()
+                        elif prm.default is Parameter.empty:
+                            if "days" in pname or "lookback" in pname or "window" in pname:
+                                kwargs[pname] = 7
+                            elif "region" in pname:
+                                kwargs[pname] = "eu-west-1"
+                            elif "account" in pname or "owner" in pname:
+                                kwargs[pname] = "423183760907"
+                            else:
+                                kwargs[pname] = None
                     try:
                         func(**kwargs)
-                    except Exception as e:
-                        failures.append((name, repr(e)))
+                    except Exception as exc:  # pylint: disable=broad-exception-caught
+                        failures.append((name, repr(exc)))
                 # No exceptions raised
                 if failures:
                     self.fail("Some checkers raised exceptions:\n" + "\n".join(f"- {n}: {e}" for n, e in failures))
                 # No error/exception logs either
-                self.assertFalse(seen["errors"] or seen["exceptions"],
-                                 f"Errors logged: {seen}")
+                self.assertFalse(seen["errors"] or seen["exceptions"], f"Errors logged: {seen}")
 
 
 class TestWriterBackCompat(unittest.TestCase):
+    """Backwards-compat checks for the CSV writer normalization rules."""
+
     HEADER = [
-        "Resource_ID","Name","ResourceType","OwnerId","State","Creation_Date",
-        "Storage_GB","Object_Count","Estimated_Cost_USD","Potential_Saving_USD",
-        "ApplicationID","Application","Environment","ReferencedIn",
-        "FlaggedForReview","Confidence","Signals"
+        "Resource_ID", "Name", "ResourceType", "OwnerId", "State", "Creation_Date",
+        "Storage_GB", "Object_Count", "Estimated_Cost_USD", "Potential_Saving_USD",
+        "ApplicationID", "Application", "Environment", "ReferencedIn",
+        "FlaggedForReview", "Confidence", "Signals",
     ]
 
-    def _roundtrip(self, signals_value):
+    def _roundtrip(self, signals_value) -> Tuple[str, str]:
+        """Write a single row and return the ``Signals`` cell and raw CSV text."""
         buf = io.StringIO()
         writer = csv.writer(buf, delimiter=';', lineterminator='\n')
         writer.writerow(self.HEADER)
@@ -458,32 +615,34 @@ class TestWriterBackCompat(unittest.TestCase):
         row = list(csv.reader(io.StringIO(raw), delimiter=';'))[-1]
         return row[-1], raw
 
-    def test_signals_as_string(self):
+    def test_signals_as_string(self) -> None:
+        """Accept a pre-formatted string as ``Signals`` content."""
         sig, raw = self._roundtrip("Type=ALB | TrafficGB=0.10")
         self.assertIn("Type=ALB", sig, f"raw={raw}")
 
-    def test_signals_as_list(self):
+    def test_signals_as_list(self) -> None:
+        """Join list inputs into the canonical pipe-delimited string."""
         sig, raw = self._roundtrip(["Type=ALB", "TrafficGB=0.10"])
-        # Depending on writer normalization, expect join with ' | ' or '; '
         self.assertTrue("Type=ALB" in sig and "TrafficGB=0.10" in sig, f"raw={raw}")
 
-    def test_signals_as_dict(self):
+    def test_signals_as_dict(self) -> None:
+        """Render dict inputs as ``key=value`` pairs."""
         sig, raw = self._roundtrip({"Type": "ALB", "TrafficGB": 0.10})
         self.assertTrue("Type=ALB" in sig and "TrafficGB=0.1" in sig, f"raw={raw}")
 
 
 class TestCSVInvariants(unittest.TestCase):
-    """Focused tests for write_resource_to_csv normalization (Signals & PotentialSaving)."""
+    """Focused tests for ``write_resource_to_csv`` normalization and invariants."""
 
     HEADER = [
         "Resource_ID", "Name", "ResourceType", "OwnerId", "State", "Creation_Date",
         "Storage_GB", "Object_Count", "Estimated_Cost_USD", "Potential_Saving_USD",
         "ApplicationID", "Application", "Environment", "ReferencedIn",
-        "FlaggedForReview", "Confidence", "Signals"
+        "FlaggedForReview", "Confidence", "Signals",
     ]
 
-    def _roundtrip(self, flags, signals):
-        # in-memory CSV with ';' to mimic your real output
+    def _roundtrip(self, flags: str, signals: object) -> Tuple[List[str], str]:
+        """Write one row using provided flags/signals and return parsed row + CSV text."""
         buf = io.StringIO()
         writer = csv.writer(buf, delimiter=';', lineterminator='\n')
         writer.writerow(self.HEADER)
@@ -503,46 +662,44 @@ class TestCSVInvariants(unittest.TestCase):
             app="App",
             env="dev",
             referenced_in="",
-            flags=flags,                 
+            flags=flags,
             confidence=100,
-            signals=signals
+            signals=signals,
         )
 
         raw = buf.getvalue()
         rows = list(csv.reader(io.StringIO(raw), delimiter=';'))
         return rows[-1], raw
 
-    def test_signals_one_cell_when_contains_pipe(self):
+    def test_signals_one_cell_when_contains_pipe(self) -> None:
+        """Ensure pipe-delimited Signals remain in a single CSV cell."""
         row, raw = self._roundtrip(
             flags="LowTrafficLB, MissingRequiredTags",
-            signals="Type=ALB | AvgLCU_per_hour=0.0012 | TrafficGB=0.42 | RequestCount=12345"
+            signals="Type=ALB | AvgLCU_per_hour=0.0012 | TrafficGB=0.42 | RequestCount=12345",
         )
         self.assertEqual(len(row), len(self.HEADER), f"Signals split the row: {raw}")
         self.assertTrue(row[-1].startswith("Type=ALB"), f"Unexpected signals: {row[-1]}")
         self.assertIn("TrafficGB=0.42", row[-1])
 
-    def test_potential_saving_is_derived_from_flags(self):
+    def test_potential_saving_is_derived_from_flags(self) -> None:
+        """Potential_Saving_USD should be derived from the ``PotentialSaving=...$`` flag."""
         row, _ = self._roundtrip(
             flags="ZeroTraffic, MissingRequiredTags, PotentialSaving=16.43$",
-            signals="Type=ALB | TrafficGB=0.00"
+            signals="Type=ALB | TrafficGB=0.00",
         )
         self.assertEqual(row[self.HEADER.index("Estimated_Cost_USD")], "16.43")
         self.assertEqual(row[self.HEADER.index("Potential_Saving_USD")], "16.43")
 
-    def test_owner_id_not_transformed_or_safely_text(self):
-        row, _ = self._roundtrip(
-            flags="",
-            signals="Type=NLB | NewFlows=0"
-        )
+    def test_owner_id_not_transformed_or_safely_text(self) -> None:
+        """Account IDs should remain numeric (or be safely quoted for Excel)."""
+        row, _ = self._roundtrip(flags="", signals="Type=NLB | NewFlows=0")
         owner = row[self.HEADER.index("OwnerId")]
         # Accept both plain digits and "'digits" (Excel-protected export)
         self.assertTrue(owner == "423183760907" or owner.endswith("423183760907"))
 
-    def test_state_and_creation_date_present(self):
-        row, _ = self._roundtrip(
-            flags="",
-            signals="Type=ALB | TrafficGB=0.12"
-        )
+    def test_state_and_creation_date_present(self) -> None:
+        """Ensure required text fields are present and unmodified."""
+        row, _ = self._roundtrip(flags="", signals="Type=ALB | TrafficGB=0.12")
         self.assertEqual(row[self.HEADER.index("State")], "active")
         self.assertEqual(row[self.HEADER.index("Creation_Date")], "2025-01-01T00:00:00Z")
 
