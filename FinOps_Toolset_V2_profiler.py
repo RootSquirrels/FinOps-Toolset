@@ -192,7 +192,7 @@ from finops_toolset.config import (
 )
 
 from finops_toolset.pricing import PRICING as PRICING, get_price as get_price, per_month
-from core.cloudwatch import CloudWatchBatcher, build_mdq
+import core.cloudwatch as cw
 
 #endregion
 
@@ -1000,7 +1000,6 @@ def check_s3_buckets_refactored(
                 region = _normalize_region(loc.get("LocationConstraint"))
             except Exception as e:
                 logging.info(f"[S3] get_bucket_location({bname}) -> {e}")
-            # tags (best effort)
             if region != "unknown":
                 try:
                     s3r = boto3.client("s3", region_name=region, config=SDK_CONFIG)
@@ -1027,7 +1026,6 @@ def check_s3_buckets_refactored(
         if not metas:
             return
 
-        # Optional region filter (no behavior change if not provided)
         region_filter = {r.strip() for r in regions} if regions else None
 
         # 3) Group by region; write minimal rows for unknown region
@@ -1085,22 +1083,26 @@ def check_s3_buckets_refactored(
             except Exception:
                 s3r = s3
 
-            batch = CloudWatchBatcher(region)
+            batch = cw.CloudWatchBatcher(region)
             for bn in buckets:
                 sid = _sid(bn)
-                batch.add(build_mdq(
-                    f"s3_size_std__{sid}",
-                    "AWS/S3", "BucketSizeBytes",
-                    [{"Name": "BucketName", "Value": bn},
-                     {"Name": "StorageType", "Value": "StandardStorage"}],
-                    "Average", 86400
+                batch.add(cw.MDQ(
+                    id=f"s3_size_std__{sid}",
+                    namespace="AWS/S3",
+                    metric="BucketSizeBytes",
+                    dims=[{"Name": "BucketName", "Value": bn},
+                          {"Name": "StorageType", "Value": "StandardStorage"}],
+                    stat="Average",
+                    period=86400,
                 ))
-                batch.add(build_mdq(
-                    f"s3_obj__{sid}",
-                    "AWS/S3", "NumberOfObjects",
-                    [{"Name": "BucketName", "Value": bn},
-                     {"Name": "StorageType", "Value": "AllStorageTypes"}],
-                    "Average", 86400
+                batch.add(cw.MDQ(
+                    id=f"s3_obj__{sid}",
+                    namespace="AWS/S3",
+                    metric="NumberOfObjects",
+                    dims=[{"Name": "BucketName", "Value": bn},
+                          {"Name": "StorageType", "Value": "AllStorageTypes"}],
+                    stat="Average",
+                    period=86400,
                 ))
 
             series = {}
@@ -1114,8 +1116,8 @@ def check_s3_buckets_refactored(
                     m = bucket_meta[bn]
                     sid = _sid(bn)
 
-                    size_bytes = CloudWatchBatcher.latest(series.get(f"s3_size_std__{sid}", []), 0.0)
-                    obj_count = CloudWatchBatcher.latest(series.get(f"s3_obj__{sid}", []), 0.0)
+                    size_bytes = cw.CloudWatchBatcher.latest(series.get(f"s3_size_std__{sid}", []), 0.0)
+                    obj_count  = cw.CloudWatchBatcher.latest(series.get(f"s3_obj__{sid}", []), 0.0)
 
                     size_gb = round(float(size_bytes) / (1024.0 ** 3), 3)
                     objects = int(obj_count)
@@ -1176,7 +1178,6 @@ def check_s3_buckets_refactored(
                         except Exception:
                             potential_saving = None
 
-                    # Signals
                     signals = {
                         "Region": region,
                         "DaysSinceLastModified": (str(days_since_last) if days_since_last is not None else ""),
@@ -1201,14 +1202,13 @@ def check_s3_buckets_refactored(
                         flags=flags,
                         object_count=objects,
                         potential_saving=potential_saving,
-                        confidence=None,  # unchanged vs. old behavior (set if you had it)
+                        confidence=None,
                         signals=signals,
                     )
                 except Exception as e:
                     logging.exception(f"[S3] bucket emit failed for {bn} in {region}: {e}")
 
     except Exception as e:
-        # Top-level guard (restored): never break the rest of the run
         logging.exception(f"[S3] check_s3_buckets_refactored failed: {e}")
         return
 
