@@ -38,6 +38,7 @@ from inspect import Parameter
 from typing import Dict, Iterable, Iterator, List, Mapping, Tuple
 
 import FinOps_Toolset_V2_profiler as finops
+import finops_toolset.pricing as pricing
 
 
 __all__ = [
@@ -55,6 +56,7 @@ __all__ = [
     "TestNoErrorLogsFromCheckers",
     "TestWriterBackCompat",
     "TestCSVInvariants",
+    "TestPricingLookup",
 ]
 
 
@@ -144,16 +146,18 @@ class NullAWSClient:
         return NullPaginator(name)
 
     # pylint: disable=too-many-return-statements, too-many-branches
-    def __getattr__(self, name: str):
-        # Always accept *args/**kwargs so calls like
-        # ec2.describe_images(Owners=[...], Filters=[...]) don't TypeError.
-        def _f(*args, **kwargs):
+    def __getattr__(self, name: str):  # noqa: D401
+        """Return a function emulating common ``describe/get/list`` operations."""
+        def _f():  # type: ignore[no-untyped-def]
+            # ELBv2
             if name == "describe_load_balancers":
                 return {"LoadBalancers": []}
             if name == "describe_tags":
                 return {"TagDescriptions": []}
+            # Classic ELB
             if name == "describe_load_balancers_elb":
                 return {"LoadBalancerDescriptions": []}
+            # EC2
             if name == "describe_images":
                 return {"Images": []}
             if name == "describe_route_tables":
@@ -166,14 +170,18 @@ class NullAWSClient:
                 return {"Vpcs": []}
             if name == "describe_instances":
                 return {"Reservations": []}
+            # SSM
             if name == "describe_parameters":
                 return {"Parameters": []}
+            # WAFv2
             if name == "list_web_acls":
                 return {"WebACLs": []}
             if name == "list_resources_for_web_acl":
                 return {"ResourceArns": []}
+            # CloudWatch
             if name == "get_metric_data":
                 return {"MetricDataResults": []}
+            # Route53 / CloudFront
             if name == "list_hosted_zones":
                 return {"HostedZones": []}
             if name == "list_resource_record_sets":
@@ -184,6 +192,7 @@ class NullAWSClient:
                 return {"StreamingDistributionList": {"Items": []}}
             if name == "list_tags_for_resource":
                 return {"Tags": {"Items": []}}
+
             return {}
         return _f
 
@@ -234,25 +243,32 @@ class TestPricingLookup(unittest.TestCase):
 
     def setUp(self) -> None:
         """Backup the pricing table before each test."""
-        self._bak = copy.deepcopy(finops.PRICING)
+        self._bak = copy.deepcopy(pricing.PRICING)
 
     def tearDown(self) -> None:
         """Restore the pricing table after each test."""
-        finops.PRICING = self._bak
+        pricing.PRICING = self._bak
+
+    def test_unknown_service_returns_default(self) -> None:
+        """Unknown services return the provided default price."""
+        pricing.PRICING.clear()
+        self.assertEqual(
+            pricing.get_price("Nope", "HOUR", region="eu-west-1"), 0.0
+        )
 
     def test_known_service_unknown_region_falls_back(self) -> None:
         """If region is missing, use the service's default price."""
-        finops.PRICING.update({
+        pricing.PRICING.update({
             "EIP": {"HOUR": {"default": 0.005}},
         })
-        self.assertEqual(finops.get_price("EIP", "HOUR", region="eu-central-7"), 0.005)
+        self.assertEqual(pricing.get_price("EIP", "HOUR", region="eu-central-7"), 0.005)
 
     def test_numeric_types_are_float(self) -> None:
         """Returned prices must be numeric for math downstream."""
-        finops.PRICING.update({
-            "ALB": {"HOUR": {"default": 0.0225}},
+        pricing.PRICING.update({
+            "ALB": {"HOUR": {"default": 0.02}},
         })
-        val = finops.get_price("ALB", "HOUR", region="eu-west-1")
+        val = pricing.get_price("ALB", "HOUR", region="eu-west-1")
         self.assertIsInstance(val, (int, float))
 
 
@@ -448,31 +464,25 @@ class TestAllCheckersRun(unittest.TestCase):
 
 class TestGetPriceResolution(unittest.TestCase):
     """Validation for region-specific and default fallback price resolution."""
+    def setUp(self):
+        self._bak = copy.deepcopy(pricing.PRICING)
 
-    def test_region_and_default_resolution(self) -> None:
+    def tearDown(self):
+        pricing.PRICING.clear()
+        pricing.PRICING.update(self._bak)
+
+    def test_region_and_default_resolution(self):
         """Ensure region override beats default; missing region falls back to default."""
-        bak = copy.deepcopy(finops.PRICING)
-        try:
-            finops.PRICING.update({
-                "ALB": {
-                    "HOUR": {"default": 0.02, "eu-west-1": 0.0225},
-                    "LCU_HOUR": {"default": 0.008}
-                },
-                "NAT": {
-                    "HOUR": {"default": 0.065},
-                    "GB_PROCESSED": {"default": 0.045}
-                },
-            })
-
-            alb_hour_d = finops.get_price("ALB", "HOUR", region="eu-west-1")
-            alb_hour_def = finops.get_price("ALB", "HOUR", region="us-east-8")
-            lcu = finops.get_price("ALB", "LCU_HOUR", region="eu-west-1")
-
-            self.assertEqual(alb_hour_d, 0.0225)
-            self.assertEqual(alb_hour_def, 0.02)
-            self.assertEqual(lcu, 0.008)
-        finally:
-            finops.PRICING = bak
+        pricing.PRICING.clear()
+        pricing.PRICING.update({
+            "ALB": {
+                "HOUR": {"default": 0.02, "eu-west-1": 0.0225},
+                "LCU_HOUR": {"default": 0.008},
+            }
+        })
+        self.assertEqual(finops.get_price("ALB", "HOUR", region="eu-west-1"), 0.0225)
+        self.assertEqual(finops.get_price("ALB", "HOUR", region="us-east-8"), 0.02)
+        self.assertEqual(finops.get_price("ALB", "LCU_HOUR", region="eu-west-1"), 0.008)
 
 
 class TestCheckerDeterminism(unittest.TestCase):
