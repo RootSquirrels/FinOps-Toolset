@@ -135,7 +135,7 @@ PRICING: PriceMap = {
 
     "EKS": {
         # Control plane cost depends on support window. Default here reflects "standard support".
-        "CONTROL_PLANE_HOUR_STANDARD": 0.10,
+        "CONTROL_PLANE_HOUR": 0.10,
         "CONTROL_PLANE_HOUR_EXTENDED": 0.60,  # when the cluster version is in extended support
     },
 
