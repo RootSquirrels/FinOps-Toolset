@@ -1,17 +1,16 @@
+"""
+Contains up to date prices for services in AWS. Provide a way to get the price of each service
+"""
 # finops_toolset/pricing.py
 from __future__ import annotations
 
-from typing import Dict, Union, Optional, Mapping, Any
-import math
+from typing import Dict, Union, Optional, Mapping
 
 Number = float
 PriceLeaf = Union[Number, Mapping[str, Number]]
 PriceMap = Dict[str, Dict[str, PriceLeaf]]
 
-try:
-    from finops_toolset.config import HOURS_PER_MONTH  # default 730
-except Exception:  # fallback if imported standalone
-    HOURS_PER_MONTH = 730
+from finops_toolset.config import HOURS_PER_MONTH  # default 730
 
 # --------------------------------------------------------------------------------------
 # CENTRALIZED PRICING (USD)
@@ -52,7 +51,7 @@ PRICING: PriceMap = {
     },
 
     "LAMBDA": {
-        # Requests: $0.20 per 1M; compute: $0.0000166667 per GB-second (all regions have the same *formula*).
+        # Requests: $0.20 per 1M; compute: $0.0000166667 per GB-second
         "REQUESTS_PER_MILLION": 0.20,
         "GB_SECOND": 0.0000166667,
         "EPHEMERAL_GB_SECOND": 0.0000000309,
