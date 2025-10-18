@@ -2616,6 +2616,13 @@ def check_lambda_efficiency(writer: csv.writer, lambda_client, cloudwatch) -> No
             or ""
         )
 
+        def _sid(name: str) -> str:
+            s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(name))
+            if not s or not s[0].isalpha():
+                s = "m_" + s
+            return s[:255]
+
+
         now = datetime.now(timezone.utc)
         lookback_days = max(1, LAMBDA_LOOKBACK_DAYS)
         start = now - timedelta(days=lookback_days)
@@ -2654,11 +2661,13 @@ def check_lambda_efficiency(writer: csv.writer, lambda_client, cloudwatch) -> No
         batch = cw.CloudWatchBatcher(region, client=cloudwatch)
         for f in funcs:
             fname = f.get("FunctionName", "")
+            sid = _sid(fname)
             dims = [{"Name": "FunctionName", "Value": fname}]
-            batch.add(cw.MDQ(id=f"lam_inv__{fname}", namespace="AWS/Lambda", metric="Invocations", dims=dims, stat="Sum",     period=PERIOD))
-            batch.add(cw.MDQ(id=f"lam_err__{fname}", namespace="AWS/Lambda", metric="Errors",      dims=dims, stat="Sum",     period=PERIOD))
-            batch.add(cw.MDQ(id=f"lam_thr__{fname}", namespace="AWS/Lambda", metric="Throttles",   dims=dims, stat="Sum",     period=PERIOD))
-            batch.add(cw.MDQ(id=f"lam_dur__{fname}", namespace="AWS/Lambda", metric="Duration",    dims=dims, stat="Average", period=PERIOD))
+            batch.add(cw.MDQ(id=f"lam_inv__{sid}", namespace="AWS/Lambda", metric="Invocations", dims=dims, stat="Sum",     period=PERIOD))
+            batch.add(cw.MDQ(id=f"lam_err__{sid}", namespace="AWS/Lambda", metric="Errors",      dims=dims, stat="Sum",     period=PERIOD))
+            batch.add(cw.MDQ(id=f"lam_thr__{sid}", namespace="AWS/Lambda", metric="Throttles",   dims=dims, stat="Sum",     period=PERIOD))
+            batch.add(cw.MDQ(id=f"lam_dur__{sid}", namespace="AWS/Lambda", metric="Duration",    dims=dims, stat="Average", period=PERIOD))
+
 
         try:
             series = batch.execute(start, now, scan_by="TimestampDescending")
@@ -2704,11 +2713,15 @@ def check_lambda_efficiency(writer: csv.writer, lambda_client, cloudwatch) -> No
                 name = tags.get("Name", fname)
 
                 # Metrics
-                inv_sum   = sum(v for _, v in series.get(f"lam_inv__{fname}", []))
-                err_sum   = sum(v for _, v in series.get(f"lam_err__{fname}", []))
-                thr_sum   = sum(v for _, v in series.get(f"lam_thr__{fname}", []))
-                dur_vals  = [v for _, v in series.get(f"lam_dur__{fname}", [])]
-                avg_ms    = (sum(dur_vals) / len(dur_vals)) if dur_vals else 0.0
+                fname = f.get("FunctionName", "")
+                sid = _sid(fname)
+
+                inv_sum  = sum(v for _, v in series.get(f"lam_inv__{sid}", []))
+                err_sum  = sum(v for _, v in series.get(f"lam_err__{sid}", []))
+                thr_sum  = sum(v for _, v in series.get(f"lam_thr__{sid}", []))
+                dur_vals = [v for _, v in series.get(f"lam_dur__{sid}", [])]
+                avg_ms   = (sum(dur_vals) / len(dur_vals)) if dur_vals else 0.0
+
 
                 #   Expectation: helper returns a flag/bool or flag string; adapt to your signature if different.
                 try:
@@ -5630,6 +5643,10 @@ def check_idle_ec2_instances(writer, ec2, cloudwatch,) -> None:
         start = now - timedelta(days=lookback_days)
         period = EC2_CW_PERIOD  # e.g., 86400
 
+        def _sid(inst_id: str) -> str:
+            return inst_id.replace("-", "_").replace(".", "_")
+
+
         # 1) List instances in this region
         instances = []
         token = None
@@ -5657,13 +5674,14 @@ def check_idle_ec2_instances(writer, ec2, cloudwatch,) -> None:
         # 2) Batch CloudWatch metrics for all instances (passed CW client)
         batch = cw.CloudWatchBatcher(region, client=cloudwatch)
         for it in instances:
-            iid = it["InstanceId"]
+            sid = _sid(iid)
             dims = [{"Name": "InstanceId", "Value": iid}]
-            batch.add(cw.MDQ(id=f"ec2_cpu__{iid}",  namespace="AWS/EC2", metric="CPUUtilization", dims=dims, stat="Average", period=period))
-            batch.add(cw.MDQ(id=f"ec2_nin__{iid}",  namespace="AWS/EC2", metric="NetworkIn",      dims=dims, stat="Sum",     period=period))
-            batch.add(cw.MDQ(id=f"ec2_nout__{iid}", namespace="AWS/EC2", metric="NetworkOut",     dims=dims, stat="Sum",     period=period))
-            batch.add(cw.MDQ(id=f"ec2_drd__{iid}",  namespace="AWS/EC2", metric="DiskReadOps",    dims=dims, stat="Sum",     period=period))
-            batch.add(cw.MDQ(id=f"ec2_dwr__{iid}",  namespace="AWS/EC2", metric="DiskWriteOps",   dims=dims, stat="Sum",     period=period))
+
+            batch.add(cw.MDQ(id=f"ec2_cpu__{sid}",  namespace="AWS/EC2", metric="CPUUtilization", dims=dims, stat="Average", period=period))
+            batch.add(cw.MDQ(id=f"ec2_nin__{sid}",  namespace="AWS/EC2", metric="NetworkIn",      dims=dims, stat="Sum",     period=period))
+            batch.add(cw.MDQ(id=f"ec2_nout__{sid}", namespace="AWS/EC2", metric="NetworkOut",     dims=dims, stat="Sum",     period=period))
+            batch.add(cw.MDQ(id=f"ec2_drd__{sid}",  namespace="AWS/EC2", metric="DiskReadOps",    dims=dims, stat="Sum",     period=period))
+            batch.add(cw.MDQ(id=f"ec2_dwr__{sid}",  namespace="AWS/EC2", metric="DiskWriteOps",   dims=dims, stat="Sum",     period=period))
 
         try:
             series = batch.execute(start, now, scan_by="TimestampDescending")
@@ -5686,11 +5704,12 @@ def check_idle_ec2_instances(writer, ec2, cloudwatch,) -> None:
                 name = tdict.get("Name", iid)
 
                 # Extract metrics
-                cpu_vals = [v for _, v in series.get(f"ec2_cpu__{iid}", [])]
-                nin_sum  = sum(v for _, v in series.get(f"ec2_nin__{iid}", []))
-                nout_sum = sum(v for _, v in series.get(f"ec2_nout__{iid}", []))
-                drd_sum  = sum(v for _, v in series.get(f"ec2_drd__{iid}", []))
-                dwr_sum  = sum(v for _, v in series.get(f"ec2_dwr__{iid}", []))
+                sid = _sid(iid)
+                cpu_vals = [v for _, v in series.get(f"ec2_cpu__{sid}", [])]
+                nin_sum  = sum(v for _, v in series.get(f"ec2_nin__{sid}", []))
+                nout_sum = sum(v for _, v in series.get(f"ec2_nout__{sid}", []))
+                drd_sum  = sum(v for _, v in series.get(f"ec2_drd__{sid}", []))
+                dwr_sum  = sum(v for _, v in series.get(f"ec2_dwr__{sid}", [])) 
 
                 avg_cpu  = (sum(cpu_vals) / len(cpu_vals)) if cpu_vals else 0.0
                 net_gb   = float(nin_sum + nout_sum) / (1024.0 ** 3)
