@@ -148,7 +148,7 @@ class NullAWSClient:
     # pylint: disable=too-many-return-statements, too-many-branches
     def __getattr__(self, name: str):  # noqa: D401
         """Return a function emulating common ``describe/get/list`` operations."""
-        def _f():  # type: ignore[no-untyped-def]
+        def _f(*args, **kwargs):  # type: ignore[no-untyped-def]
             # ELBv2
             if name == "describe_load_balancers":
                 return {"LoadBalancers": []}
