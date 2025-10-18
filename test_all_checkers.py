@@ -250,7 +250,7 @@ class TestPricingLookup(unittest.TestCase):
     def test_numeric_types_are_float(self) -> None:
         """Returned prices must be numeric for math downstream."""
         finops.PRICING.update({
-            "ALB": {"HOUR": {"default": 0.02}},
+            "ALB": {"HOUR": {"default": 0.0225}},
         })
         val = finops.get_price("ALB", "HOUR", region="eu-west-1")
         self.assertIsInstance(val, (int, float))
