@@ -251,7 +251,7 @@ class TestPricingLookup(unittest.TestCase):
         """Unknown services return the provided default price."""
         finops.PRICING.clear()
         self.assertEqual(
-            finops.get_price("Nope", "HOUR", region="eu-west-1", default=0.0), 0.0
+            finops.get_price("Morrowind", "HOUR", region="eu-west-1"), 0.0
         )
 
     def test_known_service_unknown_region_falls_back(self) -> None:
