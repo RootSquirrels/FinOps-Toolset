@@ -2722,8 +2722,6 @@ def check_lambda_efficiency(writer: csv.writer, lambda_client, cloudwatch) -> No
                 dur_vals = [v for _, v in series.get(f"lam_dur__{sid}", [])]
                 avg_ms   = (sum(dur_vals) / len(dur_vals)) if dur_vals else 0.0
 
-
-                #   Expectation: helper returns a flag/bool or flag string; adapt to your signature if different.
                 try:
                     large_pkg_flag = check_large_package(code_size_bytes=code_size, layers=f.get("Layers", []), threshold_mb=LAMBDA_LARGE_PACKAGE_MB)
                 except Exception:
@@ -2843,6 +2841,13 @@ def check_unused_nat_gateways(
             or ""
         )
 
+        def _sid(x: str) -> str:
+            s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(x))
+            if not s or not s[0].isalpha():
+                s = "m_" + s
+            return s[:255]
+
+
         lookback_days = max(1, NAT_LOOKBACK_DAYS)
         now = datetime.now(timezone.utc)
         start = now - timedelta(days=lookback_days)
@@ -2881,18 +2886,19 @@ def check_unused_nat_gateways(
         batch = cw.CloudWatchBatcher(region, client=cloudwatch)
         for nat in nats:
             nat_id = nat["NatGatewayId"]
+            sid = _sid(nat_id)
             dims = [{"Name": "NatGatewayId", "Value": nat_id}]
             # bytes (sum) — convert to GB later
-            batch.add(cw.MDQ(id=f"nat_bin_src__{nat_id}",  namespace="AWS/NATGateway",
+            batch.add(cw.MDQ(id=f"nat_bin_src__{sid}",  namespace="AWS/NATGateway",
                              metric="BytesInFromSource",      dims=dims, stat="Sum", period=3600))
-            batch.add(cw.MDQ(id=f"nat_bout_dst__{nat_id}", namespace="AWS/NATGateway",
+            batch.add(cw.MDQ(id=f"nat_bout_dst__{sid}", namespace="AWS/NATGateway",
                              metric="BytesOutToDestination",  dims=dims, stat="Sum", period=3600))
-            batch.add(cw.MDQ(id=f"nat_bin_dst__{nat_id}",  namespace="AWS/NATGateway",
+            batch.add(cw.MDQ(id=f"nat_bin_dst__{sid}",  namespace="AWS/NATGateway",
                              metric="BytesInFromDestination", dims=dims, stat="Sum", period=3600))
-            batch.add(cw.MDQ(id=f"nat_bout_src__{nat_id}", namespace="AWS/NATGateway",
+            batch.add(cw.MDQ(id=f"nat_bout_src__{sid}", namespace="AWS/NATGateway",
                              metric="BytesOutToSource",       dims=dims, stat="Sum", period=3600))
             # connections (sum)
-            batch.add(cw.MDQ(id=f"nat_conn__{nat_id}",     namespace="AWS/NATGateway",
+            batch.add(cw.MDQ(id=f"nat_conn__{sid}",     namespace="AWS/NATGateway",
                              metric="ActiveConnectionCount", dims=dims, stat="Sum", period=3600))
 
         try:
