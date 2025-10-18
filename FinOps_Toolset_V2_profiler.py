@@ -6010,7 +6010,7 @@ def main():
 
                 run_check(profiler, check_name="check_idle_load_balancers", region=region,
                           fn=check_idle_load_balancers, writer=writer,
-                          elbv2=clients['elbv2'], cw=clients['cloudwatch'])
+                          elbv2=clients['elbv2'], cloudwatch=clients['cloudwatch'])
 
                 run_check(profiler, check_name="check_detached_network_interfaces", region=region,
                           fn=check_detached_network_interfaces, writer=writer, ec2=clients['ec2'])
