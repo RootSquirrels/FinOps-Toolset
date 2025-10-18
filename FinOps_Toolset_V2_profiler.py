@@ -149,7 +149,7 @@ import csv
 import os
 import time
 import logging
-from typing import *  # noqa: F403
+from typing import Dict, Iterable, Optional, List, Tuple, Union, Callable, Any, TypeVar, Set
 from datetime import datetime, timezone, timedelta
 import json
 import random
@@ -1826,14 +1826,17 @@ def check_unused_efs_filesystems(
 
 #region LB SECTION
 
-def safe_aws_call(fn: Callable[[], Any], fallback: Any, context: str = "") -> Any:
+_T = TypeVar("_T")
+
+def safe_aws_call(fn: Callable[[], Any], default: Optional[_T] = None, 
+                  fallback: Any=None, context: str = "") -> Any:
     """Safely invoke AWS API call, returning fallback on error."""
     try:
         return fn()
     except ClientError as e:
         code = e.response["Error"].get("Code")
         logging.warning(f"[{context}] AWS call failed: {code} {e}")
-        return fallback
+        return default if default is not None else fallback
 
 
 def estimate_lb_cost(lb_type: str, region: Optional[str] = None) -> float:
@@ -1954,12 +1957,12 @@ def check_idle_load_balancers(
 
         # ---------- 5) pricing (optional, only for cross-AZ potential) ----------
         try:
-            inter_az_price = get_price("NETWORK", "INTER_AZ_GB", region, None)
+            inter_az_price = get_price("NETWORK", "INTER_AZ_GB", region)
         except Exception:
             inter_az_price = None
         if inter_az_price is None:
             try:
-                inter_az_price = get_price("NETWORK", "INTER_REGION_GB", region, 0.0)
+                inter_az_price = get_price("NETWORK", "INTER_REGION_GB", region)
             except Exception:
                 inter_az_price = 0.0
 
@@ -2725,11 +2728,11 @@ def check_unused_nat_gateways(
 
                 # Region-aware pricing
                 try:
-                    nat_hour = get_price("NAT", "HOUR", region, default=0.0)
+                    nat_hour = get_price("NAT", "HOUR", region)
                 except Exception:
                     nat_hour = 0.0
                 try:
-                    nat_gb = get_price("NAT", "GB_PROCESSED", region, default=0.0)
+                    nat_gb = get_price("NAT", "GB_PROCESSED", region)
                 except Exception:
                     nat_gb = 0.0
 
