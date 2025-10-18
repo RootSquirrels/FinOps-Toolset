@@ -6103,7 +6103,7 @@ def main():
                 fn=check_kms_customer_managed_keys, writer=writer, cloudtrail=clients['cloudtrail'], kms=clients['kms'])
 
                 run_check(profiler=profiler, check_name="check_nat_replacement_opps", region=region,
-                fn=check_nat_replacement_opps, writer=writer, cloudtrail=clients['ec2'], kms=clients['cloudwatch'])
+                fn=check_nat_replacement_opps, writer=writer, ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
 
 
         profiler.dump_csv()
