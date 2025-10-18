@@ -149,7 +149,7 @@ import csv
 import os
 import time
 import logging
-from typing import Dict, Iterable, Optional, List, Tuple, Union, Callable, Any, TypeVar, Set
+from typing import Dict, Iterable, Optional, List, Tuple, Union, Callable, Any, TypeVar, Set, Type
 from datetime import datetime, timezone, timedelta
 import json
 import random
@@ -191,7 +191,7 @@ from finops_toolset.config import (
     LOAD_BALANCER_LOOKBACK_DAYS,
 )
 
-from finops_toolset.pricing import PRICING as PRICING, get_price as get_price, per_month
+from finops_toolset.pricing import PRICING as PRICING, get_price as get_price
 import core.cloudwatch as cw
 
 #endregion
@@ -1827,15 +1827,56 @@ def check_unused_efs_filesystems(
 #region LB SECTION
 
 _T = TypeVar("_T")
+LOGGER = logging.getLogger(__name__)
+LOGGER.addHandler(logging.NullHandler())
 
-def safe_aws_call(fn: Callable[[], Any], default: Optional[_T] = None, 
-                  fallback: Any=None, context: str = "") -> Any:
-    """Safely invoke AWS API call, returning fallback on error."""
+ExceptionTypes = Union[Type[BaseException], Tuple[Type[BaseException], ...]]
+
+def _normalize_swallow(swallow: Optional[ExceptionTypes]) -> Tuple[Type[BaseException], ...]:
+    """Normalize the `swallow` argument to a tuple of exception classes.
+
+    - None  -> (Exception,)
+    - Class -> (Class,)
+    - Tuple -> Tuple (validated)
+    """
+    if swallow is None:
+        return (Exception,)  # catch broad exceptions by default
+    if isinstance(swallow, type) and issubclass(swallow, BaseException):
+        return (swallow,)
+    if isinstance(swallow, tuple) and all(isinstance(t, type) and issubclass(t, BaseException) for t in swallow):
+        return swallow
+    # Fallback to broad catch if a bad value is passed
+    return (Exception,)
+
+def safe_aws_call(
+    func: Callable[[], _T],
+    *,
+    default: Optional[_T] = None,
+    context: str = "",
+    fallback: Optional[_T] = None,
+    swallow: Optional[ExceptionTypes] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Optional[_T]:
+    """Run ``func()`` and return its value, or a default/fallback on exception.
+
+    Args:
+        func: Zero-arg callable to execute.
+        default: Preferred value when an exception is raised.
+        context: Short label for logs (e.g., 'ec2.describe_instances').
+        fallback: Secondary value if ``default`` is None (kept for backward compatibility).
+        swallow: Exception class or tuple of classes to catch. Defaults to ``Exception``.
+        logger: Optional logger (defaults to this module's ``LOGGER``).
+
+    Returns:
+        The function's return value on success; otherwise ``default`` if provided,
+        else ``fallback`` (which may be ``None``).
+    """
+    log = logger or LOGGER
+    catch: Tuple[Type[BaseException], ...] = _normalize_swallow(swallow)
     try:
-        return fn()
-    except ClientError as e:
-        code = e.response["Error"].get("Code")
-        logging.warning(f"[{context}] AWS call failed: {code} {e}")
+        return func()
+    except catch as exc:  # pylint: disable=broad-exception-caught
+        log.debug("safe_aws_call(%s) failed: %s", context, exc, exc_info=True)
         return default if default is not None else fallback
 
 

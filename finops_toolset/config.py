@@ -50,6 +50,7 @@ OUTPUT_FILE = _env_str("FINOPS_OUTPUT_FILE", "cleanup_estimates.csv")
 LOG_FILE = _env_str("FINOPS_LOG_FILE", "cleanup_analysis.log")
 BATCH_SIZE = _env_int("FINOPS_BATCH_SIZE", 100)
 REQUIRED_TAG_KEYS = _env_list("FINOPS_REQUIRED_TAG_KEYS", ["ApplicationID", "Application", "Environment"])
+CSV_DELIMITER = _env_str("FINOPS_CSV_DELIMITER", ";")
 
 # S3 multipart
 _S3_MPU_BUCKET_WORKERS: int      = _env_int("FINOPS_S3_MPU_BUCKET_WORKERS", 16)
