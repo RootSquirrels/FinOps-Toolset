@@ -1513,20 +1513,6 @@ class AMIFlagger(ResourceFlagger):
         if self.shared == "Yes":
             self.flags.append("SharedExternally")
 
-class S3BucketFlagger(ResourceFlagger):
-    def __init__(self, object_count: int, last_modified: Optional[datetime], tags: Dict[str, str]):
-        super().__init__(tags, last_modified)
-        self.object_count = object_count
-
-    def apply_rules(self, big_bucket_threshold: int = 10000):
-        self.check_big_bucket(big_bucket_threshold)
-        self.check_missing_tags(REQUIRED_TAG_KEYS)
-        self.check_age()
-
-    def check_big_bucket(self, threshold: int):
-        if self.object_count > threshold:
-            self.flags.append("BigBucket")
-
 #endregion
 
 
