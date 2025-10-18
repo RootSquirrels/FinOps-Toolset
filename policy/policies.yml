@@ -1,0 +1,108 @@
+# policies.yml — starter set
+version: 1
+defaults:
+  mode: warn      # default decision if rule doesn't override: warn | pr | remediate
+  severity: P2
+
+rules:
+  # --- CloudWatch Logs: set retention if missing ---
+  - id: cwl.retention.30d
+    description: "CloudWatch Logs groups must have retention (default 30d) unless critical."
+    target: ["cloudwatchloggroup", "cloudwatch_logs", "loggroup"]
+    when:
+      all:
+        - field: "ResourceType"
+          in: ["CloudWatchLogGroup", "cloudwatchloggroup", "cloudwatch_logs", "loggroup"]
+        - any:
+          - field: "Flags"
+            contains_any: ["noretention", "retention=0"]
+          - field: "Signals.retentionInDays"
+            eq: "0"
+        - any:
+          - field: "Estimated_Cost_USD"
+            gte: 1
+          - field: "Name"
+            regex: { field: "Name", pattern: "^prod" }
+    then:
+      mode: remediate
+      severity: P2
+      remediation: "logs.set_retention_days"
+      params: { days: 30 }
+      add_flags: ["confidence=100", "noretention"]
+
+  # --- S3: lifecycle to IA for big/stale buckets without lifecycle ---
+  - id: s3.lifecycle.ia.30d
+    description: "S3 buckets >100GB and stale data >90d should transition to STANDARD_IA after 30d."
+    target: ["s3bucket", "s3"]
+    when:
+      all:
+        - field: "ResourceType"
+          in: ["S3Bucket", "s3bucket", "s3"]
+        - field: "Storage_GB"
+          gte: 100
+        - field: "Signals.DaysSinceLastModified"
+          gte: 90
+        - not:
+            field: "Flags"
+            contains_any: ["has_lifecycle", "to_ia_30d"]
+    then:
+      mode: pr
+      severity: P2
+      remediation: "s3.put_lifecycle_ia_30d"
+      params: {}
+      add_flags: ["lifecycle_to_ia_recommended"]
+
+  # --- EBS: delete unattached volumes ---
+  - id: ebs.delete.unattached
+    description: "EBS volumes in state 'available' should be deleted (subject to snapshots)."
+    target: ["ebs", "ebsvolume"]
+    when:
+      all:
+        - field: "ResourceType"
+          in: ["EBSVolume", "ebs", "ebsvolume"]
+        - field: "State"
+          eq: "available"
+        - field: "Storage_GB"
+          gte: 1
+    then:
+      mode: remediate
+      severity: P2
+      remediation: "ebs.delete"
+      params: {}
+      add_flags: ["confidence=100", "unattached", "safedelete"]
+
+  # --- ENI: delete orphaned (available, unattached) ---
+  - id: eni.delete.orphan
+    description: "ENIs with status 'available' and no attachment should be deleted."
+    target: ["eni", "networkinterface"]
+    when:
+      all:
+        - field: "ResourceType"
+          in: ["NetworkInterface", "eni", "networkinterface"]
+        - field: "State"
+          in: ["available", "AVAILABLE"]
+        - not:
+            field: "Flags"
+            contains_any: ["requester_managed", "protected"]
+    then:
+      mode: remediate
+      severity: P2
+      remediation: "eni.delete"
+      params: {}
+      add_flags: ["confidence=100", "orphaneni", "safedelete"]
+
+  # --- NAT: suggest VPC endpoints when idle data processing is high ---
+  - id: nat.endpoints.suggestion
+    description: "High NAT data processing with known AWS endpoints suggests PrivateLink/Gateway Endpoints."
+    target: ["nat"]
+    when:
+      all:
+        - field: "ResourceType"
+          in: ["NATGateway", "nat"]
+        - field: "Signals.DataProcessedGB30d"
+          gte: 50
+    then:
+      mode: warn
+      severity: P3
+      remediation: "nat.endpoints.advisory"
+      params: {}
