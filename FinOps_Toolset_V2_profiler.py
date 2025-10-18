@@ -191,120 +191,11 @@ from finops_toolset.config import (
     LOAD_BALANCER_LOOKBACK_DAYS,
 )
 
-#endregion
-
-
-#region --- Centralized Pricing (USD) ---
-PRICING: Dict[str, Dict[str, Union[float, Dict[str, float]]]] = {
-    "EBS": {
-        "SNAPSHOT_GB_MONTH": 0.06,
-        "GP2_GB_MONTH": 0.10,
-        "GP3_GB_MONTH": 0.08,
-        "GP3_IOPS_PER_MONTH": 0.005,     
-        "GP3_TPUT_MIBPS_MONTH": 0.04,    
-        "FSR_PER_AZ_HOUR": 0.75          
-    },
-    "EIP": {
-        "UNASSIGNED_MONTH": 3.65,
-    },
-    "S3": {
-        "STANDARD_GB_MONTH": 0.019,
-        "STANDARD_IA_GB_MONTH": 0.0125,
-        "GLACIER_GB_MONTH": 0.004,
-    },
-    "EFS": {
-        "STANDARD_GB_MONTH": 0.25,
-        "IA_GB_MONTH": 0.025,
-        "PROV_TPUT_MIBPS_MONTH": 6.0,
-        "IA_RETRIEVAL_GB": 0.01,
-        "ARCHIVE_GB_MONTH": 0.008,
-        "IO_GB":0.05,
-        "MOUNT_TARGET_HOUR":0.015,
-    },
-    "LAMBDA": {
-        "REQUESTS_PER_MILLION": 0.20,
-        "GB_SECOND": 0.0000166667,
-    },
-    "DYNAMODB": {
-        "RCU_HOUR": 0.00013,
-        "WCU_HOUR": 0.00065,
-        "OD_RRU": 0.25 / 1_000_000,
-        "OD_WRU": 1.25 / 1_000_000,
-        "STORAGE_GB_MONTH_STD": 0.25,
-        "STORAGE_GB_MONTH_STD_IA": 0.10,
-    },
-    "CLOUDWATCH": {
-        "LOG_GB_MONTH": 0.03,
-    },
-    "NAT": {
-        "HOUR": {
-            "default": 0.065,
-            "eu-west-1": 0.065,
-            "eu-west-3": 0.070,
-        },
-        "GB_PROCESSED": {
-            "default": 0.045,
-        },
-    },
-    "ALB": {
-        "HOUR": {
-            "default": 0.0225,
-            "eu-west-1": 0.0225,
-            "eu-west-3": 0.0225,
-        },
-
-        "LCU_HOUR": {
-            "default": 0.008,
-            "eu-west-1": 0.008,
-            "eu-west-3": 0.008,
-        }
-    },
-    "NLB": {
-        "HOUR": {
-            "default": 0.0225,
-            "eu-west-1": 0.0225,
-            "eu-west-3": 0.0225,
-        },
-        "NLCU_HOUR": {
-            "default": 0.006,
-            "eu-west-1": 0.006,
-            "eu-west-3": 0.006,
-        }
-    },
-    "CLB": {
-        "HOUR": {
-            "default": 0.0225,
-            "eu-west-1": 0.0225,
-        }
-    },
-    "NETWORK": {
-        "INTER_REGION_GB": 0.02,
-    },
-    "ECR": {
-        "STORAGE_GB_MONTH": 0.10
-    },
-    "RDS": {
-        "BACKUP_GB_MONTH": 0.095
-    },
-    "EKS": {
-        "CONTROL_PLANE_HOUR": 0.1
-    },
-    "KINESIS": {
-        "SHARD_HOUR": 0.015
-    },
-    "WAFV2": {
-        "WEBACL_MONTH": 5.00
-    },
-    "SSM": {
-        "ADV_PARAM_MONTH": 0.05
-    },
-    "FSX": {
-        "BACKUP_GB_MONTH": 0.05
-    }
-}
+from finops_toolset.pricing import PRICING as PRICING, get_price as get_price, get_price_r, per_month
 
 #endregion
 
+#region RETRY
 
 def retry_with_backoff(max_retries=3, backoff_factor=1.5, jitter=True, exceptions=(ClientError, EndpointConnectionError, NoCredentialsError)):
     """
@@ -678,19 +569,6 @@ def get_account_id(sts_client=None) -> str:
         return ""
     
 ACCOUNT_ID = get_account_id()
-
-
-def get_price(service: str, key: str, region: Optional[str] = None, default: Optional[float] = None) -> float:
-    value = PRICING.get(service, {}).get(key)
-    if value is None:
-        if default is not None: return default
-        raise KeyError(f"No pricing found for {service}.{key}")
-    if isinstance(value, dict):
-        if region and region in value: return value[region]
-        if "default" in value: return value["default"]
-        if default is not None: return default
-        raise KeyError(f"No default pricing for {service}.{key}")
-    return float(value)
 
 
 def score_confidence(signal_weights: Dict[str, float], evidence_ok: bool = True) -> int:
@@ -2118,11 +1996,11 @@ def check_idle_load_balancers(
     )
 
     # ---------- Pricing pulled from PRICING dict ----------
-    alb_hour      = get_price("ALB", "HOUR", region=region)              # $/hour
-    alb_lcu_hour  = get_price("ALB", "LCU_HOUR", region=region)          # $/LCU-hour
-    nlb_hour      = get_price("NLB", "HOUR", region=region)              # $/hour
-    nlb_nlcu_hour = get_price("NLB", "NLCU_HOUR", region=region)         # $/NLCU-hour
-    clb_hour      = get_price("CLB", "HOUR", region=region)              # $/hour
+    alb_hour      = get_price_r("ALB", "HOUR", region=region)              # $/hour
+    alb_lcu_hour  = get_price_r("ALB", "LCU_HOUR", region=region)          # $/LCU-hour
+    nlb_hour      = get_price_r("NLB", "HOUR", region=region)              # $/hour
+    nlb_nlcu_hour = get_price_r("NLB", "NLCU_HOUR", region=region)         # $/NLCU-hour
+    clb_hour      = get_price_r("CLB", "HOUR", region=region)              # $/hour
 
     monthly_alb_base = alb_hour * HOURS_PER_MONTH
     monthly_nlb_base = nlb_hour * HOURS_PER_MONTH
@@ -2913,8 +2791,8 @@ def check_unused_nat_gateways(
             qid = _cw_id_safe(f"nat_{nid}_{metric}_{stat}")
             return [v for _, v in md.get(qid, [])]
 
-        nat_hour_price   = get_price("NAT", "HOUR", region=region)          
-        nat_gb_proc_price = get_price("NAT", "GB_PROCESSED", region=region)
+        nat_hour_price   = get_price_r("NAT", "HOUR", region=region)          
+        nat_gb_proc_price = get_price_r("NAT", "GB_PROCESSED", region=region)
         monthly_hours_cost = nat_hour_price * HOURS_PER_MONTH              
 
         # ---- Evaluate each NAT ---------------------------------------------------

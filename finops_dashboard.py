@@ -17,8 +17,8 @@ import sys
 import math
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-import plotly.io as pio
+import plotly.graph_objects as go #type: ignore
+import plotly.io as pio #type: ignore
 from datetime import datetime
 from typing import Optional
 
@@ -221,7 +221,6 @@ def fig_savings_by_type(ag: pd.DataFrame) -> go.Figure:
     )
 
 def fig_top_findings(topdf: pd.DataFrame) -> go.Figure:
-    import plotly.graph_objects as go
 
     # Guard: nothing to plot
     if topdf is None or getattr(topdf, "empty", True):
@@ -266,8 +265,6 @@ def fig_heatmap_enhanced(
 
     ag_reg columns expected: Region, ResourceType, Count, Potential
     """
-    import numpy as np
-    import plotly.graph_objects as go
 
     if ag_reg is None or ag_reg.empty:
         return go.Figure()
