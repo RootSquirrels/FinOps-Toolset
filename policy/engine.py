@@ -1,6 +1,3 @@
-# finops_toolset/policy/engine.py
-from __future__ import annotations
-
 """
 Policies-as-Code engine for the FinOps Toolset.
 
@@ -21,15 +18,17 @@ Design
 - Scalable: stateless, streaming CSV evaluation; easy to extend predicates.
 """
 
+# finops_toolset/policy/engine.py
+from __future__ import annotations
 import csv
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 # Optional dependency: pyyaml (recommended)
 try:
-    import yaml  # type: ignore
+    import yaml
 except Exception:
     yaml = None  # We'll support JSON policies as a fallback
 
@@ -322,7 +321,7 @@ def evaluate_policies_for_csv(
     return summary
 
 if __name__ == "__main__":
-    import argparse, sys, os
+    import argparse
     p = argparse.ArgumentParser(description="Evaluate FinOps policies against scanner CSV.")
     p.add_argument("--csv", required=True, help="Path to scanner CSV (e.g., cleanup_estimates.csv)")
     p.add_argument("--policies", required=True, help="policies.yml or .json")
