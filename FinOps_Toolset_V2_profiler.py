@@ -168,6 +168,29 @@ from time import perf_counter
 import threading
 #from correlator import build_certificate_graph, summarize_cert_usage
 
+from finops_toolset.config import (
+    SDK_CONFIG,
+    REGIONS, OUTPUT_FILE, LOG_FILE, BATCH_SIZE, REQUIRED_TAG_KEYS,
+    _S3_MPU_BUCKET_WORKERS, _S3_MPU_PART_WORKERS, _S3_MPU_PAGE_SIZE,
+    _S3_MPU_GLOBAL_FINDINGS_CAP, _S3_MPU_PARTS_MODE,
+    DDB_LOOKBACK_DAYS, DDB_CW_PERIOD, DDB_BACKUP_AGE_DAYS,
+    EFS_LOOKBACK_DAYS, EFS_IA_LARGE_THRESHOLD_GB, EFS_IA_READS_HIGH_GB_PER_DAY,
+    EFS_IDLE_THRESHOLD_GB_PER_DAY, EFS_STANDARD_THRESHOLD_GB,
+    EFS_STANDARD_ARCHIVE_THRESHOLD_GB, EFS_BURST_CREDIT_LOW_WATERMARK, HOURS_PER_MONTH,
+    LAMBDA_LOOKBACK_DAYS, LAMBDA_ERROR_RATE_THRESHOLD, LAMBDA_LOW_CONCURRENCY_THRESHOLD,
+    LAMBDA_LOW_TRAFFIC_THRESHOLD, LAMBDA_LARGE_PACKAGE_MB,
+    LAMBDA_LOW_PROVISIONED_UTILIZATION, LAMBDA_VERSION_SPRAWL_THRESHOLD,
+    VPC_LOOKBACK_DAYS, MIN_COST_THRESHOLD,
+    NAT_LOOKBACK_DAYS, NAT_IDLE_TRAFFIC_THRESHOLD_GB, NAT_IDLE_CONNECTION_THRESHOLD,
+    BIG_BUCKET_THRESHOLD_GB, STALE_DAYS_THRESHOLD, S3_MULTIPART_STALE_DAYS,
+    S3_LOOKBACK_DAYS, MAX_KEYS_TO_SCAN, S3_STORAGE_TYPES,
+    _DDB_TABLE_WORKERS, _DDB_META_WORKERS, _DDB_GSI_METRICS_LIMIT, _DDB_CW_PERIOD,
+    VALID_RETENTION_DAYS, SSM_ADV_STALE_DAYS, MAX_CUSTOM_METRICS_CHECK,
+    EC2_LOOKBACK_DAYS, EC2_CW_PERIOD, EC2_IDLE_CPU_PCT, EC2_IDLE_NET_GB, EC2_IDLE_DISK_OPS,
+    CLOUDFRONT_LOOKBACK_DAYS, CLOUDFRONT_PERIOD, CLOUDFRONT_IDLE_REQUESTS, CLOUDFRONT_IDLE_BYTES_GB,
+    LOAD_BALANCER_LOOKBACK_DAYS,
+)
+
 #endregion
 
 
@@ -281,114 +304,6 @@ PRICING: Dict[str, Dict[str, Union[float, Dict[str, float]]]] = {
 }
 
 #endregion
-
-
-#region Constants (non-pricing)
-REGIONS = ["eu-west-1", "eu-west-2", "eu-west-3"]
-OUTPUT_FILE = "cleanup_estimates.csv"
-LOG_FILE = "cleanup_analysis.log"
-BATCH_SIZE = 100
-REQUIRED_TAG_KEYS = ["ApplicationID", "Application", "Environment"]
-
-# S3 multipart
-_S3_MPU_BUCKET_WORKERS: int      = 16    # more parallelism across buckets
-_S3_MPU_PART_WORKERS: int        = 8     # per-bucket parallelism to fetch first page of parts
-_S3_MPU_PAGE_SIZE: int           = 1000  # uploads page size
-_S3_MPU_GLOBAL_FINDINGS_CAP: int = 5000  # overall cap to bound runtime
-_S3_MPU_PARTS_MODE: str          = "first_page"  # "first_page" (fast) or "full" (exact, slower)
-
-# --- DynamoDB thresholds ---
-DDB_LOOKBACK_DAYS = 30
-DDB_CW_PERIOD = 86400  # 1 day aggregation
-DDB_BACKUP_AGE_DAYS = 180
-
-# --- EFS analysis thresholds ---
-EFS_LOOKBACK_DAYS = 30
-EFS_IA_LARGE_THRESHOLD_GB = 100.0
-EFS_IA_READS_HIGH_GB_PER_DAY = 1.0
-EFS_IDLE_THRESHOLD_GB_PER_DAY = 0.05
-EFS_STANDARD_THRESHOLD_GB = 50.0
-EFS_STANDARD_ARCHIVE_THRESHOLD_GB = globals().get("EFS_STANDARD_ARCHIVE_THRESHOLD_GB", 1000)
-EFS_BURST_CREDIT_LOW_WATERMARK   = globals().get("EFS_BURST_CREDIT_LOW_WATERMARK", 1e6)
-HOURS_PER_MONTH                  = globals().get("HOURS_PER_MONTH", 730)
-
-# --- Lambda thresholds ---
-LAMBDA_LOOKBACK_DAYS = 90
-LAMBDA_ERROR_RATE_THRESHOLD = 0.10
-LAMBDA_LOW_CONCURRENCY_THRESHOLD = 0.1
-LAMBDA_LOW_TRAFFIC_THRESHOLD = 50
-LAMBDA_LARGE_PACKAGE_MB = 50
-LAMBDA_LOW_PROVISIONED_UTILIZATION = 0.2
-LAMBDA_VERSION_SPRAWL_THRESHOLD = 10
-
-# --- Network peering thresholds ---
-VPC_LOOKBACK_DAYS = 30
-MIN_COST_THRESHOLD = 1.0  # USD, ignore negligible findings
-
-# --- NAT Gateway thresholds ---
-NAT_LOOKBACK_DAYS = 30
-NAT_IDLE_TRAFFIC_THRESHOLD_GB = 1.0
-NAT_IDLE_CONNECTION_THRESHOLD = 0
-
-# --- S3 metrics helpers ---
-BIG_BUCKET_THRESHOLD_GB = 500 
-STALE_DAYS_THRESHOLD = 180 
-S3_MULTIPART_STALE_DAYS = 7
-S3_LOOKBACK_DAYS = 90
-MAX_KEYS_TO_SCAN = 10000
-
-# --- Dynamo DB ---
-_DDB_TABLE_WORKERS: int = 6       # parallel tables to analyze
-_DDB_META_WORKERS: int = 4        # per-table fanout for TTL/PITR/tags/backups
-_DDB_GSI_METRICS_LIMIT: Optional[int] = None  # e.g., 20 to cap very large GSI sets
-_DDB_CW_PERIOD: int = DDB_CW_PERIOD  # keep your daily granularity
-
-S3_STORAGE_TYPES = [
-    "StandardStorage",
-    "StandardIAStorage",
-    "OneZoneIAStorage",
-    "ReducedRedundancyStorage",
-    "IntelligentTieringFAStorage",
-    "IntelligentTieringIAStorage",
-    "IntelligentTieringAAStorage",
-    "GlacierInstantRetrievalStorage",
-    "GlacierStorage",            
-    "GlacierDeepArchiveStorage", 
-]
-
-# --- BACKUP ---
-VALID_RETENTION_DAYS = {7, 35, 90}
-
-# --- SSM ---
-SSM_ADV_STALE_DAYS = 180
-
-MAX_CUSTOM_METRICS_CHECK = 500  # cap to avoid expensive scans
-
-# --- EC2 --- 
-EC2_LOOKBACK_DAYS = 30               
-EC2_CW_PERIOD = 86400                 
-EC2_IDLE_CPU_PCT = 5.0                
-EC2_IDLE_NET_GB = 0.1              
-EC2_IDLE_DISK_OPS = 10   
-
-# --- CF ---
-CLOUDFRONT_LOOKBACK_DAYS = 60  
-CLOUDFRONT_PERIOD = 86400     
-CLOUDFRONT_IDLE_REQUESTS = 10 
-CLOUDFRONT_IDLE_BYTES_GB = 1.0
-
-# --- LB ---
-LOAD_BALANCER_LOOKBACK_DAYS = 60
-
-#endregion
-
-
-#region Config SECTION
-SDK_CONFIG = Config(
-    retries={"max_attempts": 10, "mode": "standard"},
-    connect_timeout=5, read_timeout=60,
-    user_agent_extra="cleanup_tooling_par/1.0"
-)
 
 
 def retry_with_backoff(max_retries=3, backoff_factor=1.5, jitter=True, exceptions=(ClientError, EndpointConnectionError, NoCredentialsError)):
