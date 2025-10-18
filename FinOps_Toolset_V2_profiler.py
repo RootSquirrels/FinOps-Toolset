@@ -2564,7 +2564,6 @@ def estimate_lambda_cost(fn: LambdaMetadata) -> float:
     )
 
 
-@retry_with_backoff()
 def check_lambda_efficiency(writer: csv.writer, lambda_client, cloudwatch) -> None:
     """
     Analyze AWS Lambda functions for cost efficiency and rightsizing opportunities.
@@ -2609,114 +2608,206 @@ def check_lambda_efficiency(writer: csv.writer, lambda_client, cloudwatch) -> No
         • API calls are wrapped with retry_with_backoff to mitigate throttling.
         • Individual function errors are logged and skipped (processing continues).
     """
+
     try:
+        region = (
+            getattr(getattr(cloudwatch, "meta", None), "region_name", "")
+            or getattr(getattr(lambda_client, "meta", None), "region_name", "")
+            or ""
+        )
+
         now = datetime.now(timezone.utc)
-        start = now - timedelta(days=LAMBDA_LOOKBACK_DAYS)
-        period = 86400  # 1 day resolution is enough for FinOps heuristics
+        lookback_days = max(1, LAMBDA_LOOKBACK_DAYS)
+        start = now - timedelta(days=lookback_days)
+        PERIOD = 300  # 5m buckets — good balance for Duration averages
 
-        paginator = lambda_client.get_paginator("list_functions")
-        for page in paginator.paginate():
-            functions = page.get("Functions", []) or []
-            if not functions:
-                continue
+        # 1) List functions (paginated)
+        funcs = []
+        token = None
+        while True:
+            try:
+                kwargs = {"Marker": token} if token else {}
+                resp = lambda_client.list_functions(**kwargs)
+            except ClientError as e:
+                logging.error(f"[Lambda] list_functions failed in {region}: {e}")
+                break
+            funcs.extend(resp.get("Functions", []))
+            token = resp.get("NextMarker")
+            if not token:
+                break
 
-            # ---------- Build one CW GetMetricData batch for this page ----------
-            mdqs: list[dict] = []
-            for f in functions:
-                fn = f["FunctionName"]
-                dims = [{"Name": "FunctionName", "Value": fn}]
-                # One stat per MDQ (CW constraint)
-                for metric, stats in [
-                    ("Invocations", ["Sum"]),
-                    ("Errors", ["Sum"]),
-                    ("Duration", ["Average", "Maximum"]),
-                    ("ConcurrentExecutions", ["Average", "Maximum"]),
-                    ("ProvisionedConcurrencyUtilization", ["Average"]),
-                ]:
-                    for stat in stats:
-                        qid = _cw_id_safe(f"lam_{fn}_{metric}_{stat}")
-                        mdqs.append(
-                            build_mdq(
-                                id_hint=qid,
-                                namespace="AWS/Lambda",
-                                metric=metric,
-                                dims=dims,
-                                stat=stat,
-                                period=period,
-                            )
-                        )
+        if not funcs:
+            return
 
-            md = cw_get_metric_data_bulk(cloudwatch, mdqs, start, now)
+        # 2) Pre-fetch tags (best effort) and (optionally) version counts
+        def _tags(arn: str) -> Dict[str, str]:
+            try:
+                t = lambda_client.list_tags(Resource=arn).get("Tags", {})
+                # Tags API returns dict already
+                return {str(k): str(v) for k, v in t.items()}
+            except ClientError:
+                return {}
+            except Exception:
+                return {}
 
-            # ---------- Reduce per function and run helper checks ----------
-            for function in functions:
+        # 3) Batch CloudWatch metrics for all functions
+        batch = cw.CloudWatchBatcher(region, client=cloudwatch)
+        for f in funcs:
+            fname = f.get("FunctionName", "")
+            dims = [{"Name": "FunctionName", "Value": fname}]
+            batch.add(cw.MDQ(id=f"lam_inv__{fname}", namespace="AWS/Lambda", metric="Invocations", dims=dims, stat="Sum",     period=PERIOD))
+            batch.add(cw.MDQ(id=f"lam_err__{fname}", namespace="AWS/Lambda", metric="Errors",      dims=dims, stat="Sum",     period=PERIOD))
+            batch.add(cw.MDQ(id=f"lam_thr__{fname}", namespace="AWS/Lambda", metric="Throttles",   dims=dims, stat="Sum",     period=PERIOD))
+            batch.add(cw.MDQ(id=f"lam_dur__{fname}", namespace="AWS/Lambda", metric="Duration",    dims=dims, stat="Average", period=PERIOD))
+
+        try:
+            series = batch.execute(start, now, scan_by="TimestampDescending")
+        except Exception as e:
+            logging.exception(f"[Lambda] CloudWatch batch execute failed in {region}: {e}")
+            series = {}
+
+        # 4) Pricing constants
+        try:
+            req_per_million = get_price("LAMBDA", "REQUESTS_PER_MILLION")
+        except Exception:
+            req_per_million = 0.20
+        try:
+            gb_second = get_price("LAMBDA", "GB_SECOND")
+        except Exception:
+            gb_second = 0.0000166667
+
+        # 5) Emit rows
+        for f in funcs:
+            try:
+                arn = f.get("FunctionArn", "")
+                fname = f.get("FunctionName", arn or "lambda")
+                runtime = f.get("Runtime", "")
+                memory_mb = int(f.get("MemorySize", 0) or 0)
+                timeout_s = int(f.get("Timeout", 0) or 0)
+                archs = f.get("Architectures", []) or []
+                arch = archs[0] if archs else "x86_64"
+                code_size = int(f.get("CodeSize", 0) or 0)
+                pkg_type = f.get("PackageType", "Zip")
+                created = f.get("LastModified", "")  # often '2023-05-22T12:34:56.000+0000'
                 try:
-                    fn_name = function.get("FunctionName", "")
-                    arn = function.get("FunctionArn", "")
-                    creation_time = function.get("LastModified", "")  # keep existing creation date
-                    memory_mb = int(function.get("MemorySize", 128) or 128)
-                    code_size = int(function.get("CodeSize", 0) or 0)
-                    runtime = function.get("Runtime", "")
-                    ephemeral_mb = int((function.get("EphemeralStorage") or {}).get("Size", 512) or 512)
+                    if created:
+                        created_dt = datetime.fromisoformat(created.replace("Z", "+00:00")) if "T" in created else now
+                    else:
+                        created_dt = now
+                except Exception:
+                    created_dt = now
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+                created_iso = created_dt.astimezone(timezone.utc).isoformat()
 
-                    def vals(metric: str, stat: str) -> list[float]:
-                        qid = _cw_id_safe(f"lam_{fn_name}_{metric}_{stat}")
-                        return [v for _, v in md.get(qid, [])]
+                tags = _tags(arn)
+                name = tags.get("Name", fname)
 
-                    inv_sum          = series_sum(vals("Invocations", "Sum"))
-                    err_sum          = series_sum(vals("Errors", "Sum"))
-                    dur_avg_series   = vals("Duration", "Average")
-                    dur_max_series   = vals("Duration", "Maximum")
-                    conc_avg_series  = vals("ConcurrentExecutions", "Average")
-                    conc_max_series  = vals("ConcurrentExecutions", "Maximum")
-                    prov_util_series = vals("ProvisionedConcurrencyUtilization", "Average")
+                # Metrics
+                inv_sum   = sum(v for _, v in series.get(f"lam_inv__{fname}", []))
+                err_sum   = sum(v for _, v in series.get(f"lam_err__{fname}", []))
+                thr_sum   = sum(v for _, v in series.get(f"lam_thr__{fname}", []))
+                dur_vals  = [v for _, v in series.get(f"lam_dur__{fname}", [])]
+                avg_ms    = (sum(dur_vals) / len(dur_vals)) if dur_vals else 0.0
 
-                    fn_meta = LambdaMetadata(
-                        arn=arn,
-                        name=fn_name,
-                        runtime=runtime,
-                        memory_mb=memory_mb,
-                        ephemeral_mb=ephemeral_mb,
-                        code_size=code_size,
-                        creation_date=creation_time,
-                        total_invocations=int(inv_sum),
-                        total_errors=int(err_sum),
-                        avg_duration_ms=series_avg(dur_avg_series),
-                        # Use daily max as a robust proxy for p95 over the period
-                        p95_duration_ms=series_p95(dur_max_series),
-                        avg_concurrency=series_avg(conc_avg_series),
-                        max_concurrency=max(conc_max_series) if conc_max_series else 0.0,
-                        avg_prov_util=series_avg(prov_util_series),
-                        estimated_cost=0.0,
-                    )
+                #   Expectation: helper returns a flag/bool or flag string; adapt to your signature if different.
+                try:
+                    large_pkg_flag = check_large_package(code_size_bytes=code_size, layers=f.get("Layers", []), threshold_mb=LAMBDA_LARGE_PACKAGE_MB)
+                except Exception:
+                    large_pkg_flag = False
 
-                    fn_meta.estimated_cost = estimate_lambda_cost(fn_meta)
+                # Low traffic?
+                try:
+                    low_traffic_flag = check_low_traffic(total_invocations=inv_sum, threshold=LAMBDA_LOW_TRAFFIC_THRESHOLD)
+                except Exception:
+                    low_traffic_flag = (inv_sum <= LAMBDA_LOW_TRAFFIC_THRESHOLD)
 
-                    # Registry-based helpers (includes check_large_package, etc.)
-                    for check in LAMBDA_CHECKS:
-                        fn_meta.flags.update(check(fn_meta))
+                # Error rate?
+                try:
+                    err_rate, high_error_flag = check_high_error_rate(invocations=inv_sum, errors=err_sum, threshold=LAMBDA_ERROR_RATE_THRESHOLD)
+                except Exception:
+                    err_rate = (err_sum / inv_sum) if inv_sum > 0 else 0.0
+                    high_error_flag = (err_rate >= LAMBDA_ERROR_RATE_THRESHOLD)
 
-                    # Extra helper checks that need a client
-                    fn_meta.flags.update(check_layers(fn_meta, lambda_client))
-                    fn_meta.flags.update(check_version_sprawl(fn_meta, lambda_client))
+                # Low concurrency (heuristic via throttles == 0 and low invocations)
+                try:
+                    low_conc_flag = check_low_concurrency(invocations=inv_sum, throttles=thr_sum, threshold=LAMBDA_LOW_CONCURRENCY_THRESHOLD)
+                except Exception:
+                    low_conc_flag = (inv_sum <= (LAMBDA_LOW_CONCURRENCY_THRESHOLD * lookback_days * 60 * 60))  # fallback, harmless
 
-                    if fn_meta.flags or fn_meta.estimated_cost > 0:
-                        write_resource_to_csv(
-                            writer=writer,
-                            resource_id=fn_meta.arn,
-                            name=fn_meta.name,
-                            owner_id=ACCOUNT_ID,
-                            resource_type="LambdaFunction",
-                            creation_date=fn_meta.creation_date,
-                            estimated_cost=fn_meta.estimated_cost,
-                            flags=list(fn_meta.flags),
-                        )
+                # Version sprawl (optional)
+                try:
+                    sprawl_flag = check_version_sprawl(lambda_client, function_name=fname, threshold=LAMBDA_VERSION_SPRAWL_THRESHOLD)
+                except Exception:
+                    sprawl_flag = False
 
-                except Exception as fe:
-                    logging.error(f"[check_lambda_efficiency] Function {function.get('FunctionName','?')} error: {fe}")
+                # ARM64 candidate (helper, if you have it)
+                arm64_flag = (arch == "x86_64" and isinstance(runtime, str) and runtime.startswith(("python", "nodejs", "java", "dotnet")))
+
+                # --- Cost estimation (requests + GB-seconds) ---
+                #   GB-seconds = invocations * (avg_ms/1000) * (memory_mb/1024)
+                gb_seconds = inv_sum * (avg_ms / 1000.0) * max(0.0, float(memory_mb) / 1024.0)
+                compute_cost = gb_seconds * gb_second
+                request_cost = (inv_sum / 1_000_000.0) * req_per_million
+                est_monthly = round(compute_cost + request_cost, 2)
+
+                # Flags & confidence
+                flags: List[str] = []
+                missing = [k for k in REQUIRED_TAG_KEYS if not tags.get(k)]
+                if missing:
+                    flags.append(f"MissingRequiredTags={','.join(missing)}")
+                if large_pkg_flag:
+                    flags.append("lambda_large_package")
+                if low_traffic_flag:
+                    flags.append("lambda_low_traffic")
+                if high_error_flag:
+                    flags.append("lambda_high_error_rate")
+                if low_conc_flag:
+                    flags.append("lambda_low_concurrency")
+                if sprawl_flag:
+                    flags.append("lambda_version_sprawl")
+                if arm64_flag:
+                    flags.append("lambda_arm64_candidate")
+
+                # Potential saving: optional; left None unless you have a dedicated estimator
+                potential = None
+
+                signals = {
+                    "Region": region,
+                    "Runtime": runtime,
+                    "Arch": arch,
+                    "MemoryMB": str(memory_mb),
+                    "TimeoutSec": str(timeout_s),
+                    f"Invocations{lookback_days}d": str(int(inv_sum)),
+                    f"Errors{lookback_days}d": str(int(err_sum)),
+                    f"Throttles{lookback_days}d": str(int(thr_sum)),
+                    "AvgDurationMs": f"{avg_ms:.2f}",
+                    "ErrorRate": f"{err_rate:.4f}",
+                    "LookbackDays": str(lookback_days),
+                }
+
+                write_resource_to_csv(
+                    writer=writer,
+                    resource_id=arn,
+                    name=name,
+                    resource_type="LambdaFunction",
+                    owner_id=ACCOUNT_ID,
+                    state="",
+                    creation_date=created_iso,
+                    estimated_cost=est_monthly,  # requests + GB-seconds
+                    app_id=tags.get("ApplicationID", "NULL"),
+                    app=tags.get("Application", "NULL"),
+                    env=tags.get("Environment", "NULL"),
+                    flags=flags,
+                    potential_saving=potential,
+                    signals=signals,
+                )
+            except Exception as e:
+                logging.exception(f"[Lambda] emit failed for {f.get('FunctionName','?')} in {region}: {e}")
 
     except Exception as e:
-        logging.error(f"[check_lambda_efficiency] Error: {e}")
+        logging.exception(f"[Lambda] check_lambda_functions_refactored failed: {e}")
+        return
 
 
 #endregion
