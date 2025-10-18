@@ -524,12 +524,6 @@ def _fmt_dt(dt: Optional[datetime]) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _fmt_num(v) -> str:
-    if isinstance(v, float):
-        s = f"{v:.4f}".rstrip("0").rstrip(".")
-        return s or "0"
-    return str(v)
-
 #endregion
 
 #region ENGINE SECTION
@@ -2730,176 +2724,160 @@ def check_lambda_efficiency(writer: csv.writer, lambda_client, cloudwatch) -> No
 
 #region NAT Gateways SECTION
 
-@retry_with_backoff()
 def check_unused_nat_gateways(
     writer: csv.writer,
     ec2,
     cloudwatch,
-    lookback_days: int = NAT_LOOKBACK_DAYS
 ) -> None:
     """
-    Detect under-used/idle NAT Gateways and estimate monthly cost:
-    NAT hourly charge + data-processed charge (per GB) read from PRICING via get_price().
+    NAT Gateway audit using CloudWatch batcher
     """
     try:
-        # ---- Time window & region ------------------------------------------------
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=lookback_days)
-        period = 86400  # 1 day
-
         region = (
             getattr(getattr(cloudwatch, "meta", None), "region_name", "")
             or getattr(getattr(ec2, "meta", None), "region_name", "")
             or ""
         )
 
-        # ---- Subnet -> route table map (who could be behind each NAT?) -----------
-        route_tables = safe_aws_call(
-            lambda: ec2.describe_route_tables().get("RouteTables", []),
-            [],
-            context="DescribeRouteTables",
-        )
-        subnet_to_rts: Dict[str, List[str]] = {}
-        for rt in route_tables:
-            for assoc in rt.get("Associations", []) or []:
-                sid = assoc.get("SubnetId")
-                if sid:
-                    subnet_to_rts.setdefault(sid, []).append(rt["RouteTableId"])
+        lookback_days = max(1, NAT_LOOKBACK_DAYS)
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(days=lookback_days)
 
-        # ---- List NAT Gateways in 'available' state ------------------------------
-        nat_gateways = safe_aws_call(
-            lambda: ec2.describe_nat_gateways().get("NatGateways", []),
-            [],
-            context="DescribeNATGateways",
-        )
-        nat_ids = [ng["NatGatewayId"] for ng in nat_gateways if ng.get("State") == "available"]
-        if not nat_ids:
+        # 1) List NATs in this region
+        nats = []
+        token = None
+        while True:
+            try:
+                if token:
+                    resp = ec2.describe_nat_gateways(
+                        Filters=[{"Name": "state", "Values": ["available", "pending"]}],
+                        NextToken=token
+                    )
+                else:
+                    resp = ec2.describe_nat_gateways(
+                        Filters=[{"Name": "state", "Values": ["available", "pending"]}]
+                    )
+            except ClientError as e:
+                logging.error(f"[NAT] describe_nat_gateways failed in {region}: {e}")
+                break
+            nats.extend(resp.get("NatGateways", []))
+            token = resp.get("NextToken")
+            if not token:
+                break
+
+        if not nats:
             return
 
-        # ---- Batch CloudWatch GetMetricData for all NAT GWs ----------------------
-        mdqs: List[dict] = []
-        for nid in nat_ids:
-            dims = [{"Name": "NatGatewayId", "Value": nid}]
-            for metric, stat in (
-                ("BytesInFromSource", "Sum"),
-                ("BytesOutToDestination", "Sum"),
-                ("ActiveConnectionCount", "Maximum"),
-            ):
-                mdqs.append(
-                    build_mdq(
-                        id_hint=f"nat_{nid}_{metric}_{stat}",
-                        namespace="AWS/NATGateway",
-                        metric=metric,
-                        dims=dims,
-                        stat=stat,
-                        period=period,
-                    )
-                )
+        def tags_dict(aws_tags):
+            if not aws_tags:
+                return {}
+            return {t.get("Key", ""): t.get("Value", "") for t in aws_tags}
 
-        md = cw_get_metric_data_bulk(cloudwatch, mdqs, start, end, scan_by="TimestampAscending")
-
-        def _vals(nid: str, metric: str, stat: str) -> List[float]:
-            qid = _cw_id_safe(f"nat_{nid}_{metric}_{stat}")
-            return [v for _, v in md.get(qid, [])]
-
-        nat_hour_price   = get_price("NAT", "HOUR", region=region)          
-        nat_gb_proc_price = get_price("NAT", "GB_PROCESSED", region=region)
-        monthly_hours_cost = nat_hour_price * HOURS_PER_MONTH              
-
-        # ---- Evaluate each NAT ---------------------------------------------------
-        for nat in nat_gateways:
-            if nat.get("State") != "available":
-                continue
-
+        # 2) Batch CW metrics for all NATs in this region (use passed CW client)
+        batch = cw.CloudWatchBatcher(region, client=cloudwatch)
+        for nat in nats:
             nat_id = nat["NatGatewayId"]
-            tags = {t["Key"]: t["Value"] for t in (nat.get("Tags") or [])}
+            dims = [{"Name": "NatGatewayId", "Value": nat_id}]
+            # bytes (sum) — convert to GB later
+            batch.add(cw.MDQ(id=f"nat_bin_src__{nat_id}",  namespace="AWS/NATGateway",
+                             metric="BytesInFromSource",      dims=dims, stat="Sum", period=3600))
+            batch.add(cw.MDQ(id=f"nat_bout_dst__{nat_id}", namespace="AWS/NATGateway",
+                             metric="BytesOutToDestination",  dims=dims, stat="Sum", period=3600))
+            batch.add(cw.MDQ(id=f"nat_bin_dst__{nat_id}",  namespace="AWS/NATGateway",
+                             metric="BytesInFromDestination", dims=dims, stat="Sum", period=3600))
+            batch.add(cw.MDQ(id=f"nat_bout_src__{nat_id}", namespace="AWS/NATGateway",
+                             metric="BytesOutToSource",       dims=dims, stat="Sum", period=3600))
+            # connections (sum)
+            batch.add(cw.MDQ(id=f"nat_conn__{nat_id}",     namespace="AWS/NATGateway",
+                             metric="ActiveConnectionCount", dims=dims, stat="Sum", period=3600))
 
-            # Route tables pointing to this NAT -> candidate subnets behind it
-            rts_with_nat = [
-                rt["RouteTableId"]
-                for rt in route_tables
-                if any((r.get("NatGatewayId") == nat_id) for r in (rt.get("Routes") or []))
-            ]
-            subs_with_nat = [s for s, rts in subnet_to_rts.items() if set(rts) & set(rts_with_nat)]
+        try:
+            series = batch.execute(start, now, scan_by="TimestampDescending")
+        except Exception as e:
+            logging.exception(f"[NAT] CloudWatch batch execute failed in {region}: {e}")
+            series = {}
 
-            # Running instances in those subnets (proxy for "who actually uses the NAT")
-            instances: List[str] = []
-            if subs_with_nat:
-                paginator = ec2.get_paginator("describe_instances")
-                for page in paginator.paginate(Filters=[{"Name": "subnet-id", "Values": subs_with_nat}]):
-                    for res in page.get("Reservations", []) or []:
-                        for inst in res.get("Instances", []) or []:
-                            if inst.get("State", {}).get("Name") == "running":
-                                instances.append(inst["InstanceId"])
+        # 3) Emit rows
+        for nat in nats:
+            try:
+                nat_id = nat["NatGatewayId"]
+                state = nat.get("State", "")
+                create_time = nat.get("CreateTime")
+                if isinstance(create_time, datetime) and create_time.tzinfo is None:
+                    create_time = create_time.replace(tzinfo=timezone.utc)
+                created_iso = (create_time or now).astimezone(timezone.utc).isoformat()
 
-            # CloudWatch metrics reductions
-            in_sum  = float(sum(_vals(nat_id, "BytesInFromSource", "Sum")))
-            out_sum = float(sum(_vals(nat_id, "BytesOutToDestination", "Sum")))
-            max_conn = float(max(_vals(nat_id, "ActiveConnectionCount", "Maximum") or [0.0]))
+                tdict = tags_dict(nat.get("Tags", []))
+                name = tdict.get("Name", nat_id)
 
-            total_gb = (in_sum + out_sum) / (1024 ** 3)
-            total_gb_rounded = round(total_gb, 2)
+                # Sum bytes across the 4 metrics → GB
+                b_sum = 0.0
+                for key in (f"nat_bin_src__{nat_id}",
+                            f"nat_bout_dst__{nat_id}",
+                            f"nat_bin_dst__{nat_id}",
+                            f"nat_bout_src__{nat_id}"):
+                    b_sum += sum(v for _, v in series.get(key, []))
+                gb_processed = float(b_sum) / (1024.0 ** 3)
 
-            monthly_data_cost = total_gb * nat_gb_proc_price
-            monthly_total = round(monthly_hours_cost + monthly_data_cost, 2)
+                # Connections sum
+                conn_sum = sum(v for _, v in series.get(f"nat_conn__{nat_id}", []))
 
-            flags: List[str] = []
-            signals = {
-                "Region": region,
-                "TrafficGB": total_gb_rounded,
-                "MaxConnections": int(max_conn),
-                "Subnets": len(subs_with_nat),
-                "Instances": len(instances),
-                "LookbackDays": lookback_days,
-                "HourRate": round(nat_hour_price, 5),
-                "GBRate": round(nat_gb_proc_price, 5),
-            }
+                # Region-aware pricing
+                try:
+                    nat_hour = get_price("NAT", "HOUR", region, default=0.0)
+                except Exception:
+                    nat_hour = 0.0
+                try:
+                    nat_gb = get_price("NAT", "GB_PROCESSED", region, default=0.0)
+                except Exception:
+                    nat_gb = 0.0
 
-            if not instances:
-                flags.append("NoActiveInstances")
-            if total_gb < NAT_IDLE_TRAFFIC_THRESHOLD_GB:
-                flags.append("LowTrafficNAT")
-            if max_conn == NAT_IDLE_CONNECTION_THRESHOLD:
-                flags.append("ZeroConnections")
-            if (not instances) and (total_gb < NAT_IDLE_TRAFFIC_THRESHOLD_GB) and (max_conn == NAT_IDLE_CONNECTION_THRESHOLD):
-                flags.append("IdleNATProven")
+                est_monthly = round(nat_hour * HOURS_PER_MONTH + gb_processed * nat_gb, 2)
 
-            if not all(tags.get(k) for k in REQUIRED_TAG_KEYS):
-                flags.append("MissingRequiredTags")
+                # Flags (idle candidate)
+                flags = []
+                missing = [k for k in REQUIRED_TAG_KEYS if not tdict.get(k)]
+                if missing:
+                    flags.append(f"MissingRequiredTags={','.join(missing)}")
+                if (gb_processed <= NAT_IDLE_TRAFFIC_THRESHOLD_GB) and (conn_sum <= NAT_IDLE_CONNECTION_THRESHOLD):
+                    flags.append("idle_nat_candidate")
 
-            confidence = score_confidence({
-                "traffic_low": pct_to_signal(total_gb, NAT_IDLE_TRAFFIC_THRESHOLD_GB),
-                "conn_zero": 1.0 if max_conn == NAT_IDLE_CONNECTION_THRESHOLD else 0.0,
-                "no_instances": 1.0 if not instances else 0.0,
-            })
+                # Potential saving & confidence
+                potential = round(est_monthly, 2) if "idle_nat_candidate" in flags else None
+                confidence = 100 if "idle_nat_candidate" in flags else None
 
-            if "IdleNATProven" in flags:
-                flags.append(f"PotentialSaving={monthly_total}$")
+                # Signals (used by policies later)
+                signals = {
+                    "Region": region,
+                    f"DataProcessedGB{lookback_days}d": f"{gb_processed:.3f}",
+                    "ActiveConnectionSum": str(int(conn_sum)),
+                    "LookbackDays": str(lookback_days),
+                }
 
-            write_resource_to_csv(
-                writer=writer,
-                resource_id=nat_id,
-                name=tags.get("Name", ""),
-                resource_type="NATGateway",
-                owner_id=ACCOUNT_ID,
-                estimated_cost=monthly_total,
-                app_id=tags.get("ApplicationID", "NULL"),
-                app=tags.get("Application", "NULL"),
-                env=tags.get("Environment", "NULL"),
-                flags=flags,
-                confidence=confidence,
-                signals=signals,
-            )
+                write_resource_to_csv(
+                    writer=writer,
+                    resource_id=nat_id,
+                    name=name,
+                    resource_type="NATGateway",
+                    owner_id=ACCOUNT_ID,
+                    state=str(state),
+                    creation_date=created_iso,
+                    estimated_cost=est_monthly,
+                    app_id=tdict.get("ApplicationID", "NULL"),
+                    app=tdict.get("Application", "NULL"),
+                    env=tdict.get("Environment", "NULL"),
+                    referenced_in="",
+                    flags=flags,
+                    potential_saving=potential,
+                    confidence=confidence,
+                    signals=signals,
+                )
+            except Exception as e:
+                logging.exception(f"[NAT] emit failed for {nat.get('NatGatewayId','?')} in {region}: {e}")
 
-            logging.info(
-                "[check_unused_nat_gateways] %s traffic≈%sGB maxConn=%s est≈$%s flags=%s",
-                nat_id, total_gb_rounded, int(max_conn), monthly_total, flags
-            )
-
-    except ClientError as e:
-        logging.error("[check_unused_nat_gateways] AWS error: %s", e)
     except Exception as e:
-        logging.error("[check_unused_nat_gateways] Unexpected error: %s", e)
+        logging.exception(f"[NAT] check_nat_gateways_refactored failed: {e}")
+        return
 
 #endregion
 
