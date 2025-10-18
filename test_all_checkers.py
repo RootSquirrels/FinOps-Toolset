@@ -102,7 +102,7 @@ class NullPaginator:
     def __init__(self, name: str) -> None:
         self.name = name
 
-    def paginate(self) -> Iterable[Mapping[str, object]]:  # noqa: D401
+    def paginate(self, *args, **kwargs) -> Iterable[Mapping[str, object]]:  # noqa: D401
         """Yield a single empty page for the requested paginator name."""
         n = self.name
         if n == "describe_instances":
@@ -144,18 +144,16 @@ class NullAWSClient:
         return NullPaginator(name)
 
     # pylint: disable=too-many-return-statements, too-many-branches
-    def __getattr__(self, name: str):  # noqa: D401
-        """Return a function emulating common ``describe/get/list`` operations."""
-        def _f():  # type: ignore[no-untyped-def]
-            # ELBv2
+    def __getattr__(self, name: str):
+        # Always accept *args/**kwargs so calls like
+        # ec2.describe_images(Owners=[...], Filters=[...]) don't TypeError.
+        def _f(*args, **kwargs):
             if name == "describe_load_balancers":
                 return {"LoadBalancers": []}
             if name == "describe_tags":
                 return {"TagDescriptions": []}
-            # Classic ELB
             if name == "describe_load_balancers_elb":
                 return {"LoadBalancerDescriptions": []}
-            # EC2
             if name == "describe_images":
                 return {"Images": []}
             if name == "describe_route_tables":
@@ -168,18 +166,14 @@ class NullAWSClient:
                 return {"Vpcs": []}
             if name == "describe_instances":
                 return {"Reservations": []}
-            # SSM
             if name == "describe_parameters":
                 return {"Parameters": []}
-            # WAFv2
             if name == "list_web_acls":
                 return {"WebACLs": []}
             if name == "list_resources_for_web_acl":
                 return {"ResourceArns": []}
-            # CloudWatch
             if name == "get_metric_data":
                 return {"MetricDataResults": []}
-            # Route53 / CloudFront
             if name == "list_hosted_zones":
                 return {"HostedZones": []}
             if name == "list_resource_record_sets":
@@ -190,7 +184,6 @@ class NullAWSClient:
                 return {"StreamingDistributionList": {"Items": []}}
             if name == "list_tags_for_resource":
                 return {"Tags": {"Items": []}}
-
             return {}
         return _f
 
