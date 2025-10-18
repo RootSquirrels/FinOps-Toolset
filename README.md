@@ -6,61 +6,49 @@ This repository contains a pragmatic FinOps toolkit that surfaces **actionable, 
 
 ## Highlights
 
-- **Broad coverage** of services (EC2, EBS, ECR, EKS, DynamoDB, Kinesis, RDS, CloudFront, KMS, WAFv2, SSM, VPC/TGW… and more).
-- **Fast, batched CloudWatch reads** (via `GetMetricData`) and selective deep-dives to avoid throttling.
-- **Normalized CSV** with derived `Potential_Saving_USD`, confidence, and compact “Signals” for diagnostics.
-- **Interactive dashboard** (`finops_dashboard.py`) that visualizes savings by resource type and region, with click‑to‑filter charts.
-- **Built‑in profiler** to time each checker and export per‑check timings.
-- **S3 & Lambda refactors** (added here) that reduce metric calls while adding higher‑value flags and keeping CSV compatibility.
-
-> The dashboard generator usage and CSV schema are documented inline in the code and tests. fileciteturn19file10 fileciteturn19file6
+- **Broad coverage** of services (EC2, EBS, ECR, EKS, DynamoDB, Kinesis, RDS, CloudFront, KMS, WAFv2, SSM, VPC/TGW, and more).  
+- **Fast, batched CloudWatch reads** (`GetMetricData`) and selective deep‑dives to avoid throttling.  
+- **Normalized CSV** with derived `Potential_Saving_USD` and compact `Signals` for diagnostics.  
+- **Interactive dashboard** (`finops_dashboard.py`) that visualizes savings by resource type and region, with **click‑to‑filter** charts.  
+- **Built‑in profiler** (in the main runner) that times each checker and reports slow spots.  
+- **S3 & Lambda refactors** reduce metric calls while adding higher‑value flags, with **no CSV regressions**.
 
 ---
 
-## What’s in the box?
+## What’s in the repo?
 
-- **`FinOps_Toolset_V2_profiler.py`** — the main scanner and checkers, plus pricing constants, retry/backoff, CSV writer, and a simple profiler. It orchestrates “check_*” functions across regions and writes a consolidated CSV. fileciteturn19file14 fileciteturn19file11 fileciteturn19file18
-- **`finops_dashboard.py`** — a one‑file HTML dashboard generator for the CSV export (Plotly‑based, self‑contained by default). fileciteturn19file10
-- **`test_all_checkers.py`** — a lightweight test harness that discovers every `check_*` function, runs them with Null AWS stubs, and asserts CSV invariants. Run with `python -m unittest -v`. fileciteturn19file19
+- **`FinOps_Toolset_V2_profiler.py`** — main scanner/orchestrator, shared helpers (pricing, retries, CSV writer), and a lightweight profiler.  
+- **`finops_dashboard.py`** — one‑file HTML dashboard generator for the CSV export.  
+- **`test_all_checkers.py`** — unittest harness that discovers all `check_*` functions and validates CSV invariants.
 
 ---
 
 ## Quickstart
 
-### 1) Install deps
-
+### 1) Install
 ```bash
-python -m venv .venv && source .venv/bin/activate  # on Windows: .venv\Scripts\activate
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install boto3 botocore pandas numpy plotly
 ```
 
 ### 2) Configure AWS credentials
-
-Provide read‑only credentials (env vars, `~/.aws/credentials`, or SSO). The tool uses paginated `describe/*` and CloudWatch `GetMetricData` across your selected regions.
+Supply read‑only credentials via environment variables, `~/.aws/credentials`, or SSO. The tool reads across your selected regions using paginated `describe/*` and CloudWatch `GetMetricData`.
 
 ### 3) Run the scanner
-
 ```bash
 python FinOps_Toolset_V2_profiler.py
 ```
-
-The script iterates your configured regions and runs each checker (see the `run_check(...)` calls), exporting a unified CSV (default name referenced in the code comments). fileciteturn19file14 fileciteturn19file15
+This iterates regions, runs each `check_*` function, and writes a unified `;`‑delimited CSV.
 
 ### 4) Generate the dashboard
-
 ```bash
 python finops_dashboard.py cleanup_estimates.csv -o cleanup_dashboard.html --top 25
 ```
-
-- Reads your `;`‑delimited CSV.
-- Adds Region if missing by parsing Signals.
-- Outputs a single HTML file that you can open locally or share. fileciteturn19file10 fileciteturn19file3
+- Reads the CSV, infers Region if missing from `Signals`, and emits a single HTML file you can open locally or share.
 
 ---
 
-## CSV schema
-
-The writer normalizes rows into this schema (derived columns are handled automatically): fileciteturn19file18 fileciteturn19file12
+## CSV schema (normalized)
 
 | Column | Meaning |
 |---|---|
@@ -73,74 +61,76 @@ The writer normalizes rows into this schema (derived columns are handled automat
 | `Storage_GB` | Storage size (if applicable) |
 | `Object_Count` | e.g., S3 `NumberOfObjects` |
 | `Estimated_Cost_USD` | Monthly estimate |
-| `Potential_Saving_USD` | Auto‑derived from `flags` like `PotentialSaving=123.45$` |
+| `Potential_Saving_USD` | Derived from flags like `PotentialSaving=123.45$` |
 | `ApplicationID`, `Application`, `Environment` | Tag‑based ownership |
-| `ReferencedIn` | Links or owning stack if detected |
+| `ReferencedIn` | Owning stack or links if detected |
 | `FlaggedForReview` | Comma‑separated hints |
 | `Confidence` | 0–100 evidence score (optional) |
-| `Signals` | Compact diagnostics (`k=v | k=v`) kept in **one cell** |
-
-> The tests assert that Signals remain in one cell and that `Potential_Saving_USD` is derived from flags. fileciteturn19file6
+| `Signals` | Compact diagnostics in one cell (`k=v | k=v`) |
 
 ---
 
-## S3 & Lambda
+## S3 & Lambda — refactor notes
 
 ### S3 buckets
 - **Batched metrics**: one `GetMetricData` batch per region for `BucketSizeBytes` (Standard/IA/Glacier) and `NumberOfObjects` (AllStorageTypes).  
-- **No regression**: `Creation_Date` comes from `list_buckets`, and we use your **last‑modified helper** on significant buckets.
-- **Selective deep checks**: lifecycle + versioning only for large/pricey buckets to avoid API caps.
-- **Value flags**: `NoLifecycleToColderTiers`, `VersioningWONoncurrentExpiration`, `StaleData>Xd`, `EmptyBucket`, `BigBucket`, plus `PotentialSaving=…$` where applicable.
+- **No regression**: `Creation_Date` comes from `list_buckets`, and the **last‑modified helper** is used on significant buckets.  
+- **Selective deep checks**: lifecycle and versioning only for large/pricey buckets to avoid API caps.  
+- **Value flags**: `NoLifecycleToColderTiers`, `VersioningWONoncurrentExpiration`, `StaleData>Xd`, `EmptyBucket`, `BigBucket`, plus `PotentialSaving=…$` when applicable.
 
 ### Lambda functions
-- **Batched CloudWatch** per page of functions using helper builders (`build_mdq`, `_cw_id_safe`), with minimal metric set (Invocations, Errors, Duration, Concurrency/PCU). fileciteturn19file9 fileciteturn19file17
-- **No regression**: we **do not** inline checks; we **call your helper registry** `LAMBDA_CHECKS` (which includes `check_large_package`) and use `check_layers` / `check_version_sprawl`. Cost estimation uses your `estimate_lambda_cost`. fileciteturn19file17
-- **CSV compatibility**: same creation date field (`LastModified`), same writer, same flags behavior.
+- **Batched CloudWatch** per page of functions using helper builders, with a minimal metric set.  
+- **No regression**: all rule checks are invoked via your helper registry `LAMBDA_CHECKS` (includes `check_large_package`) and `check_layers` / `check_version_sprawl`. Cost estimation uses your `estimate_lambda_cost`.  
+- **CSV‑compatible**: same creation date (`LastModified`), CSV writer, and flag format.
 
 ---
 
-## How it works (design notes)
+## How it works (design)
 
-- **One checker per service**: Each `check_*` function writes zero or more rows via a unified CSV helper that normalizes flags, signals, and potential saving. The tests auto‑discover and run all `check_*` functions. fileciteturn19file18 fileciteturn19file8
-- **API hygiene**: Paginators everywhere, parallelism only where safe (e.g., ECR repo scans in a thread pool), and heavy lookups gated to large/expensive candidates. fileciteturn19file13
-- **Dashboard**: Plotly charts (savings by type, region heatmap, top findings) with click‑to‑filter interactions; generates a single HTML file. fileciteturn19file3
-- **Profiler**: Each run logs durations and writes a CSV/summary for the slowest checks. (See orchestrator section near the `run_check(...)` calls.) fileciteturn19file14
+- **One checker per service**: each `check_*` writes rows via a unified CSV writer that normalizes flags, signals, and potential saving.  
+- **API hygiene**: paginators everywhere; parallelism only where safe; heavyweight lookups gated to likely‑savings candidates.  
+- **Dashboard**: Plotly charts (savings by type, region heatmap, top findings) with click‑to‑filter interactions; outputs a single HTML file.  
+- **Profiler**: each run logs durations and writes a concise per‑checker timing summary.
 
 ---
 
-## Running tests
+## Tests
 
 ```bash
 python -m unittest -v
 ```
-
-The harness stubs AWS calls, runs all `check_*` functions, and validates CSV invariants (shape, derived potential saving, Signals cell). It also checks determinism across repeated runs. fileciteturn19file1 fileciteturn19file4
+The harness stubs AWS calls, runs all `check_*` functions, and validates CSV invariants (shape, derived saving, Signals cell). It also checks determinism across repeated runs.
 
 ---
 
-## Extending the toolset
+## Extending
 
-1. **Add a checker**: create `def check_service_xyz(writer, <clients...>, **kwargs):` that appends rows with `write_resource_to_csv(...)`. fileciteturn19file18  
-2. **Register it**: call it from the orchestrator loop alongside other `run_check(...)` calls. fileciteturn19file14  
-3. **Expose Signals**: include right‑sized signals; the dashboard infers Region if missing. fileciteturn19file0
+1. **Add a checker**: create `def check_service_xyz(writer, <clients...>, **kwargs):` and write rows via `write_resource_to_csv(...)`.  
+2. **Register** it in the orchestrator loop next to other checks.  
+3. **Expose Signals**: include right‑sized signals; the dashboard can infer Region from them if needed.
 
 ---
 
 ## IAM permissions (read‑only baseline)
 
-- `ec2:Describe*`, `elasticloadbalancing:Describe*`, `cloudwatch:GetMetricData`, `cloudwatch:GetMetricStatistics`, `s3:ListAllMyBuckets`, `s3:GetBucket*`, `lambda:List*`, `lambda:Get*`, `ecr:Describe*`, `eks:List*`, `eks:Describe*`, `rds:Describe*`, `dynamodb:ListTables/DescribeTable`, `kms:ListKeys/DescribeKey`, `cloudfront:ListDistributions`, `wafv2:List*`, `ssm:DescribeParameters`, etc.  
-Grant on a read‑only role or scope via IAM Access Analyzer as needed.
+- `ec2:Describe*`, `elasticloadbalancing:Describe*`, `cloudwatch:GetMetricData`, `cloudwatch:GetMetricStatistics`  
+- `s3:ListAllMyBuckets`, `s3:GetBucket*`  
+- `lambda:List*`, `lambda:Get*`  
+- `ecr:Describe*`, `eks:List*`, `eks:Describe*`, `rds:Describe*`, `dynamodb:ListTables`, `dynamodb:DescribeTable`  
+- `kms:ListKeys`, `kms:DescribeKey`, `cloudfront:ListDistributions`, `wafv2:List*`, `ssm:DescribeParameters`
+
+Grant on a read‑only role and restrict by region/account as appropriate.
 
 ---
 
 ## Troubleshooting
 
-- **Throttling / rate‑limits**: The tool batches `GetMetricData` and gates deep checks, but if you still hit caps, reduce concurrency in threaded sections (e.g., ECR worker pool) or shorten lookback windows. fileciteturn19file13
-- **CSV missing Region**: The dashboard will attempt to extract Region from Signals; ensure your checkers populate `Signals["Region"]` where possible. fileciteturn19file0
-- **Dashboard too large**: Use `--cdn` to avoid embedding Plotly and shrink the HTML size. fileciteturn19file0
+- **Throttling / rate limits**: the tool batches `GetMetricData` and gates deep checks. If you still hit caps, reduce concurrency in threaded sections or shorten lookback windows.  
+- **CSV missing Region**: ensure your checkers populate `Signals["Region"]` when possible; the dashboard will also attempt to infer it.  
+- **Dashboard file too large**: use `--cdn` to avoid embedding Plotly and shrink the HTML output.
 
 ---
 
 ## License
 
-
+MIT
