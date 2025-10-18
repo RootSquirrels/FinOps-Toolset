@@ -1,0 +1,6 @@
+# Runtime dependencies for FinOps-Toolset
+boto3
+botocore
+pandas
+numpy
+plotly
