@@ -5831,8 +5831,8 @@ def check_kms_customer_managed_keys(writer: csv.writer, cloudtrail, kms, lookbac
             # === Cost estimation (rough, monthly) ===
             # Base key storage: $1 / month (prorated). Add $1/month for first two rotations; we can't know history,
             # so we conservatively assume +$1 only when rotation_enabled is True (still an approximation).
-            base_month = get_price("KMS", "KEY_MONTH", default=1.0)
-            extra_rotation = get_price("KMS", "KEY_ROTATION_MONTH", default=1.0) if rotation_enabled else 0.0
+            base_month = get_price("KMS", "KEY_MONTH")
+            extra_rotation = get_price("KMS", "KEY_ROTATION_MONTH") if rotation_enabled else 0.0
             est_monthly = 0.0 if state == "PendingDeletion" else round(float(base_month) + float(extra_rotation), 2)
 
             # === Usage via CloudTrail ===
