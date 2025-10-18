@@ -1840,18 +1840,6 @@ def check_unused_efs_filesystems(
 
 #region LB SECTION
 
-@dataclass
-class LoadBalancerMetadata:
-    name: str
-    arn: str
-    lb_type: str
-    state: str
-    creation_date: str
-    hourly_price: float
-    monthly_cost: float
-    flags: Set[str] = field(default_factory=set)
-
-
 def safe_aws_call(fn: Callable[[], Any], fallback: Any, context: str = "") -> Any:
     """Safely invoke AWS API call, returning fallback on error."""
     try:
@@ -1868,53 +1856,6 @@ def estimate_lb_cost(lb_type: str, region: Optional[str] = None) -> float:
     key = "ALB" if t in ("application", "alb") else ("NLB" if t in ("network", "nlb") else "CLB")
     hourly_price = get_price(key, "HOUR", region=region)
     return round(float(hourly_price) * 24 * 30, 2)
-
-
-def check_lb_listeners(elbv2, lb: LoadBalancerMetadata) -> List[str]:
-    listeners = safe_aws_call(
-        lambda: elbv2.describe_listeners(LoadBalancerArn=lb.arn).get("Listeners", []),
-        [],
-        context=f"LB:{lb.name}:Listeners",
-    )
-    return ["NoListeners"] if not listeners else []
-
-
-def check_lb_targets(elbv2, lb: LoadBalancerMetadata) -> List[str]:
-    flags: List[str] = []
-    target_groups = safe_aws_call(
-        lambda: elbv2.describe_target_groups(LoadBalancerArn=lb.arn).get("TargetGroups", []),
-        [],
-        context=f"LB:{lb.name}:TargetGroups",
-    )
-
-    total = healthy = 0
-    for tg in target_groups:
-        health_descs = safe_aws_call(
-            lambda: elbv2.describe_target_health(TargetGroupArn=tg["TargetGroupArn"]).get("TargetHealthDescriptions", []),
-            [],
-            context=f"LB:{lb.name}:TargetHealth",
-        )
-        total += len(health_descs)
-        healthy += sum(1 for d in health_descs if d.get("TargetHealth", {}).get("State") == "healthy")
-
-    if total > 0:
-        unhealthy_ratio = (total - healthy) / total
-        if unhealthy_ratio >= 0.8:
-            flags.append(f"HighUnhealthyTargetRatio≈{int(unhealthy_ratio*100)}%")
-
-    return flags
-
-
-def check_lb_cross_az(elbv2, lb: LoadBalancerMetadata) -> List[str]:
-    attrs = safe_aws_call(
-        lambda: elbv2.describe_load_balancer_attributes(LoadBalancerArn=lb.arn).get("Attributes", []),
-        [],
-        context=f"LB:{lb.name}:Attributes",
-    )
-    for attr in attrs:
-        if attr.get("Key") == "load_balancing.cross_zone.enabled" and attr.get("Value") == "true":
-            return ["CrossAZEnabled"]
-    return []
 
 
 def check_idle_load_balancers(
