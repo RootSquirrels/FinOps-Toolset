@@ -1,14 +1,14 @@
 import io
 import csv
 import pytest
-from FinOps_Toolset_V2_profiler import write_resource_to_csv
+from ... import FinOps_Toolset_V2_profiler as FinOps
 
 @pytest.mark.benchmark
 def test_writer_perf(benchmark):
     buf = io.StringIO()
     writer = csv.writer(buf, delimiter=";", lineterminator="\n")
     def run():
-        write_resource_to_csv(
+        FinOps.write_resource_to_csv(
             writer=writer,
             resource_id="i-123",
             name="bench",

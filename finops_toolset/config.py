@@ -1,4 +1,7 @@
 # finops_toolset/config.py
+"""
+Contains constants and basic helpers for toolset
+"""
 from __future__ import annotations
 import os
 from typing import Iterable, Set, Optional
@@ -49,7 +52,8 @@ REGIONS = _env_list("FINOPS_REGIONS", ["eu-west-1", "eu-west-2", "eu-west-3"])
 OUTPUT_FILE = _env_str("FINOPS_OUTPUT_FILE", "cleanup_estimates.csv")
 LOG_FILE = _env_str("FINOPS_LOG_FILE", "cleanup_analysis.log")
 BATCH_SIZE = _env_int("FINOPS_BATCH_SIZE", 100)
-REQUIRED_TAG_KEYS = _env_list("FINOPS_REQUIRED_TAG_KEYS", ["ApplicationID", "Application", "Environment"])
+REQUIRED_TAG_KEYS = _env_list("FINOPS_REQUIRED_TAG_KEYS", 
+["ApplicationID", "Application", "Environment"])
 CSV_DELIMITER = _env_str("FINOPS_CSV_DELIMITER", ";")
 
 # S3 multipart
