@@ -192,6 +192,7 @@ from finops_toolset.config import (
 )
 
 from finops_toolset.pricing import PRICING as PRICING, get_price as get_price, per_month
+from core.cloudwatch import CloudWatchBatcher, build_mdq
 
 #endregion
 
@@ -923,8 +924,11 @@ def get_bucket_last_modified(s3, bucket_name: str) -> Optional[datetime]:
             return None
 
 
-@retry_with_backoff()
-def check_s3_buckets_refactored(writer: csv.writer, s3, cloudwatch=None) -> None:
+def check_s3_buckets_refactored(
+    writer: csv.writer,
+    s3,
+    regions: Optional[Iterable[str]] = None,
+) -> None:
     """
     Audit all S3 buckets in the current AWS account for cost, usage, and compliance
 
@@ -963,243 +967,250 @@ def check_s3_buckets_refactored(writer: csv.writer, s3, cloudwatch=None) -> None
           unless explicitly added to PRICING.
     """
     try:
-        # 1) Enumerate buckets (names + creation date)
-        resp = safe_aws_call(lambda: s3.list_buckets(), {"Buckets": []}, "S3:ListBuckets")
-        buckets = resp.get("Buckets", []) or []
-        if not buckets:
+        # 1) Global list of buckets (+ creation date)
+        try:
+            all_buckets = s3.list_buckets().get("Buckets", [])
+        except ClientError as e:
+            logging.error(f"[S3] list_buckets failed: {e}")
+            return
+        if not all_buckets:
             return
 
-        bucket_created = {b["Name"]: b.get("CreationDate") for b in buckets if b.get("Name")}
-        names = list(bucket_created.keys())
+        bucket_created_iso: Dict[str, str] = {}
+        for b in all_buckets:
+            c = b.get("CreationDate")
+            if isinstance(c, datetime) and c.tzinfo is None:
+                c = c.replace(tzinfo=timezone.utc)
+            bucket_created_iso[b["Name"]] = (c or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
 
-        # 2) Resolve bucket regions (parallel) and group by region
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # 2) Resolve region & tags
+        def _normalize_region(loc):
+            if not loc:
+                return "us-east-1"
+            if loc == "EU":
+                return "eu-west-1"
+            return loc
 
-        def _region_of_bucket(bname: str) -> str:
+        def fetch_meta(bucket_entry) -> Dict[str, Any]:
+            bname = bucket_entry["Name"]
+            created = bucket_created_iso.get(bname, "")
+            region, tags = "unknown", {}
             try:
-                loc = s3.get_bucket_location(Bucket=bname) or {}
-                return _normalize_bucket_region(loc.get("LocationConstraint"))
-            except Exception:
-                return "us-east-1"  # safe fallback
-
-        regions: dict[str, list[str]] = {}
-        with ThreadPoolExecutor(max_workers=min(len(names), 8)) as pool:
-            futs = {pool.submit(_region_of_bucket, n): n for n in names}
-            for fut in as_completed(futs):
-                n = futs[fut]
+                loc = s3.get_bucket_location(Bucket=bname)
+                region = _normalize_region(loc.get("LocationConstraint"))
+            except Exception as e:
+                logging.info(f"[S3] get_bucket_location({bname}) -> {e}")
+            # tags (best effort)
+            if region != "unknown":
                 try:
-                    r = fut.result() or "us-east-1"
+                    s3r = boto3.client("s3", region_name=region, config=SDK_CONFIG)
                 except Exception:
-                    r = "us-east-1"
-                regions.setdefault(r, []).append(n)
-
-        # 3) (Optional) tags – kept simple: fetch once per bucket (parallel).
-        REQUIRED = set(REQUIRED_TAG_KEYS)
-        def _tags(bname: str) -> dict:
-            try:
-                out = s3.get_bucket_tagging(Bucket=bname) or {}
-                lst = out.get("TagSet", []) or []
-                return {t.get("Key",""): t.get("Value","") for t in lst}
-            except Exception:
-                return {}
-
-        bucket_tags: dict[str, dict] = {}
-        with ThreadPoolExecutor(max_workers=min(len(names), 8)) as pool:
-            futs = {pool.submit(_tags, n): n for n in names}
-            for fut in as_completed(futs):
-                n = futs[fut]
+                    s3r = s3
                 try:
-                    bucket_tags[n] = fut.result() or {}
+                    tagset = s3r.get_bucket_tagging(Bucket=bname).get("TagSet", [])
+                    tags = {t["Key"]: t.get("Value", "") for t in tagset}
+                except ClientError:
+                    tags = {}
                 except Exception:
-                    bucket_tags[n] = {}
+                    tags = {}
+            return {"Name": bname, "Region": region, "CreatedISO": created, "Tags": tags}
 
-        # 4) Build batched MDQs per-region and collect latest datapoints
-        storage_types = ["StandardStorage", "StandardIAStorage", "GlacierStorage"]
-        period = 86400
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=3)  # S3 storage metrics are daily + lag
+        metas: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = [ex.submit(fetch_meta, b) for b in all_buckets]
+            for f in as_completed(futs):
+                try:
+                    metas.append(f.result())
+                except Exception as e:
+                    logging.warning(f"[S3] fetch_meta error: {e}")
 
-        # cw client cache (per-region). If caller gave a CW, reuse only when region matches.
-        cw_cache: dict[str, any] = {}
+        if not metas:
+            return
 
-        def _get_cw(region: str):
-            r = region or "us-east-1"
-            cw = cw_cache.get(r)
-            if cw:
-                return cw
-            try:
-                # reuse caller CW if its region matches
-                if cloudwatch and getattr(getattr(cloudwatch, "meta", None), "region_name", None) == r:
-                    cw = cloudwatch
-                else:
-                    cw = boto3.client("cloudwatch", region_name=r, config=SDK_CONFIG)
-            except Exception:
-                cw = boto3.client("cloudwatch", region_name="us-east-1", config=SDK_CONFIG)
-            cw_cache[r] = cw
-            return cw
+        # Optional region filter (no behavior change if not provided)
+        region_filter = {r.strip() for r in regions} if regions else None
 
-        # rollup[bucket] = {"objects": int|None, "bytes": {class: bytes}}
-        rollup: dict[str, dict] = {bn: {"objects": None, "bytes": {}} for bn in names}
+        # 3) Group by region; write minimal rows for unknown region
+        now = datetime.now(timezone.utc)
+        lookback_days = max(2, min(S3_LOOKBACK_DAYS, 7))
+        start = now - timedelta(days=lookback_days)
 
-        for region, bnames in regions.items():
-            if not bnames:
+        region_to_buckets: Dict[str, List[str]] = {}
+        bucket_meta: Dict[str, Dict[str, Any]] = {}
+
+        for m in metas:
+            bn = m["Name"]
+            bucket_meta[bn] = m
+            if m["Region"] == "unknown":
+                flags = ["RegionUnknown"]
+                miss = [k for k in REQUIRED_TAG_KEYS if not m["Tags"].get(k)]
+                if miss:
+                    flags.append(f"MissingRequiredTags={','.join(miss)}")
+                write_resource_to_csv(
+                    writer=writer,
+                    resource_id=bn,
+                    name=bn,
+                    resource_type="S3Bucket",
+                    owner_id=ACCOUNT_ID or "",
+                    state="",
+                    creation_date=m["CreatedISO"],
+                    storage_gb="",
+                    estimated_cost="",
+                    app_id=m["Tags"].get("ApplicationID", "NULL"),
+                    app=m["Tags"].get("Application", "NULL"),
+                    env=m["Tags"].get("Environment", "NULL"),
+                    referenced_in="",
+                    flags=flags,
+                    object_count="",
+                    potential_saving=None,
+                    confidence=None,
+                    signals={"Region": "unknown"},
+                )
                 continue
-            cw = _get_cw(region)
 
-            mdqs: list[dict] = []
-            idx: dict[str, tuple[str, str, str]] = {}
-            for bn in bnames:
-                # objects
-                qid = _cw_make_id("s3", bn, "objs")
-                mdqs.append(build_mdq(
-                    id_hint=qid,
-                    namespace="AWS/S3",
-                    metric="NumberOfObjects",
-                    dims=[{"Name": "BucketName", "Value": bn},
-                          {"Name": "StorageType", "Value": "AllStorageTypes"}],
-                    stat="Average",
-                    period=period,
+            if region_filter and m["Region"] not in region_filter:
+                continue
+            region_to_buckets.setdefault(m["Region"], []).append(bn)
+
+        # 4) Per-region batch metrics & emit rows
+        def _sid(bn: str) -> str:
+            return bn.replace(".", "_").replace("-", "_")[:255]
+
+        for region, buckets in region_to_buckets.items():
+            if not buckets:
+                continue
+
+            try:
+                s3r = boto3.client("s3", region_name=region, config=SDK_CONFIG)
+            except Exception:
+                s3r = s3
+
+            batch = CloudWatchBatcher(region)
+            for bn in buckets:
+                sid = _sid(bn)
+                batch.add(build_mdq(
+                    f"s3_size_std__{sid}",
+                    "AWS/S3", "BucketSizeBytes",
+                    [{"Name": "BucketName", "Value": bn},
+                     {"Name": "StorageType", "Value": "StandardStorage"}],
+                    "Average", 86400
                 ))
-                idx[qid] = (bn, "NumberOfObjects", "")
+                batch.add(build_mdq(
+                    f"s3_obj__{sid}",
+                    "AWS/S3", "NumberOfObjects",
+                    [{"Name": "BucketName", "Value": bn},
+                     {"Name": "StorageType", "Value": "AllStorageTypes"}],
+                    "Average", 86400
+                ))
 
-                # bytes per storage class
-                for st in storage_types:
-                    qid = _cw_make_id("s3", bn, f"bytes_{st}")
-                    mdqs.append(build_mdq(
-                        id_hint=qid,
-                        namespace="AWS/S3",
-                        metric="BucketSizeBytes",
-                        dims=[{"Name": "BucketName", "Value": bn},
-                              {"Name": "StorageType", "Value": st}],
-                        stat="Average",
-                        period=period,
-                    ))
-                    idx[qid] = (bn, "BucketSizeBytes", st)
+            series = {}
+            try:
+                series = batch.execute(start, now, scan_by="TimestampDescending")
+            except Exception as e:
+                logging.exception(f"[S3] CloudWatch batch execute failed in {region}: {e}")
 
-            if not mdqs:
-                continue
-            series = cw_get_metric_data_bulk(cw, mdqs, start, end, scan_by="TimestampDescending")
-
-            def _latest(pts):
-                if not pts:
-                    return None
+            for bn in buckets:
                 try:
-                    return float(pts[0][1])  # ScanBy=TimestampDescending
-                except Exception:
-                    return None
+                    m = bucket_meta[bn]
+                    sid = _sid(bn)
 
-            for qid, pts in (series or {}).items():
-                bn, m, st = idx.get(qid, (None, None, None))
-                if not bn:
-                    continue
-                if m == "NumberOfObjects":
-                    v = _latest(pts)
-                    rollup[bn]["objects"] = int(v) if v is not None else None
-                else:
-                    v = _latest(pts)
-                    if v is not None:
-                        rollup[bn]["bytes"][st] = v
+                    size_bytes = CloudWatchBatcher.latest(series.get(f"s3_size_std__{sid}", []), 0.0)
+                    obj_count = CloudWatchBatcher.latest(series.get(f"s3_obj__{sid}", []), 0.0)
 
-        # 5) Emit rows (+ gated deep checks)
-        for bn in names:
-            created_dt = bucket_created.get(bn)
-            created_str = created_dt.strftime("%Y-%m-%d %H:%M:%S") if created_dt else ""
-            tags = bucket_tags.get(bn, {})
-            app_id = tags.get("ApplicationID", "")
-            app = tags.get("Application", "")
-            env = tags.get("Environment", "")
+                    size_gb = round(float(size_bytes) / (1024.0 ** 3), 3)
+                    objects = int(obj_count)
 
-            bytes_by_class = rollup.get(bn, {}).get("bytes", {})
-            obj_count = rollup.get(bn, {}).get("objects")
+                    # Last modified via helper (no regression)
+                    try:
+                        lm_dt = get_bucket_last_modified(s3r, bn)
+                    except Exception:
+                        lm_dt = None
+                    days_since_last = (now - lm_dt).days if lm_dt else None
 
-            std_gb = (bytes_by_class.get("StandardStorage", 0.0)) / (1024 ** 3)
-            ia_gb = (bytes_by_class.get("StandardIAStorage", 0.0)) / (1024 ** 3)
-            gl_gb = (bytes_by_class.get("GlacierStorage", 0.0)) / (1024 ** 3)
-            total_gb = round(std_gb + ia_gb + gl_gb, 2)
+                    # Guarded deep calls (only for big/stale)
+                    has_lifecycle = False
+                    versioning_status = ""
+                    if (size_gb >= BIG_BUCKET_THRESHOLD_GB) or (days_since_last is not None and days_since_last >= STALE_DAYS_THRESHOLD):
+                        try:
+                            s3r.get_bucket_lifecycle_configuration(Bucket=bn)
+                            has_lifecycle = True
+                        except Exception:
+                            has_lifecycle = False
+                        try:
+                            v = s3r.get_bucket_versioning(Bucket=bn) or {}
+                            versioning_status = (v.get("Status") or "").upper()
+                        except Exception:
+                            versioning_status = ""
 
-            flags: list[str] = []
-            if not all(tags.get(k) for k in REQUIRED):
-                flags.append("MissingRequiredTags")
-            if obj_count is None:
-                flags.append("ObjectCountUnknown")
-            if not bytes_by_class:
-                flags.append("SizeUnknown")
-            if obj_count == 0 and total_gb == 0:
-                flags.append("EmptyBucket")
-            if total_gb >= BIG_BUCKET_THRESHOLD_GB:
-                flags.append("BigBucket")
+                    # Flags (keep legacy strings)
+                    flags: List[str] = []
+                    missing = [k for k in REQUIRED_TAG_KEYS if not m["Tags"].get(k)]
+                    if missing:
+                        flags.append(f"MissingRequiredTags={','.join(missing)}")
 
-            # Estimated storage cost (basic classes). Mark approximate if others exist.
-            est_cost = round(
-                std_gb * get_price("S3", "STANDARD_GB_MONTH") +
-                ia_gb * get_price("S3", "STANDARD_IA_GB_MONTH") +
-                gl_gb * get_price("S3", "GLACIER_GB_MONTH"),
-                2,
-            )
-            if set(bytes_by_class.keys()) - {"StandardStorage", "StandardIAStorage", "GlacierStorage"}:
-                flags.append("CostApproximate")
+                    if size_gb == 0.0 and objects == 0:
+                        flags += ["emptybucket", "confidence=100", "safedelete"]
 
-            # Gated last-modified check (big or many objects)
-            if (obj_count or 0) > 0 and (total_gb >= 50 or (obj_count or 0) >= 10_000):
-                lm_dt = get_bucket_last_modified(s3, bn)
-                if lm_dt:
-                    days = (datetime.now(timezone.utc) - lm_dt).days
-                    if days > STALE_DAYS_THRESHOLD:
-                        flags.append(f"StaleData>{days}d")
-                else:
-                    flags.append("LastModifiedUnknown")
+                    if days_since_last is None:
+                        flags.append("LastModifiedUnknown")
+                    elif days_since_last >= STALE_DAYS_THRESHOLD:
+                        flags.append(f"stale_data>{STALE_DAYS_THRESHOLD}d")
 
-            # Gated lifecycle/versioning checks for large buckets
-            lifecycle_missing = False
-            versioning_enabled = False
-            if total_gb >= BIG_BUCKET_THRESHOLD_GB:
-                try:
-                    lcfg = s3.get_bucket_lifecycle_configuration(Bucket=bn) or {}
-                    rules = lcfg.get("Rules", [])
-                    has_cold = any(("Transition" in r) or ("Transitions" in r) for r in rules)
-                    lifecycle_missing = not has_cold
-                except Exception:
-                    lifecycle_missing = True
-                try:
-                    v = s3.get_bucket_versioning(Bucket=bn) or {}
-                    versioning_enabled = v.get("Status") == "Enabled"
-                except Exception:
-                    pass
-                if lifecycle_missing:
-                    flags.append("NoLifecycleToColderTiers")
-                if versioning_enabled and lifecycle_missing:
-                    flags.append("VersioningWONoncurrentExpiration")
+                    if not has_lifecycle and size_gb >= BIG_BUCKET_THRESHOLD_GB:
+                        flags.append("nolifecycle_for_big_bucket")
+                    if not has_lifecycle and (days_since_last or 0) >= 90:
+                        flags.append("lifecycle_to_ia_recommended")
+                    if versioning_status == "ENABLED" and not has_lifecycle and size_gb >= (BIG_BUCKET_THRESHOLD_GB / 2):
+                        flags.append("versioning_wo_noncurrent_expiration")
 
-            # Rough potential saving if lifecycle missing (conservative)
-            if lifecycle_missing and std_gb > 0:
-                delta = max(0.0, get_price("S3", "STANDARD_GB_MONTH") - get_price("S3", "STANDARD_IA_GB_MONTH"))
-                potential = round(0.5 * std_gb * delta, 2)
-                if potential >= MIN_COST_THRESHOLD:
-                    flags.append(f"PotentialSaving={potential}$")
+                    # Pricing (conservative: STANDARD only)
+                    s3_std_gb_month = get_price("S3", "STANDARD_GB_MONTH")
+                    est_cost = round(size_gb * s3_std_gb_month, 2)
 
-            write_resource_to_csv(
-                writer=writer,
-                resource_id=bn,
-                name=bn,
-                resource_type="S3Bucket",
-                owner_id=ACCOUNT_ID,
-                state="",
-                creation_date=created_str,   # <-- preserved
-                storage_gb=total_gb,
-                object_count=int(obj_count or 0) if obj_count is not None else "",
-                estimated_cost=est_cost,
-                app_id=app_id, app=app, env=env,
-                flags=flags,
-                signals={
-                    "StdGB": round(std_gb, 2),
-                    "IAGB": round(ia_gb, 2),
-                    "GlacierGB": round(gl_gb, 2),
-                    "Objects": int(obj_count or 0),
-                    "Region": next((r for r, bs in regions.items() if bn in bs), ""),
-                },
-            )
+                    potential_saving = None
+                    if "lifecycle_to_ia_recommended" in flags:
+                        try:
+                            s3_ia_gb_month = get_price("S3", "STANDARD_IA_GB_MONTH")
+                            delta = max(0.0, s3_std_gb_month - s3_ia_gb_month)
+                            potential_saving = round(size_gb * delta * 0.7, 2)  # assume 70% moves to IA
+                        except Exception:
+                            potential_saving = None
+
+                    # Signals
+                    signals = {
+                        "Region": region,
+                        "DaysSinceLastModified": (str(days_since_last) if days_since_last is not None else ""),
+                        "Versioning": versioning_status or "",
+                        "HasLifecycle": str(bool(has_lifecycle)).lower(),
+                    }
+
+                    write_resource_to_csv(
+                        writer=writer,
+                        resource_id=bn,
+                        name=bn,
+                        resource_type="S3Bucket",
+                        owner_id=ACCOUNT_ID or "",
+                        state="",
+                        creation_date=m["CreatedISO"],
+                        storage_gb=size_gb,
+                        estimated_cost=est_cost,
+                        app_id=m["Tags"].get("ApplicationID", "NULL"),
+                        app=m["Tags"].get("Application", "NULL"),
+                        env=m["Tags"].get("Environment", "NULL"),
+                        referenced_in="",
+                        flags=flags,
+                        object_count=objects,
+                        potential_saving=potential_saving,
+                        confidence=None,  # unchanged vs. old behavior (set if you had it)
+                        signals=signals,
+                    )
+                except Exception as e:
+                    logging.exception(f"[S3] bucket emit failed for {bn} in {region}: {e}")
+
     except Exception as e:
-        logging.error(f"[check_s3_buckets_refactored] Unexpected: {e}")
+        # Top-level guard (restored): never break the rest of the run
+        logging.exception(f"[S3] check_s3_buckets_refactored failed: {e}")
+        return
 
 
 def _is_wrong_region_error(e: ClientError) -> bool:
