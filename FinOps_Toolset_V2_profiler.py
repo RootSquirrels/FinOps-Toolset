@@ -191,7 +191,7 @@ from finops_toolset.config import (
     LOAD_BALANCER_LOOKBACK_DAYS,
 )
 
-from finops_toolset.pricing import PRICING as PRICING, get_price as get_price, get_price_r, per_month
+from finops_toolset.pricing import PRICING as PRICING, get_price as get_price, per_month
 
 #endregion
 
@@ -1996,11 +1996,11 @@ def check_idle_load_balancers(
     )
 
     # ---------- Pricing pulled from PRICING dict ----------
-    alb_hour      = get_price_r("ALB", "HOUR", region=region)              # $/hour
-    alb_lcu_hour  = get_price_r("ALB", "LCU_HOUR", region=region)          # $/LCU-hour
-    nlb_hour      = get_price_r("NLB", "HOUR", region=region)              # $/hour
-    nlb_nlcu_hour = get_price_r("NLB", "NLCU_HOUR", region=region)         # $/NLCU-hour
-    clb_hour      = get_price_r("CLB", "HOUR", region=region)              # $/hour
+    alb_hour      = get_price("ALB", "HOUR", region=region)              # $/hour
+    alb_lcu_hour  = get_price("ALB", "LCU_HOUR", region=region)          # $/LCU-hour
+    nlb_hour      = get_price("NLB", "HOUR", region=region)              # $/hour
+    nlb_nlcu_hour = get_price("NLB", "NLCU_HOUR", region=region)         # $/NLCU-hour
+    clb_hour      = get_price("CLB", "HOUR", region=region)              # $/hour
 
     monthly_alb_base = alb_hour * HOURS_PER_MONTH
     monthly_nlb_base = nlb_hour * HOURS_PER_MONTH
@@ -2791,8 +2791,8 @@ def check_unused_nat_gateways(
             qid = _cw_id_safe(f"nat_{nid}_{metric}_{stat}")
             return [v for _, v in md.get(qid, [])]
 
-        nat_hour_price   = get_price_r("NAT", "HOUR", region=region)          
-        nat_gb_proc_price = get_price_r("NAT", "GB_PROCESSED", region=region)
+        nat_hour_price   = get_price("NAT", "HOUR", region=region)          
+        nat_gb_proc_price = get_price("NAT", "GB_PROCESSED", region=region)
         monthly_hours_cost = nat_hour_price * HOURS_PER_MONTH              
 
         # ---- Evaluate each NAT ---------------------------------------------------
