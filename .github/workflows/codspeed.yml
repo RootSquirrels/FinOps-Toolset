@@ -33,4 +33,4 @@ jobs:
         with:
           mode: instrumentation
           token: ${{ secrets.CODSPEED_TOKEN }}   
-          run: pytest -q tests/perf --codspeed
+          run: pytest -q perf/ --codspeed
