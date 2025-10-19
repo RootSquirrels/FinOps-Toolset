@@ -188,6 +188,7 @@ from finops_toolset.config import (
 from finops_toolset.pricing import PRICING as PRICING, get_price as get_price
 import core.cloudwatch as cw
 import aws_checkers.eip as eip
+import aws_checkers.network_interfaces as eni
 from core.retry import retry_with_backoff
 
 #endregion
@@ -1472,34 +1473,6 @@ class AMIFlagger(ResourceFlagger):
     def check_shared(self):
         if self.shared == "Yes":
             self.flags.append("SharedExternally")
-
-#endregion
-
-
-#region ENI SECTION
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_detached_network_interfaces(writer: csv.writer, ec2):
-    try:
-        enis = ec2.describe_network_interfaces().get("NetworkInterfaces", [])
-        for eni in enis:
-            if eni.get("Status") == "available":
-                tags = {tag["Key"]: tag["Value"] for tag in eni.get("TagSet", [])}
-                flags = ["DetachedENI"]
-                write_resource_to_csv(
-                    writer=writer,
-                    resource_id=eni["NetworkInterfaceId"],
-                    name=tags.get("Name", ""),
-                    owner_id=ACCOUNT_ID,
-                    resource_type="ENI",
-                    state=eni.get("Status", ""),
-                    creation_date="",  # Not available in ENI metadata
-                    estimated_cost=0.0,
-                    flags=flags,
-                    confidence=100
-                )
-    except ClientError as e:
-        logging.error(f"Error checking network interfaces: {e}")
 
 #endregion
 
@@ -5985,15 +5958,16 @@ def main():
                 #cert_summary = summarize_cert_usage(graph)
 
                 run_check(profiler, check_name="EIP", region=region,
-                          fn=eip, ec2=clients['ec2'], account_id=ACCOUNT_ID, write_row=writer, 
+                          fn=eip, ec2=clients['ec2'], account_id=ACCOUNT_ID, write_row=writer,
                           get_price_fn=get_price, logger=LOGGER)
 
                 run_check(profiler, check_name="check_idle_load_balancers", region=region,
                           fn=check_idle_load_balancers, writer=writer,
                           elbv2=clients['elbv2'], cloudwatch=clients['cloudwatch'])
 
-                run_check(profiler, check_name="check_detached_network_interfaces", region=region,
-                          fn=check_detached_network_interfaces, writer=writer, ec2=clients['ec2'])
+                run_check(profiler, check_name="ENI", ec2=clients['ec2'], fn=eni,
+                          account_id=ACCOUNT_ID, write_row=writer,
+                          get_price_fn=get_price, logger=LOGGER)
 
                 run_check(profiler, check_name="check_unused_efs_filesystems", region=region,
                           fn=check_unused_efs_filesystems, writer=writer,
@@ -6004,10 +5978,12 @@ def main():
                           ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
 
                 run_check(profiler, check_name="check_log_groups_with_infinite_retention", region=region,
-                          fn=check_log_groups_with_infinite_retention, writer=writer, logs=clients['logs'])
+                          fn=check_log_groups_with_infinite_retention,
+                          writer=writer, logs=clients['logs'])
 
-                run_check(profiler, check_name="check_backup_retention_misconfigurations", region=region,
-                          fn=check_backup_retention_misconfigurations, writer=writer, backup=clients['backup'])
+                run_check(profiler, check_name="check_backup_retention_misconfigurations",
+                          region=region, fn=check_backup_retention_misconfigurations,
+                          writer=writer, backup=clients['backup'])
 
                 run_check(profiler, check_name="check_orphaned_fsx_backups", region=region,
                           fn=check_orphaned_fsx_backups, writer=writer, fsx=clients['fsx'])
@@ -6033,8 +6009,8 @@ def main():
                           fn=check_dynamodb_cost_optimization, writer=writer,
                           dynamodb=clients['dynamodb'], cloudwatch=clients['cloudwatch'])
 
-                run_check(profiler, check_name="check_inter_region_vpc_and_tgw_peerings", 
-                          region=region, fn=check_inter_region_vpc_and_tgw_peerings, 
+                run_check(profiler, check_name="check_inter_region_vpc_and_tgw_peerings",
+                          region=region, fn=check_inter_region_vpc_and_tgw_peerings,
                           writer=writer, ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
 
                 run_check(profiler, check_name="check_ecr_storage_and_staleness", region=region,
@@ -6090,7 +6066,7 @@ def main():
 
 
         profiler.dump_csv()
-        profiler.log_summary(top_n=20)
+        profiler.log_summary(top_n=30)
         logging.info(f"CSV export complete: {OUTPUT_FILE}")
         logging.info(f"Profile export complete: {PROFILE_FILE}")
 

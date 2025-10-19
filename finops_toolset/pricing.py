@@ -155,6 +155,9 @@ PRICING: PriceMap = {
 
     "FSX": {
         "BACKUP_GB_MONTH": 0.05
+    },
+    "ENI": {
+        "DETACHED_MONTH": 0.0
     }
 }
 
