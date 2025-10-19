@@ -9,10 +9,8 @@ import logging
 from botocore.exceptions import ClientError
 from core.retry import retry_with_backoff
 
-# Type for the CSV row writer you already have (write_resource_to_csv)
 WriteRow = Callable[..., None]
 GetPrice = Callable[[str, str], float]
-
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_unused_elastic_ips(

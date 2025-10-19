@@ -160,6 +160,7 @@ import string
 import re
 from time import perf_counter
 import threading
+from functools import partial
 #from correlator import build_certificate_graph, summarize_cert_usage
 
 from finops_toolset.config import (
@@ -189,6 +190,7 @@ from finops_toolset.pricing import PRICING as PRICING, get_price as get_price
 import core.cloudwatch as cw
 import aws_checkers.eip as eip
 import aws_checkers.network_interfaces as eni
+import aws_checkers.ssm as ssm
 from core.retry import retry_with_backoff
 
 #endregion
@@ -5013,85 +5015,6 @@ def check_kinesis_streams(writer: csv.writer, kinesis, cw) -> None:
 #endregion
 
 
-#region SSM SECTION
-
-@dataclass
-class SSMParameterMetadata:
-    name: str
-    tier: str
-    last_modified: Optional[datetime]
-    age_days: Optional[int]
-    monthly_cost: float
-    flags: Set[str] = field(default_factory=set)
-
-
-# ---------- Cost estimation ----------
-def estimate_ssm_param_cost(param: dict) -> float:
-    """Return monthly cost for an Advanced SSM Parameter."""
-    if param.get("Tier") == "Advanced":
-        return float(get_price("SSM", "ADV_PARAM_MONTH"))
-    return 0.0
-
-
-def build_ssm_metadata(param: dict) -> SSMParameterMetadata:
-    """Construct metadata object for an SSM parameter."""
-    name = param.get("Name", "")
-    tier = param.get("Tier", "Standard")
-    last = param.get("LastModifiedDate")
-
-    age_days = None
-    if last:
-        age_days = (datetime.now(timezone.utc) - last).days
-
-    monthly_cost = estimate_ssm_param_cost(param)
-
-    return SSMParameterMetadata(
-        name=name,
-        tier=tier,
-        last_modified=last,
-        age_days=age_days,
-        monthly_cost=monthly_cost,
-    )
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ssm_advanced_parameters(writer: csv.writer, ssm):
-    """
-    Flags Advanced tier parameters, highlighting stale ones (> SSM_ADV_STALE_DAYS).
-    """
-    try:
-        pager = ssm.get_paginator("describe_parameters")
-        for page in pager.paginate():
-            for raw_param in page.get("Parameters", []):
-                meta = build_ssm_metadata(raw_param)
-
-                if meta.tier != "Advanced":
-                    continue
-
-                meta.flags.add("AdvancedTierParameter")
-
-                if meta.age_days is not None and meta.age_days > SSM_ADV_STALE_DAYS:
-                    meta.flags.add(f"Stale>{meta.age_days}d")
-                    meta.flags.add(f"PotentialSaving={round(meta.monthly_cost,2)}$")
-
-                if meta.flags:
-                    write_resource_to_csv(
-                        writer=writer,
-                        resource_id=meta.name,
-                        name=meta.name,
-                        owner_id=ACCOUNT_ID,
-                        resource_type="SSMParameter",
-                        estimated_cost=round(meta.monthly_cost, 2),
-                        flags=list(meta.flags),
-                    )
-                    logging.info(f"[SSM:{meta.name}] flags={meta.flags} estCost≈${meta.monthly_cost}")
-
-    except ClientError as e:
-        logging.error(f"[check_ssm_advanced_parameters] {e}")
-
-#endregion
-
-
 #region EC2 SECTION
 
 def _ec2_hourly_price(instance_type: str, region: str) -> float:
@@ -6038,9 +5961,6 @@ def main():
                           fn=check_wafv2_unassociated_acls, writer=writer,
                           wafv2=clients['wafv2'], region_name=region)
 
-                run_check(profiler, check_name="check_ssm_advanced_parameters", region=region,
-                          fn=check_ssm_advanced_parameters, writer=writer, ssm=clients['ssm'])
-
                 run_check(profiler, check_name="check_idle_ec2_instances", region=region,
                           fn=check_idle_ec2_instances, writer=writer,
                           ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
@@ -6065,6 +5985,48 @@ def main():
                           ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
 
 
+                # plaintext
+                run_check(
+                    profiler, check_name="check_ssm_plaintext_parameters", region=region,
+                    fn=partial(
+                        ssm.check_ssm_plaintext_parameters,
+                        account_id=ACCOUNT_ID,
+                        write_row=write_resource_to_csv,
+                        get_price_fn=get_price,
+                        logger=LOGGER,
+                    ),
+                    writer=writer, ssm=clients["ssm"],
+                )
+
+                # stale (365 days)
+                run_check(
+                    profiler, check_name="check_ssm_stale_parameters", region=region,
+                    fn=partial(
+                        ssm.check_ssm_stale_parameters,
+                        account_id=ACCOUNT_ID,
+                        write_row=write_resource_to_csv,
+                        get_price_fn=get_price,
+                        logger=LOGGER,
+                        stale_days=365,
+                    ),
+                    writer=writer, ssm=clients["ssm"],
+                )
+
+                # maintenance windows
+                run_check(
+                    profiler, check_name="check_ssm_maintenance_windows_gaps", region=region,
+                    fn=partial(
+                        ssm.check_ssm_maintenance_windows_gaps,
+                        account_id=ACCOUNT_ID,
+                        write_row=write_resource_to_csv,
+                        get_price_fn=get_price,
+                        logger=LOGGER,
+                        # consolidate_rows=False  #set True if you want one row/window
+                    ),
+                    writer=writer, ssm=clients["ssm"],
+                )
+
+
         profiler.dump_csv()
         profiler.log_summary(top_n=30)
         logging.info(f"CSV export complete: {OUTPUT_FILE}")
@@ -6075,4 +6037,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

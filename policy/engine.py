@@ -326,7 +326,8 @@ if __name__ == "__main__":
     p.add_argument("--csv", required=True, help="Path to scanner CSV (e.g., cleanup_estimates.csv)")
     p.add_argument("--policies", required=True, help="policies.yml or .json")
     p.add_argument("--out-actions", default="policy_actions.csv", help="Output actions CSV")
-    p.add_argument("--update-csv", default="", help="Optional output updated CSV with extra flags merged")
+    p.add_argument("--update-csv", default="", 
+                   help="Optional output updated CSV with extra flags merged")
     args = p.parse_args()
 
     out_updated = args["update_csv"] if isinstance(args, dict) else (args.update_csv or None)

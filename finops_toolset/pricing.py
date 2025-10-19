@@ -5,12 +5,12 @@ Contains up to date prices for services in AWS. Provide a way to get the price o
 from __future__ import annotations
 
 from typing import Dict, Union, Optional, Mapping
+from finops_toolset.config import HOURS_PER_MONTH
 
 Number = float
 PriceLeaf = Union[Number, Mapping[str, Number]]
 PriceMap = Dict[str, Dict[str, PriceLeaf]]
 
-from finops_toolset.config import HOURS_PER_MONTH  # default 730
 
 # --------------------------------------------------------------------------------------
 # CENTRALIZED PRICING (USD)
@@ -150,7 +150,14 @@ PRICING: PriceMap = {
 
     "SSM": {
         # Advanced parameter monthly fee. (Standard is free; API request costs omitted here.)
-        "ADV_PARAM_MONTH": 0.05
+        "ADV_PARAM_MONTH": 0.05,
+        "SSMParameter": 0.0,
+        "PLAINTEXT_MONTH": 0.0
+    },
+
+    "SSMMaintenanceWindow":{
+        "NO_TARGETS_MONTH": 0.0,
+        "NO_TASKS_MONTH": 0.0
     },
 
     "FSX": {

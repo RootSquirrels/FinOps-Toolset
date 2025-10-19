@@ -91,7 +91,8 @@ class CloudWatchBatcher:
 
         self._mdqs.append(d)
 
-    def add_q(self, *, id_hint: str, namespace: str, metric: str, dims: List[dict], stat: str, period: int) -> None:
+    def add_q(self, *, id_hint: str, namespace: str, metric: str, 
+              dims: List[dict], stat: str, period: int) -> None:
         self.add({
             "Id": id_hint,  # we'll sanitize internally and map back
             "MetricStat": {

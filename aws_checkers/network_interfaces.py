@@ -1,10 +1,8 @@
 """Checker: Detached Network Interfaces (ENIs).
 
 Scans EC2 for ENIs that are detached (i.e., have Status == "available" and no
-Attachment) and writes them to the CSV via the provided writer and row-writer
-callable.
+Attachment) and writes them to the CSV 
 
-The function intentionally returns None to match the legacy behavior.
 """
 
 from __future__ import annotations
