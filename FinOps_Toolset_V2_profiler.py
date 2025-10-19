@@ -2586,94 +2586,6 @@ def check_inter_region_vpc_and_tgw_peerings(writer: csv.writer, ec2, cloudwatch)
 
 #endregion
 
-
-#region EBS SNAPSHOT SECTION
-
-@dataclass
-class EBSSnapshotMetadata:
-    snapshot_id: str
-    volume_size: int
-    start_time: Optional[datetime]
-    description: str
-    tags: Dict[str, str]
-    estimated_cost: float = 0.0
-    flags: Set[str] = field(default_factory=set)
-
-def estimate_ebs_snapshot_cost(snapshot: EBSSnapshotMetadata) -> float:
-    """Estimate monthly cost of an EBS snapshot."""
-    return round(snapshot.volume_size * get_price("EBS", "SNAPSHOT_GB_MONTH"), 2)
-
-def check_snapshot_replication(snapshot: EBSSnapshotMetadata, source_snapshot_ids: Set[str]) -> List[str]:
-    """
-    Flag snapshot if it's replicated:
-      - If it's a source of a copy
-      - If Description indicates it was copied
-    """
-    desc = snapshot.description or ""
-    if snapshot.snapshot_id in source_snapshot_ids or \
-       "Copied from snapshot" in desc or \
-       "Copied for DestinationAmi" in desc:
-        return ["SnapshotReplicated"]
-    return []
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_snapshot_replication(writer: csv.writer, ec2) -> None:
-    """
-    Identify EBS snapshots that are replicated to other regions.
-    Writes flagged snapshots with estimated monthly storage cost to CSV.
-    """
-    try:
-        snapshots = safe_aws_call(
-            lambda: ec2.describe_snapshots(OwnerIds=["self"]).get("Snapshots", []),
-            fallback=[],
-            context="DescribeSnapshots"
-        )
-
-        # First pass: identify snapshots used as source for copies
-        source_snapshot_ids: Set[str] = set()
-        for snap in snapshots:
-            desc = snap.get("Description", "") or ""
-            if "Copied for DestinationAmi" in desc and "SourceSnapshot" in desc:
-                parts = desc.split("SourceSnapshot")
-                if len(parts) > 1:
-                    source_id = parts[1].strip().split()[0]
-                    source_snapshot_ids.add(source_id)
-
-        # Second pass: build metadata and run checks
-        for snap in snapshots:
-            snapshot_id = snap.get("SnapshotId", "")
-            volume_size = int(snap.get("VolumeSize", 0) or 0)
-            start_time = snap.get("StartTime")
-            description = snap.get("Description", "") or ""
-            tags = {t["Key"]: t["Value"] for t in snap.get("Tags", [])} if snap.get("Tags") else {}
-
-            snapshot = EBSSnapshotMetadata(
-                snapshot_id=snapshot_id,
-                volume_size=volume_size,
-                start_time=start_time if isinstance(start_time, datetime) else None,
-                description=description,
-                tags=tags
-            )
-            snapshot.estimated_cost = estimate_ebs_snapshot_cost(snapshot)
-            snapshot.flags.update(check_snapshot_replication(snapshot, source_snapshot_ids))
-
-            write_resource_to_csv(
-                writer=writer,
-                resource_id=snapshot.snapshot_id,
-                name=snapshot.tags.get("Name", ""),
-                owner_id=ACCOUNT_ID,
-                resource_type="EBSSnapshot",
-                creation_date=snapshot.start_time.isoformat() if snapshot.start_time else "",
-                storage_gb=snapshot.volume_size,
-                estimated_cost=snapshot.estimated_cost,
-                flags=list(snapshot.flags)
-            )
-
-    except ClientError as e:
-        logging.error(f"[check_ebs_snapshot_replication] Error retrieving snapshots: {e}")
-
-#endregion
-
 #region FSR SECTION
 
 @retry_with_backoff(exceptions=(ClientError,))
@@ -3796,9 +3708,6 @@ def main():
                           cached_templates=cached_templates, ec2=clients['ec2'],
                           autoscaling=clients['autoscaling'], cfn=clients['cfn'])
 
-                run_check(profiler, check_name="check_ebs_snapshot_replication", region=region,
-                          fn=check_ebs_snapshot_replication, writer=writer, ec2=clients['ec2'])
-
                 run_check(profiler, check_name="check_inter_region_vpc_and_tgw_peerings",
                           region=region, fn=check_inter_region_vpc_and_tgw_peerings,
                           writer=writer, ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
@@ -3887,36 +3796,46 @@ def main():
                           writer=writer, kinesis=clients["kinesis"],
                           cloudwatch=clients["cloudwatch"])
 
-                run_check(profiler, "check_firehose_delivery_streams", 
+                run_check(profiler, "check_firehose_delivery_streams",
                           region, kinesis_checks.check_firehose_delivery_streams,
                           writer=writer, firehose=clients["firehose"],
                           cloudwatch=clients["cloudwatch"])
                 
-                run_check(profiler, "check_dynamodb_unused_tables", region, 
-                          ddb_checks.check_dynamodb_unused_tables, writer=writer, 
+                run_check(profiler, "check_dynamodb_unused_tables", region,
+                          ddb_checks.check_dynamodb_unused_tables, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_dynamodb_underutilized_provisioned", region, 
-                          ddb_checks.check_dynamodb_underutilized_provisioned, writer=writer, 
+                run_check(profiler, "check_dynamodb_underutilized_provisioned", region,
+                          ddb_checks.check_dynamodb_underutilized_provisioned, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_dynamodb_continuous_backups", region, 
-                          ddb_checks.check_dynamodb_continuous_backups, writer=writer, 
+                run_check(profiler, "check_dynamodb_continuous_backups", region,
+                          ddb_checks.check_dynamodb_continuous_backups, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_dynamodb_gsi_underutilized", region, 
-                          ddb_checks.check_dynamodb_gsi_underutilized, writer=writer, 
+                run_check(profiler, "check_dynamodb_gsi_underutilized", region,
+                          ddb_checks.check_dynamodb_gsi_underutilized, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_dynamodb_streams_enabled_no_consumers", region, 
-                          ddb_checks.check_dynamodb_streams_enabled_no_consumers, writer=writer, 
-                          dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"], 
+                run_check(profiler, "check_dynamodb_streams_enabled_no_consumers", region,
+                          ddb_checks.check_dynamodb_streams_enabled_no_consumers, writer=writer,
+                          dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"],
                           dynamodbstreams=clients.get("dynamodbstreams"))
-                run_check(profiler, "check_dynamodb_ttl_disabled", region, 
-                          ddb_checks.check_dynamodb_ttl_disabled, writer=writer, 
+                run_check(profiler, "check_dynamodb_ttl_disabled", region,
+                          ddb_checks.check_dynamodb_ttl_disabled, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_dynamodb_table_class_mismatch", region, 
-                          ddb_checks.check_dynamodb_table_class_mismatch, writer=writer, 
+                run_check(profiler, "check_dynamodb_table_class_mismatch", region,
+                          ddb_checks.check_dynamodb_table_class_mismatch, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_dynamodb_global_tables_low_activity", region, 
-                          ddb_checks.check_dynamodb_global_tables_low_activity, writer=writer, 
+                run_check(profiler, "check_dynamodb_global_tables_low_activity", region,
+                          ddb_checks.check_dynamodb_global_tables_low_activity, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
+                
+                run_check(profiler, "check_ebs_snapshots_public_or_shared", region,
+                          ebs_checks.check_ebs_snapshots_public_or_shared, writer=writer,
+                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
+                run_check(profiler, "check_ebs_snapshots_unencrypted", region,
+                          ebs_checks.check_ebs_snapshots_unencrypted, writer=writer,
+                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
+                run_check(profiler, "check_ebs_snapshots_missing_description", region,
+                          ebs_checks.check_ebs_snapshots_missing_description, writer=writer,
+                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
 
 
         profiler.dump_csv()

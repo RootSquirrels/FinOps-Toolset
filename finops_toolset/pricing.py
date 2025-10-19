@@ -28,10 +28,10 @@ PRICING: PriceMap = {
         "MAGNETIC_GB_MONTH": 0.05,
         "IO1_IOPS_MONTH": 0.065,
         "IO2_IOPS_MONTH": 0.0625,
-        "GP3_IOPS_MONTH": 0.005,   # per IOPS above 3000
-        "GP3_THROUGHPUT_MBPS_MONTH": 0.04,  # per MB/s above 125
+        "GP3_IOPS_MONTH": 0.005,
+        "GP3_THROUGHPUT_MBPS_MONTH": 0.04,
         "SNAPSHOT_STANDARD_GB_MONTH": 0.05,
-        "SNAPSHOT_ARCHIVE_GB_MONTH": 0.0125,         
+        "SNAPSHOT_ARCHIVE_GB_MONTH": 0.0125,
     },
 
     "EIP": {

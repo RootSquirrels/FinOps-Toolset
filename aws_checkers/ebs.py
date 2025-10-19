@@ -1,25 +1,30 @@
 """Checkers: Amazon EBS (Elastic Block Store).
 
-Contains:
-  - check_unattached_ebs_volumes: Volumes in 'available' state (likely waste).
-  - check_ebs_low_activity_volumes: Attached volumes with no/low I/O in window.
-  - check_ebs_gp2_to_gp3_migration: gp2 volumes with potential gp3 savings.
-  - check_ebs_snapshots_old_or_orphaned: stale/orphan snapshots, archive suggestions.
+Includes:
+  Volumes
+  - check_unattached_ebs_volumes            : 'available' (unattached) volumes
+  - check_ebs_low_activity_volumes          : attached volumes with no/low I/O
+  - check_ebs_gp2_to_gp3_migration          : gp2 volumes with gp3 savings
+
+  Snapshots (legacy section + modern extras)
+  - check_ebs_snapshots_old_or_orphaned     : stale/orphaned and archive candidates
+  - check_ebs_snapshots_public_or_shared    : public or shared outside the account
+  - check_ebs_snapshots_unencrypted         : unencrypted snapshots (hygiene)
+  - check_ebs_snapshots_missing_description : snapshots without description (hygiene)
 
 Design:
-  - Dependencies (account_id, write_row, get_price, logger) provided via
-    finops_toolset.checkers.config.setup(...).
-  - CloudWatch metrics via finops_toolset.cloudwatch.CloudWatchBatcher.
-  - Each checker is tolerant to run_check calling style and to partial AWS failures.
-  - Emits Flags, Signals (compact k=v), Estimated_Cost_USD, Potential_Saving_USD.
-  - Datetimes are timezone-aware (datetime.now(timezone.utc)).
+  - Dependencies via finops_toolset.checkers.config.setup(...).
+  - CloudWatch via finops_toolset.cloudwatch.CloudWatchBatcher where relevant.
+  - Tolerant call signatures for run_check; no returns; graceful skips.
+  - Uses config.safe_price(...) for all estimates; UTC-aware datetimes.
+  - Pylint-friendly lazy %s logging.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 from botocore.exceptions import ClientError
 
@@ -124,8 +129,8 @@ def _volume_monthly_cost(vol: Dict[str, Any]) -> float:
             else config.safe_price("EBS", "IO2_IOPS_MONTH", 0.0)
         )
     if vtype == "gp3":
-        extra_iops = max(0, iops - 3000)  # gp3 includes 3k IOPS
-        extra_tp = max(0, throughput - 125)  # gp3 includes 125 MB/s
+        extra_iops = max(0, iops - 3000)      # gp3 includes 3000 IOPS
+        extra_tp = max(0, throughput - 125)   # gp3 includes 125 MB/s
         if extra_iops > 0:
             add += extra_iops * config.safe_price("EBS", "GP3_IOPS_MONTH", 0.0)
         if extra_tp > 0:
@@ -145,7 +150,7 @@ def _gp2_to_gp3_saving(vol: Dict[str, Any]) -> float:
     return size_gb * delta
 
 
-# ----------------------- volumes: unattached (available) ------------------ #
+# ============================= VOLUMES =================================== #
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_unattached_ebs_volumes(  # pylint: disable=unused-argument
@@ -181,8 +186,7 @@ def check_unattached_ebs_volumes(  # pylint: disable=unused-argument
                 encrypted = vol.get("Encrypted")
 
                 est = _volume_monthly_cost(vol)
-                # Unattached → assume full saving if deleted
-                potential = est
+                potential = est  # unattached → assume full saving if deleted
 
                 signals = _signals_str(
                     {
@@ -219,8 +223,6 @@ def check_unattached_ebs_volumes(  # pylint: disable=unused-argument
         log.error("[check_unattached_ebs_volumes] describe_volumes failed: %s", exc)
         raise
 
-
-# ---------------- volumes: low/zero activity while attached --------------- #
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ebs_low_activity_volumes(  # pylint: disable=unused-argument
@@ -346,12 +348,10 @@ def check_ebs_low_activity_volumes(  # pylint: disable=unused-argument
                     signals=signals,
                 )
             except Exception as exc:  # pylint: disable=broad-except
-                log.warning("[check_ebs_low_activity_volumes] write failed for %s: %s", vid, exc)
+                log.warning("[check_ebs_low_activity_volumes] write_row failed for %s: %s", vid, exc)
 
             log.info("[check_ebs_low_activity_volumes] Wrote low-activity volume: %s (size=%sGB type=%s)", vid, size_gb, vtype)
 
-
-# ------------------------ volumes: gp2 → gp3 savings ---------------------- #
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ebs_gp2_to_gp3_migration(  # pylint: disable=unused-argument
@@ -390,9 +390,7 @@ def check_ebs_gp2_to_gp3_migration(  # pylint: disable=unused-argument
                 size_gb = vol.get("Size")
                 encrypted = vol.get("Encrypted")
 
-                # attached?
                 attached = bool(vol.get("Attachments"))
-
                 signals = _signals_str(
                     {
                         "Region": region,
@@ -422,16 +420,16 @@ def check_ebs_gp2_to_gp3_migration(  # pylint: disable=unused-argument
                         signals=signals,
                     )
                 except Exception as exc:  # pylint: disable=broad-except
-                    log.warning("[GP2->GP3] write_row failed for %s: %s", vid, exc)
+                    log.warning("[check_ebs_gp2_to_gp3_migration] write_row failed for %s: %s", vid, exc)
 
-                log.info("[GP2->GP3] Wrote gp2 volume: %s (size=%sGB)", vid, size_gb)
+                log.info("[check_ebs_gp2_to_gp3_migration] Wrote gp2 volume: %s (size=%sGB)", vid, size_gb)
 
     except ClientError as exc:
-        log.error("[GP2->GP3] describe_volumes failed: %s", exc)
+        log.error("[check_ebs_gp2_to_gp3_migration] describe_volumes failed: %s", exc)
         raise
 
 
-# ------------------- snapshots: stale and/or orphaned -------------------- #
+# ============================= SNAPSHOTS ================================= #
 
 def _list_all_volume_ids(ec2, log: logging.Logger) -> set[str]:
     ids: set[str] = set()
@@ -458,8 +456,8 @@ def check_ebs_snapshots_old_or_orphaned(  # pylint: disable=unused-argument
     """
     Flag EBS snapshots that are:
       - Orphaned (source volume no longer exists) → EbsSnapshotOrphaned
-      - Old (StartTime older than stale_days) → EbsSnapshotStale
-      - Standard tier & old enough to archive → EbsSnapshotArchiveCandidate
+      - Old (StartTime older than stale_days)     → EbsSnapshotStale
+      - Standard tier & old enough to archive     → EbsSnapshotArchiveCandidate
 
     Estimated cost uses VolumeSize * price per GB-month (heuristic).
     Potential saving = estimated_cost for orphaned/stale.
@@ -486,7 +484,6 @@ def check_ebs_snapshots_old_or_orphaned(  # pylint: disable=unused-argument
 
     try:
         paginator = ec2.get_paginator("describe_snapshots")
-        # OwnerIds param avoids scanning public snapshots
         for page in paginator.paginate(OwnerIds=["self"]):
             for snap in page.get("Snapshots", []) or []:
                 sid = snap.get("SnapshotId")
@@ -513,7 +510,6 @@ def check_ebs_snapshots_old_or_orphaned(  # pylint: disable=unused-argument
                     flags.append("EbsSnapshotOrphaned")
                 if is_old:
                     flags.append("EbsSnapshotStale")
-                # archive recommendation
                 if (tier == "standard") and isinstance(start, datetime):
                     age_days = (datetime.now(timezone.utc) - (start if start.tzinfo else start.replace(tzinfo=timezone.utc))).days
                     if age_days >= int(archive_recommend_days):
@@ -522,7 +518,6 @@ def check_ebs_snapshots_old_or_orphaned(  # pylint: disable=unused-argument
                 if not flags:
                     continue
 
-                # Archive saving (delta between std and archive) if applicable
                 if "EbsSnapshotArchiveCandidate" in flags and price_std > price_arch:
                     potential = max(potential, size_gb * (price_std - price_arch))
 
@@ -558,10 +553,298 @@ def check_ebs_snapshots_old_or_orphaned(  # pylint: disable=unused-argument
                         signals=signals,
                     )
                 except Exception as exc:  # pylint: disable=broad-except
-                    log.warning("[EBS_Old_Orphaned] write_row failed for %s: %s", sid, exc)
+                    log.warning("[check_ebs_snapshots_old_or_orphaned] write_row failed for %s: %s", sid, exc)
 
-                log.info("[EBS_Old_Orphaned] Wrote snapshot: %s (flags=%s)", sid, flags)
+                log.info("[check_ebs_snapshots_old_or_orphaned] Wrote snapshot: %s (flags=%s)", sid, flags)
 
     except ClientError as exc:
-        log.error("[EBS_Old_Orphaned] describe_snapshots failed: %s", exc)
+        log.error("[check_ebs_snapshots_old_or_orphaned] describe_snapshots failed: %s", exc)
+        raise
+
+
+# -------- Legacy extras: public/shared, unencrypted, missing description -------- #
+
+def _snapshot_sharing(
+    ec2,
+    snapshot_id: str,
+    log: logging.Logger,
+) -> Tuple[bool, bool, List[str]]:
+    """
+    Best-effort sharing analysis.
+
+    Returns:
+        (is_public, shared_outside_account, shared_user_ids)
+    """
+    try:
+        resp = ec2.describe_snapshot_attribute(
+            SnapshotId=snapshot_id,
+            Attribute="createVolumePermission",
+        )
+        # boto3 uses 'CreateVolumePermissions'
+        perms = resp.get("CreateVolumePermissions") or resp.get("CreateVolumePermission") or []
+        is_public = any(p.get("Group") == "all" for p in perms if isinstance(p, dict))
+        shared_user_ids = [p.get("UserId") for p in perms if isinstance(p, dict) and p.get("UserId")]
+        acct = str(config.ACCOUNT_ID or "")
+        shared_outside = any(uid and uid != acct for uid in shared_user_ids)
+        return is_public, shared_outside, shared_user_ids
+    except ClientError as exc:
+        # No permission → treat as unknown; return nothing flagged
+        log.debug("[ebs snapshots] describe_snapshot_attribute failed for %s: %s", snapshot_id, exc)
+        return False, False, []
+
+
+@retry_with_backoff(exceptions=(ClientError,))
+def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
+    *args,
+    logger: Optional[logging.Logger] = None,
+    **kwargs,
+) -> None:
+    """
+    Flag EBS snapshots that are public or shared outside the current account.
+
+    Flags:
+      - EBSSnapshotPublic
+      - EBSSnapshotSharedOutsideAccount
+
+    Notes:
+      - Estimated cost is the snapshot storage monthly estimate (informational).
+      - Potential saving is 0.0 (security/hygiene issue, not direct cost).
+    """
+    log = _logger(kwargs.get("logger") or logger)
+
+    try:
+        writer, ec2, cloudwatch = _extract_writer_ec2_cw(args, kwargs)  # cloudwatch unused
+    except TypeError as exc:
+        log.warning("[check_ebs_snapshots_public_or_shared] Skipping: %s", exc)
+        return
+    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
+        log.warning("[check_ebs_snapshots_public_or_shared] Skipping: checker config not provided.")
+        return
+
+    region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
+    price_std = config.safe_price("EBS", "SNAPSHOT_STANDARD_GB_MONTH", 0.0)
+    price_arch = config.safe_price("EBS", "SNAPSHOT_ARCHIVE_GB_MONTH", 0.0)
+
+    try:
+        paginator = ec2.get_paginator("describe_snapshots")
+        for page in paginator.paginate(OwnerIds=["self"]):
+            for snap in page.get("Snapshots", []) or []:
+                sid = snap.get("SnapshotId")
+                if not sid:
+                    continue
+
+                tier = (snap.get("StorageTier") or "standard").lower()
+                size_gb = float(snap.get("VolumeSize") or 0.0)
+                enc = snap.get("Encrypted")
+                start = snap.get("StartTime")
+
+                est = size_gb * (price_arch if tier == "archive" else price_std)
+
+                is_public, shared_outside, shared_ids = _snapshot_sharing(ec2, sid, log)
+                flags: List[str] = []
+                if is_public:
+                    flags.append("EBSSnapshotPublic")
+                if shared_outside:
+                    flags.append("EBSSnapshotSharedOutsideAccount")
+
+                if not flags:
+                    continue
+
+                signals = _signals_str(
+                    {
+                        "Region": region,
+                        "SnapshotId": sid,
+                        "Tier": tier,
+                        "Encrypted": enc,
+                        "SizeGB": int(size_gb),
+                        "StartTime": _to_utc_iso(start) if isinstance(start, datetime) else None,
+                        "SharedWith": ",".join(shared_ids) if shared_ids else "",
+                    }
+                )
+
+                try:
+                    # type: ignore[call-arg]
+                    config.WRITE_ROW(
+                        writer=writer,
+                        resource_id=sid,
+                        name=sid,
+                        owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
+                        resource_type="EBSSnapshot",
+                        estimated_cost=est,
+                        potential_saving=0.0,
+                        flags=flags,
+                        confidence=100,
+                        signals=signals,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    log.warning("[check_ebs_snapshots_public_or_shared] write_row failed for %s: %s", sid, exc)
+
+                log.info("[check_ebs_snapshots_public_or_shared] Wrote snapshot: %s (flags=%s)", sid, flags)
+
+    except ClientError as exc:
+        log.error("[check_ebs_snapshots_public_or_shared] describe_snapshots failed: %s", exc)
+        raise
+
+
+@retry_with_backoff(exceptions=(ClientError,))
+def check_ebs_snapshots_unencrypted(  # pylint: disable=unused-argument
+    *args,
+    logger: Optional[logging.Logger] = None,
+    **kwargs,
+) -> None:
+    """
+    Flag EBS snapshots that are unencrypted (hygiene/security).
+
+    Flags:
+      - EBSSnapshotUnencrypted
+
+    Notes:
+      - Estimated cost is the snapshot storage monthly estimate (informational).
+      - Potential saving is 0.0 (hygiene).
+    """
+    log = _logger(kwargs.get("logger") or logger)
+
+    try:
+        writer, ec2, cloudwatch = _extract_writer_ec2_cw(args, kwargs)  # cloudwatch unused
+    except TypeError as exc:
+        log.warning("[check_ebs_snapshots_unencrypted] Skipping: %s", exc)
+        return
+    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
+        log.warning("[check_ebs_snapshots_unencrypted] Skipping: checker config not provided.")
+        return
+
+    region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
+    price_std = config.safe_price("EBS", "SNAPSHOT_STANDARD_GB_MONTH", 0.0)
+    price_arch = config.safe_price("EBS", "SNAPSHOT_ARCHIVE_GB_MONTH", 0.0)
+
+    try:
+        paginator = ec2.get_paginator("describe_snapshots")
+        for page in paginator.paginate(OwnerIds=["self"]):
+            for snap in page.get("Snapshots", []) or []:
+                sid = snap.get("SnapshotId")
+                if not sid:
+                    continue
+                enc = bool(snap.get("Encrypted"))
+                if enc:
+                    continue  # only flag unencrypted
+
+                tier = (snap.get("StorageTier") or "standard").lower()
+                size_gb = float(snap.get("VolumeSize") or 0.0)
+                start = snap.get("StartTime")
+                est = size_gb * (price_arch if tier == "archive" else price_std)
+
+                signals = _signals_str(
+                    {
+                        "Region": region,
+                        "SnapshotId": sid,
+                        "Tier": tier,
+                        "Encrypted": enc,
+                        "SizeGB": int(size_gb),
+                        "StartTime": _to_utc_iso(start) if isinstance(start, datetime) else None,
+                    }
+                )
+
+                try:
+                    # type: ignore[call-arg]
+                    config.WRITE_ROW(
+                        writer=writer,
+                        resource_id=sid,
+                        name=sid,
+                        owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
+                        resource_type="EBSSnapshot",
+                        estimated_cost=est,
+                        potential_saving=0.0,
+                        flags=["EBSSnapshotUnencrypted"],
+                        confidence=100,
+                        signals=signals,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    log.warning("[check_ebs_snapshots_unencrypted] write_row failed for %s: %s", sid, exc)
+
+                log.info("[check_ebs_snapshots_unencrypted] Wrote snapshot: %s (unencrypted)", sid)
+
+    except ClientError as exc:
+        log.error("[check_ebs_snapshots_unencrypted] describe_snapshots failed: %s", exc)
+        raise
+
+
+@retry_with_backoff(exceptions=(ClientError,))
+def check_ebs_snapshots_missing_description(  # pylint: disable=unused-argument
+    *args,
+    logger: Optional[logging.Logger] = None,
+    **kwargs,
+) -> None:
+    """
+    Flag snapshots with empty/absent Description (hygiene).
+
+    Flags:
+      - EBSSnapshotMissingDescription
+
+    Notes:
+      - Estimated cost is the snapshot storage monthly estimate (informational).
+      - Potential saving is 0.0 (hygiene).
+    """
+    log = _logger(kwargs.get("logger") or logger)
+
+    try:
+        writer, ec2, cloudwatch = _extract_writer_ec2_cw(args, kwargs)  # cloudwatch unused
+    except TypeError as exc:
+        log.warning("[check_ebs_snapshots_missing_description] Skipping: %s", exc)
+        return
+    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
+        log.warning("[check_ebs_snapshots_missing_description] Skipping: checker config not provided.")
+        return
+
+    region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
+    price_std = config.safe_price("EBS", "SNAPSHOT_STANDARD_GB_MONTH", 0.0)
+    price_arch = config.safe_price("EBS", "SNAPSHOT_ARCHIVE_GB_MONTH", 0.0)
+
+    try:
+        paginator = ec2.get_paginator("describe_snapshots")
+        for page in paginator.paginate(OwnerIds=["self"]):
+            for snap in page.get("Snapshots", []) or []:
+                sid = snap.get("SnapshotId")
+                if not sid:
+                    continue
+
+                desc = (snap.get("Description") or "").strip()
+                if desc:
+                    continue  # has a description
+
+                tier = (snap.get("StorageTier") or "standard").lower()
+                size_gb = float(snap.get("VolumeSize") or 0.0)
+                start = snap.get("StartTime")
+                est = size_gb * (price_arch if tier == "archive" else price_std)
+
+                signals = _signals_str(
+                    {
+                        "Region": region,
+                        "SnapshotId": sid,
+                        "Tier": tier,
+                        "SizeGB": int(size_gb),
+                        "StartTime": _to_utc_iso(start) if isinstance(start, datetime) else None,
+                    }
+                )
+
+                try:
+                    # type: ignore[call-arg]
+                    config.WRITE_ROW(
+                        writer=writer,
+                        resource_id=sid,
+                        name=sid,
+                        owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
+                        resource_type="EBSSnapshot",
+                        estimated_cost=est,
+                        potential_saving=0.0,
+                        flags=["EBSSnapshotMissingDescription"],
+                        confidence=100,
+                        signals=signals,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    log.warning("[check_ebs_snapshots_missing_description] write_row failed for %s: %s", sid, exc)
+
+                log.info("[check_ebs_snapshots_missing_description] Wrote snapshot: %s (missing description)", sid)
+
+    except ClientError as exc:
+        log.error("[check_ebs_snapshots_missing_description] describe_snapshots failed: %s", exc)
         raise
