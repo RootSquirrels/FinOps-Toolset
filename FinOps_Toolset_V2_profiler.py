@@ -144,29 +144,24 @@ Usage
 """
 
 #region Imports SECTION
-import boto3 # type: ignore
+
 import csv
 import os
 import logging
 from typing import Dict, Optional, List, Tuple, Union, Callable, Any, TypeVar, Set, Type
 from datetime import datetime, timezone, timedelta
-from botocore.exceptions import ClientError # type: ignore
+
 from dataclasses import dataclass, field
-from statistics import fmean
-from enum import Enum
 import re
+
 from time import perf_counter
+import boto3 # type: ignore
+from botocore.exceptions import ClientError # type: ignore
 #from correlator import build_certificate_graph, summarize_cert_usage
 
 from finops_toolset.config import (
     SDK_CONFIG,
-    REGIONS, OUTPUT_FILE, LOG_FILE, BATCH_SIZE, REQUIRED_TAG_KEYS,
-    _S3_MPU_BUCKET_WORKERS, _S3_MPU_PART_WORKERS, _S3_MPU_PAGE_SIZE,
-    _S3_MPU_GLOBAL_FINDINGS_CAP, _S3_MPU_PARTS_MODE,
-    DDB_LOOKBACK_DAYS, DDB_CW_PERIOD, DDB_BACKUP_AGE_DAYS, HOURS_PER_MONTH,
-    LAMBDA_LOOKBACK_DAYS, LAMBDA_ERROR_RATE_THRESHOLD, LAMBDA_LOW_CONCURRENCY_THRESHOLD,
-    LAMBDA_LOW_TRAFFIC_THRESHOLD, LAMBDA_LARGE_PACKAGE_MB,
-    LAMBDA_LOW_PROVISIONED_UTILIZATION, LAMBDA_VERSION_SPRAWL_THRESHOLD,
+    REGIONS, OUTPUT_FILE, LOG_FILE, REQUIRED_TAG_KEYS,
     VPC_LOOKBACK_DAYS, MIN_COST_THRESHOLD,
     EC2_LOOKBACK_DAYS, EC2_CW_PERIOD, EC2_IDLE_CPU_PCT, EC2_IDLE_NET_GB, EC2_IDLE_DISK_OPS,
     LOAD_BALANCER_LOOKBACK_DAYS,
@@ -191,6 +186,8 @@ from aws_checkers import kinesis as kinesis_checks
 from aws_checkers import dynamodb as ddb_checks
 from aws_checkers import s3 as s3_checks
 from aws_checkers import ami as ami_checks
+from aws_checkers import lambda_svc as lambda_checks
+from aws_checkers import ec2 as ec2_checks
 #endregion
 
 # Configure logging
@@ -294,6 +291,7 @@ def _fmt_dt(dt: Optional[datetime]) -> str:
 #region ENGINE SECTION
 
 def init_clients(region: str):
+    """Create boto3 clients for the toolset."""
     return {
         "ec2": boto3.client("ec2", region_name=region, config=SDK_CONFIG),
         "autoscaling": boto3.client("autoscaling", region_name=region, config=SDK_CONFIG),
@@ -791,399 +789,6 @@ def check_idle_load_balancers(
 
     except Exception as e:
         logging.exception(f"[ELB] check_idle_load_balancers_refactored failed: {e}")
-        return
-
-#endregion
-
-
-#region LAMBDA SECTION
-
-# ---------- Flags ----------
-class LambdaFlag(str, Enum):
-    NO_INVOCATIONS = "NoInvocations90d"
-    LOW_TRAFFIC = "LowTraffic"
-    HIGH_ERROR_RATE = "HighErrorRate"
-    LARGE_PACKAGE = "LargePackage"
-    LOW_CONCURRENCY = "LowConcurrencyUsage"
-    UNDERUTILIZED_PROV_CONC = "UnderutilizedProvisionedConcurrency"
-    TMP_USAGE = "TmpUsageHeuristic"
-    OVERPROVISIONED_MEMORY = "OverProvisionedMemory"
-    POTENTIAL_SAVING = "PotentialSaving"
-    STALE_LAYER = "StaleLayer"
-    VERSION_SPRAWL = "VersionSprawl"
-
-
-@dataclass
-class LambdaMetadata:
-    arn: str
-    name: str
-    runtime: str
-    memory_mb: int
-    ephemeral_mb: int
-    code_size: int
-    creation_date: str
-    total_invocations: int
-    total_errors: int
-    avg_duration_ms: float
-    p95_duration_ms: float
-    avg_concurrency: float
-    max_concurrency: float
-    avg_prov_util: float
-    estimated_cost: float
-    flags: set[str] = field(default_factory=set)
-
-
-# ---------- Heuristic checks ----------
-def check_low_traffic(fn: LambdaMetadata) -> list[str]:
-    if fn.total_invocations == 0:
-        return [LambdaFlag.NO_INVOCATIONS.value]
-    est_month_inv = round(fn.total_invocations * (30 / max(1, LAMBDA_LOOKBACK_DAYS)))
-    if est_month_inv < LAMBDA_LOW_TRAFFIC_THRESHOLD:
-        return [f"{LambdaFlag.LOW_TRAFFIC.value}={est_month_inv}/mo"]
-    return []
-
-
-def check_high_error_rate(fn: LambdaMetadata) -> list[str]:
-    if fn.total_invocations > 0 and (fn.total_errors / fn.total_invocations) > LAMBDA_ERROR_RATE_THRESHOLD:
-        return [LambdaFlag.HIGH_ERROR_RATE.value]
-    return []
-
-
-def check_large_package(fn: LambdaMetadata) -> list[str]:
-    if fn.code_size >= LAMBDA_LARGE_PACKAGE_MB * 1024 * 1024:
-        return [f"{LambdaFlag.LARGE_PACKAGE.value}≈{round(fn.code_size/1024/1024,1)}MB"]
-    return []
-
-
-def check_low_concurrency(fn: LambdaMetadata) -> list[str]:
-    if fn.avg_concurrency < LAMBDA_LOW_CONCURRENCY_THRESHOLD:
-        return [LambdaFlag.LOW_CONCURRENCY.value]
-    return []
-
-
-def check_underutilized_prov_conc(fn: LambdaMetadata) -> list[str]:
-    if fn.avg_prov_util < LAMBDA_LOW_PROVISIONED_UTILIZATION:
-        return [LambdaFlag.UNDERUTILIZED_PROV_CONC.value]
-    return []
-
-
-def check_tmp_usage(fn: LambdaMetadata) -> list[str]:
-    if fn.ephemeral_mb > 512 and fn.p95_duration_ms > 2000:
-        return [f"{LambdaFlag.TMP_USAGE.value}(ephemeral={fn.ephemeral_mb}MB,p95Dur≈{int(fn.p95_duration_ms)}ms)"]
-    return []
-
-
-def check_memory_rightsizing(fn: LambdaMetadata) -> list[str]:
-    if fn.memory_mb >= 1024 and fn.p95_duration_ms <= 500 and fn.total_invocations > 0:
-        suggested = max(128, fn.memory_mb // 2 // 128 * 128)
-        if suggested < fn.memory_mb:
-            new_mem_gb = suggested / 1024.0
-            avg_duration_sec = fn.avg_duration_ms / 1000.0
-            potential_saving = (fn.memory_mb/1024.0 - new_mem_gb) * fn.total_invocations * avg_duration_sec * get_price("LAMBDA", "GB_SECOND")
-            return [
-                f"{LambdaFlag.OVERPROVISIONED_MEMORY.value}(cur={fn.memory_mb}MB,->~{suggested}MB)",
-                f"{LambdaFlag.POTENTIAL_SAVING.value}={round(potential_saving,2)}$"
-            ]
-    return []
-
-
-def check_layers(fn: LambdaMetadata, lambda_client=None) -> list[str]:
-    flags = []
-    if not lambda_client:
-        return flags
-    try:
-        config = lambda_client.get_function_configuration(FunctionName=fn.name)
-        for layer in config.get("Layers", []):
-            arn = layer.get("Arn", "")
-            if arn and ":1" in arn:
-                flags.append(f"{LambdaFlag.STALE_LAYER.value}={arn.split(':')[-2:]}")
-    except Exception as e:
-        logging.warning(f"[Lambda:{fn.name}] Layer check failed: {e}")
-    return flags
-
-
-def check_version_sprawl(fn: LambdaMetadata, lambda_client=None) -> list[str]:
-    flags = []
-    if not lambda_client:
-        return flags
-    try:
-        versions = lambda_client.list_versions_by_function(FunctionName=fn.name).get("Versions", [])
-        if len(versions) > LAMBDA_VERSION_SPRAWL_THRESHOLD:
-            flags.append(f"{LambdaFlag.VERSION_SPRAWL.value}={len(versions)}")
-    except Exception as e:
-        logging.warning(f"[Lambda:{fn.name}] Version sprawl check failed: {e}")
-    return flags
-
-
-# ---------- Check registry ----------
-LAMBDA_CHECKS: list[Callable[[LambdaMetadata], list[str]]] = [
-    check_low_traffic,
-    check_high_error_rate,
-    check_large_package,
-    check_low_concurrency,
-    check_underutilized_prov_conc,
-    check_tmp_usage,
-    check_memory_rightsizing,
-]
-
-
-# ---------- Cost estimation ----------
-def estimate_lambda_cost(fn: LambdaMetadata) -> float:
-    avg_duration_sec = fn.avg_duration_ms / 1000.0
-    memory_gb = fn.memory_mb / 1024.0
-    gb_seconds = fn.total_invocations * avg_duration_sec * memory_gb
-    return round(
-        gb_seconds * get_price("LAMBDA", "GB_SECOND")
-        + (fn.total_invocations / 1_000_000.0 * get_price("LAMBDA", "REQUESTS_PER_MILLION")),
-        4,
-    )
-
-
-def check_lambda_efficiency(writer: csv.writer, lambda_client, cloudwatch) -> None:
-    """
-    Analyze AWS Lambda functions for cost efficiency and rightsizing opportunities.
-
-    This check:
-      • Enumerates all Lambda functions in the region (via list_functions).
-      • Pulls CloudWatch metrics over the last LAMBDA_LOOKBACK_DAYS:
-          - Invocations (Sum)
-          - Errors (Sum)
-          - Duration (Average, Maximum)
-          - ConcurrentExecutions (Average, Maximum)
-          - ProvisionedConcurrencyUtilization (Average)
-      • Derives per-function statistics:
-          - Total invocations & errors
-          - Average duration (ms) and p95 duration (ms)
-          - Average & max concurrency
-          - Average provisioned concurrency utilization
-      • Estimates monthly Lambda cost using GB-seconds + request count.
-      • Applies heuristic flags:
-          - NoInvocations90d / LowTraffic
-          - HighErrorRate
-          - LargePackage
-          - LowConcurrencyUsage
-          - UnderutilizedProvisionedConcurrency
-          - TmpUsageHeuristic
-          - OverProvisionedMemory (with PotentialSaving=$)
-          - StaleLayer
-          - VersionSprawl
-
-    Output:
-        Writes one CSV row per function that has flags or non-zero estimated cost:
-            - Function ARN, name, creation date
-            - Estimated monthly cost (USD)
-            - List of optimization / compliance flags
-
-    Args:
-        writer (csv.writer): Active CSV writer instance for appending findings.
-        lambda_client: boto3 Lambda client (regional).
-        cloudwatch: boto3 CloudWatch client (regional).
-
-    Error handling:
-        • API calls are wrapped with retry_with_backoff to mitigate throttling.
-        • Individual function errors are logged and skipped (processing continues).
-    """
-
-    try:
-        region = (
-            getattr(getattr(cloudwatch, "meta", None), "region_name", "")
-            or getattr(getattr(lambda_client, "meta", None), "region_name", "")
-            or ""
-        )
-
-        now = datetime.now(timezone.utc)
-        lookback_days = max(1, LAMBDA_LOOKBACK_DAYS)
-        start = now - timedelta(days=lookback_days)
-        PERIOD = 300  # 5m buckets — good balance for Duration averages
-
-        # 1) List functions (paginated)
-        funcs = []
-        token = None
-        while True:
-            try:
-                kwargs = {"Marker": token} if token else {}
-                resp = lambda_client.list_functions(**kwargs)
-            except ClientError as e:
-                logging.error(f"[Lambda] list_functions failed in {region}: {e}")
-                break
-            funcs.extend(resp.get("Functions", []))
-            token = resp.get("NextMarker")
-            if not token:
-                break
-
-        if not funcs:
-            return
-
-        # 2) Pre-fetch tags (best effort) and (optionally) version counts
-        def _tags(arn: str) -> Dict[str, str]:
-            try:
-                t = lambda_client.list_tags(Resource=arn).get("Tags", {})
-                # Tags API returns dict already
-                return {str(k): str(v) for k, v in t.items()}
-            except ClientError:
-                return {}
-            except Exception:
-                return {}
-
-        # 3) Batch CloudWatch metrics for all functions
-        batch = cw.CloudWatchBatcher(region, client=cloudwatch)
-        for f in funcs:
-            fname = f.get("FunctionName", "")
-            dims = [{"Name": "FunctionName", "Value": fname}]
-            batch.add_q(id_hint=f"lam_inv__{fname}", namespace="AWS/Lambda", metric="Invocations", dims=dims, stat="Sum",     period=PERIOD)
-            batch.add_q(id_hint=f"lam_err__{fname}", namespace="AWS/Lambda", metric="Errors",      dims=dims, stat="Sum",     period=PERIOD)
-            batch.add_q(id_hint=f"lam_thr__{fname}", namespace="AWS/Lambda", metric="Throttles",   dims=dims, stat="Sum",     period=PERIOD)
-            batch.add_q(id_hint=f"lam_dur__{fname}", namespace="AWS/Lambda", metric="Duration",    dims=dims, stat="Average", period=PERIOD)
-
-
-        try:
-            series = batch.execute(start, now, scan_by="TimestampDescending")
-        except Exception as e:
-            logging.exception(f"[Lambda] CloudWatch batch execute failed in {region}: {e}")
-            series = {}
-
-        # 4) Pricing constants
-        try:
-            req_per_million = get_price("LAMBDA", "REQUESTS_PER_MILLION")
-        except Exception:
-            req_per_million = 0.20
-        try:
-            gb_second = get_price("LAMBDA", "GB_SECOND")
-        except Exception:
-            gb_second = 0.0000166667
-
-        # 5) Emit rows
-        for f in funcs:
-            try:
-                arn = f.get("FunctionArn", "")
-                fname = f.get("FunctionName", arn or "lambda")
-                runtime = f.get("Runtime", "")
-                memory_mb = int(f.get("MemorySize", 0) or 0)
-                timeout_s = int(f.get("Timeout", 0) or 0)
-                archs = f.get("Architectures", []) or []
-                arch = archs[0] if archs else "x86_64"
-                code_size = int(f.get("CodeSize", 0) or 0)
-                pkg_type = f.get("PackageType", "Zip")
-                created = f.get("LastModified", "")  # often '2023-05-22T12:34:56.000+0000'
-                try:
-                    if created:
-                        created_dt = datetime.fromisoformat(created.replace("Z", "+00:00")) if "T" in created else now
-                    else:
-                        created_dt = now
-                except Exception:
-                    created_dt = now
-                if created_dt.tzinfo is None:
-                    created_dt = created_dt.replace(tzinfo=timezone.utc)
-                created_iso = created_dt.astimezone(timezone.utc).isoformat()
-
-                tags = _tags(arn)
-                name = tags.get("Name", fname)
-
-                # Metrics
-                fname = f.get("FunctionName", "")
-
-                inv_sum  = sum(v for _, v in series.get(f"lam_inv__{fname}", []))
-                err_sum  = sum(v for _, v in series.get(f"lam_err__{fname}", []))
-                thr_sum  = sum(v for _, v in series.get(f"lam_thr__{fname}", []))
-                dur_vals = [v for _, v in series.get(f"lam_dur__{fname}", [])]
-                avg_ms   = (sum(dur_vals) / len(dur_vals)) if dur_vals else 0.0
-
-                try:
-                    large_pkg_flag = check_large_package(code_size_bytes=code_size, layers=f.get("Layers", []), threshold_mb=LAMBDA_LARGE_PACKAGE_MB)
-                except Exception:
-                    large_pkg_flag = False
-
-                # Low traffic?
-                try:
-                    low_traffic_flag = check_low_traffic(total_invocations=inv_sum, threshold=LAMBDA_LOW_TRAFFIC_THRESHOLD)
-                except Exception:
-                    low_traffic_flag = (inv_sum <= LAMBDA_LOW_TRAFFIC_THRESHOLD)
-
-                # Error rate?
-                try:
-                    err_rate, high_error_flag = check_high_error_rate(invocations=inv_sum, errors=err_sum, threshold=LAMBDA_ERROR_RATE_THRESHOLD)
-                except Exception:
-                    err_rate = (err_sum / inv_sum) if inv_sum > 0 else 0.0
-                    high_error_flag = (err_rate >= LAMBDA_ERROR_RATE_THRESHOLD)
-
-                # Low concurrency (heuristic via throttles == 0 and low invocations)
-                try:
-                    low_conc_flag = check_low_concurrency(invocations=inv_sum, throttles=thr_sum, threshold=LAMBDA_LOW_CONCURRENCY_THRESHOLD)
-                except Exception:
-                    low_conc_flag = (inv_sum <= (LAMBDA_LOW_CONCURRENCY_THRESHOLD * lookback_days * 60 * 60))  # fallback, harmless
-
-                # Version sprawl (optional)
-                try:
-                    sprawl_flag = check_version_sprawl(lambda_client, function_name=fname, threshold=LAMBDA_VERSION_SPRAWL_THRESHOLD)
-                except Exception:
-                    sprawl_flag = False
-
-                # ARM64 candidate (helper, if you have it)
-                arm64_flag = (arch == "x86_64" and isinstance(runtime, str) and runtime.startswith(("python", "nodejs", "java", "dotnet")))
-
-                # --- Cost estimation (requests + GB-seconds) ---
-                #   GB-seconds = invocations * (avg_ms/1000) * (memory_mb/1024)
-                gb_seconds = inv_sum * (avg_ms / 1000.0) * max(0.0, float(memory_mb) / 1024.0)
-                compute_cost = gb_seconds * gb_second
-                request_cost = (inv_sum / 1_000_000.0) * req_per_million
-                est_monthly = round(compute_cost + request_cost, 2)
-
-                # Flags & confidence
-                flags: List[str] = []
-                missing = [k for k in REQUIRED_TAG_KEYS if not tags.get(k)]
-                if missing:
-                    flags.append(f"MissingRequiredTags={','.join(missing)}")
-                if large_pkg_flag:
-                    flags.append("lambda_large_package")
-                if low_traffic_flag:
-                    flags.append("lambda_low_traffic")
-                if high_error_flag:
-                    flags.append("lambda_high_error_rate")
-                if low_conc_flag:
-                    flags.append("lambda_low_concurrency")
-                if sprawl_flag:
-                    flags.append("lambda_version_sprawl")
-                if arm64_flag:
-                    flags.append("lambda_arm64_candidate")
-
-                # Potential saving: optional; left None unless you have a dedicated estimator
-                potential = None
-
-                signals = {
-                    "Region": region,
-                    "Runtime": runtime,
-                    "Arch": arch,
-                    "MemoryMB": str(memory_mb),
-                    "TimeoutSec": str(timeout_s),
-                    f"Invocations{lookback_days}d": str(int(inv_sum)),
-                    f"Errors{lookback_days}d": str(int(err_sum)),
-                    f"Throttles{lookback_days}d": str(int(thr_sum)),
-                    "AvgDurationMs": f"{avg_ms:.2f}",
-                    "ErrorRate": f"{err_rate:.4f}",
-                    "LookbackDays": str(lookback_days),
-                }
-
-                write_resource_to_csv(
-                    writer=writer,
-                    resource_id=arn,
-                    name=name,
-                    resource_type="LambdaFunction",
-                    owner_id=ACCOUNT_ID,
-                    state="",
-                    creation_date=created_iso,
-                    estimated_cost=est_monthly,  # requests + GB-seconds
-                    app_id=tags.get("ApplicationID", "NULL"),
-                    app=tags.get("Application", "NULL"),
-                    env=tags.get("Environment", "NULL"),
-                    flags=flags,
-                    potential_saving=potential,
-                    signals=signals,
-                )
-            except Exception as e:
-                logging.exception(f"[Lambda] emit failed for {f.get('FunctionName','?')} in {region}: {e}")
-
-    except Exception as e:
-        logging.exception(f"[Lambda] check_lambda_functions_refactored failed: {e}")
         return
 
 #endregion
@@ -2402,9 +2007,43 @@ def main():
                           fn=check_redundant_route53_records, writer=writer,
                           route53=clients['route53'], elbv2=clients['elbv2'], s3=clients['s3'])
 
-                run_check(profiler, check_name="check_lambda_efficiency", region=region,
-                          fn=check_lambda_efficiency, writer=writer,
-                          lambda_client=clients['lambda'], cloudwatch=clients['cloudwatch'])
+                run_check(
+                    profiler, "check_lambda_unused_functions",
+                    region, lambda_checks.check_lambda_unused_functions,
+                    writer=writer, lambda_client=clients["lambda"], 
+                    cloudwatch=clients["cloudwatch"],
+                )
+
+                run_check(
+                    profiler, "check_lambda_provisioned_concurrency_underutilized",
+                    region, lambda_checks.check_lambda_provisioned_concurrency_underutilized,
+                    writer=writer, lambda_client=clients["lambda"], 
+                    cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, util_threshold=0.05
+                )
+
+                run_check(
+                    profiler, "check_lambda_runtime_deprecated",
+                    region, lambda_checks.check_lambda_runtime_deprecated,
+                    writer=writer, lambda_client=clients["lambda"],
+                    cloudwatch=clients["cloudwatch"],
+                )
+
+                run_check(
+                    profiler, "check_lambda_large_packages",
+                    region, lambda_checks.check_lambda_large_packages,
+                    writer=writer, lambda_client=clients["lambda"],
+                    cloudwatch=clients["cloudwatch"],
+                    # knobs: size_threshold_mb=50
+                )
+
+                run_check(
+                    profiler, "check_lambda_old_functions",
+                    region, lambda_checks.check_lambda_old_functions,
+                    writer=writer, lambda_client=clients["lambda"], 
+                    cloudwatch=clients["cloudwatch"],
+                    # knobs: age_days=180
+                )
 
                 run_check(profiler, check_name="check_inter_region_vpc_and_tgw_peerings",
                           region=region, fn=check_inter_region_vpc_and_tgw_peerings,
