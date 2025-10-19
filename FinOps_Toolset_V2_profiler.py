@@ -172,11 +172,6 @@ from finops_toolset.config import (
     LAMBDA_LOW_TRAFFIC_THRESHOLD, LAMBDA_LARGE_PACKAGE_MB,
     LAMBDA_LOW_PROVISIONED_UTILIZATION, LAMBDA_VERSION_SPRAWL_THRESHOLD,
     VPC_LOOKBACK_DAYS, MIN_COST_THRESHOLD,
-    NAT_LOOKBACK_DAYS, NAT_IDLE_TRAFFIC_THRESHOLD_GB, NAT_IDLE_CONNECTION_THRESHOLD,
-    BIG_BUCKET_THRESHOLD_GB, STALE_DAYS_THRESHOLD, S3_MULTIPART_STALE_DAYS,
-    S3_LOOKBACK_DAYS, MAX_KEYS_TO_SCAN, S3_STORAGE_TYPES,
-    _DDB_TABLE_WORKERS, _DDB_META_WORKERS, _DDB_GSI_METRICS_LIMIT, _DDB_CW_PERIOD,
-    VALID_RETENTION_DAYS, SSM_ADV_STALE_DAYS, MAX_CUSTOM_METRICS_CHECK,
     EC2_LOOKBACK_DAYS, EC2_CW_PERIOD, EC2_IDLE_CPU_PCT, EC2_IDLE_NET_GB, EC2_IDLE_DISK_OPS,
     LOAD_BALANCER_LOOKBACK_DAYS,
 )
@@ -198,6 +193,7 @@ from aws_checkers.nat_gateways import check_nat_gateways
 from aws_checkers import ebs as ebs_checks
 from aws_checkers import kinesis as kinesis_checks
 from aws_checkers import dynamodb as ddb_checks
+from aws_checkers import s3 as s3_checks
 #endregion
 
 # Configure logging
@@ -702,736 +698,6 @@ def run_step(profiler: RunProfiler,
 
 def _region_of(client) -> str:
     return getattr(getattr(client, "meta", None), "region_name", "") or ""
-
-#endregion
-
-
-#region S3 SECTION
-
-def _cw_last_avg(cloudwatch, namespace: str, metric: str, dimensions: list[dict], start: datetime, end: datetime, period: int = 86400) -> Optional[float]:
-    try:
-        resp = cloudwatch.get_metric_statistics(
-            Namespace=namespace,
-            MetricName=metric,
-            Dimensions=dimensions,
-            StartTime=start,
-            EndTime=end,
-            Period=period,
-            Statistics=["Average"],
-        )
-        dps = sorted(resp.get("Datapoints", []), key=lambda x: x["Timestamp"])
-        if not dps:
-            return None
-        return float(dps[-1].get("Average", 0.0))
-    except ClientError as e:
-        logging.warning(f"[S3/_cw_last_avg] {namespace}/{metric} dims={dimensions} failed: {e}")
-        return None
-
-def get_bucket_metrics_via_cw(bucket_name: str, cw) -> tuple[Optional[float], Optional[int], Dict[str, float], List[str]]:
-    """
-    Returns (total_size_gb, number_of_objects, size_breakdown_gb, flags).
-    - total_size_gb: sum across common storage types (None if no datapoints).
-    - number_of_objects: CW NumberOfObjects for AllStorageTypes (None if no datapoints).
-    - size_breakdown_gb: per storage type GB we could retrieve.
-    - flags: AccessDenied/MetricsStale/SizeUnknown etc.
-    """
-    flags: list[str] = []
-    end = datetime.now(timezone.utc)
-    # Use 3 days to avoid the daily timing hole; S3 storage metrics are updated daily with a delay
-    start = end - timedelta(days=3)
-
-    # NumberOfObjects (disambiguates real empty vs “no size datapoints”)
-    obj_avg = _cw_last_avg(
-        cw,
-        "AWS/S3",
-        "NumberOfObjects",
-        [{"Name": "BucketName", "Value": bucket_name}, {"Name": "StorageType", "Value": "AllStorageTypes"}],
-        start,
-        end,
-    )
-    number_of_objects = int(obj_avg) if obj_avg is not None else None
-
-    # Sum sizes across storage classes
-    size_breakdown_gb: dict[str, float] = {}
-    total_bytes = 0.0
-    any_dp = False
-    for stype in S3_STORAGE_TYPES:
-        avg_bytes = _cw_last_avg(
-            cw,
-            "AWS/S3",
-            "BucketSizeBytes",
-            [{"Name": "BucketName", "Value": bucket_name}, {"Name": "StorageType", "Value": stype}],
-            start,
-            end,
-        )
-        if avg_bytes is not None:
-            any_dp = True
-            size_breakdown_gb[stype] = round(avg_bytes / (1024**3), 2)
-            total_bytes += avg_bytes
-
-    total_size_gb = round(total_bytes / (1024**3), 2) if any_dp else None
-
-    if not any_dp:
-        flags.append("SizeUnknown")
-    if number_of_objects is None:
-        flags.append("ObjectCountUnknown")
-
-    return total_size_gb, number_of_objects, size_breakdown_gb, flags
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def get_bucket_last_modified(s3, bucket_name: str) -> Optional[datetime]:
-    """
-    Return the most recent LastModified (UTC) across all objects in the bucket.
-
-    Defensive behavior to avoid false positives:
-      • We only return a timestamp if we have high confidence.
-      • If the listing is truncated and we did not complete the scan (hit safety cap),
-        we return None (caller will mark LastModifiedUnknown rather than StaleData).
-      • Region mismatch is retried once with a regional S3 client.
-      • AccessDenied/AllAccessDisabled/NoSuchBucket -> None.
-
-    NOTE: S3 ListObjectsV2 is lexicographically ordered by key, not by LastModified.
-          Therefore we must aggregate across the pages we actually scan. For very large
-          buckets we cap total keys scanned to bound runtime; if truncated after the cap,
-          we return None to avoid stale false positives.
-
-    Args:
-        s3: boto3 S3 client (may be global/non-regional).
-        bucket_name: target bucket.
-
-    Returns:
-        datetime (tz-aware, UTC) of the most recently modified object, or None if unknown.
-    """
-
-    PAGE_SIZE = 1000
-
-    def _scan_with_client(client) -> Optional[datetime]:
-        latest: Optional[datetime] = None
-        scanned = 0
-        truncated = False
-
-        paginator = client.get_paginator("list_objects_v2")
-        try:
-            page_iter = paginator.paginate(
-                Bucket=bucket_name,
-                PaginationConfig={"PageSize": PAGE_SIZE}
-            )
-            for page in page_iter:
-                contents = page.get("Contents") or []
-                if contents:
-                    try:
-                        page_latest = max(
-                            obj["LastModified"] for obj in contents if obj.get("LastModified")
-                        )
-                        if latest is None or page_latest > latest:
-                            latest = page_latest
-                    except Exception:
-                        pass
-                    scanned += len(contents)
-
-                truncated = bool(page.get("IsTruncated"))
-                if scanned >= MAX_KEYS_TO_SCAN:
-                    break
-            if scanned >= MAX_KEYS_TO_SCAN and truncated:
-                human_cap = f"{MAX_KEYS_TO_SCAN:,}"
-                logging.info(
-                    "[get_bucket_last_modified] %s: hit cap (%s keys) with truncated listing; "
-                    "returning None to avoid false 'stale' classification.",
-                    bucket_name, human_cap
-                )
-                return None
-
-            # If we scanned zero keys, either empty bucket or no permission -> None
-            return latest
-        except ClientError as e:
-            code = (e.response or {}).get("Error", {}).get("Code", "")
-            if code in ("AccessDenied", "AllAccessDisabled", "NoSuchBucket"):
-                logging.info("[get_bucket_last_modified] %s: %s", bucket_name, code)
-                return None
-            raise
-
-        except Exception as e:
-            logging.warning(
-                "[get_bucket_last_modified] Unexpected error on %s: %s", bucket_name, e
-            )
-            return None
-
-    # First attempt with provided client
-    try:
-        return _scan_with_client(s3)
-    except ClientError as e:
-        # Handle region mismatch (PermanentRedirect / AuthorizationHeaderMalformed / 301 / InvalidRequest)
-        if _is_wrong_region_error(e):
-            try:
-                loc = s3.get_bucket_location(Bucket=bucket_name)
-                region = _normalize_bucket_region(loc.get("LocationConstraint"))
-                try:
-                    regional = boto3.client("s3", region_name=region, config=SDK_CONFIG)
-                except Exception as ce:
-                    logging.warning(
-                        "[get_bucket_last_modified] Failed to init regional S3 client for %s: %s; "
-                        "falling back to original client.", region, ce
-                    )
-                    regional = s3
-                return _scan_with_client(regional)
-            except Exception as re:
-                logging.warning(
-                    "[get_bucket_last_modified] Regional retry failed for %s: %s",
-                    bucket_name, re
-                )
-                return None
-        else:
-            # Other client errors already handled in _scan_with_client, but just in case:
-            code = (e.response or {}).get("Error", {}).get("Code", "")
-            logging.warning("[get_bucket_last_modified] %s: %s", bucket_name, code or str(e))
-            return None
-
-
-def check_s3_buckets_refactored(
-    writer: csv.writer,
-    s3,
-    regions: Optional[Iterable[str]] = None,
-) -> None:
-    """
-    Audit all S3 buckets in the current AWS account for cost, usage, and compliance
-
-      • Enumerates buckets
-      • Caches regional CloudWatch clients to avoid re‑init overhead.
-      • Gathers object count and per‑storage‑class size from CloudWatch
-        (3‑day look‑back to avoid S3 metrics delay holes).
-      • Estimates monthly storage cost using STANDARD and STANDARD_IA rates,
-        flags when other storage classes are present.
-      • Flags buckets for common FinOps/ops conditions:
-          - MissingRequiredTags: one or more REQUIRED_TAG_KEYS absent or empty.
-          - RegionUnknown: bucket region could not be resolved.
-          - MetricsError / SizeUnknown / ObjectCountUnknown from CloudWatch.
-          - EmptyBucket or NotEmptyByObjects mismatches.
-          - CostApproximate when partial storage class pricing applied.
-          - BigBucket when size exceeds BIG_BUCKET_THRESHOLD_GB.
-
-    Args:
-        writer: Active csv.writer instance used to append findings to the
-            unified output file.
-        s3: boto3 S3 client (global, no region_name) with permissions to
-            list buckets, get locations, and read tags.
-
-    Output:
-        Writes a row to CSV for every bucket discovered, including:
-            - Bucket name, owner account ID, creation date, region
-            - Object count, total size (GB), per‑class size breakdown (for cost)
-            - Estimated monthly storage cost (or "Unknown")
-            - ApplicationID / Application / Environment tags if present
-            - List of optimisation / compliance flags
-
-    Notes:
-        • CloudWatch S3 metrics are updated once per day; allow for lag
-          when interpreting recent changes.
-        • Cost estimates exclude classes other than STANDARD and STANDARD_IA
-          unless explicitly added to PRICING.
-    """
-    try:
-        # 1) Global list of buckets (+ creation date)
-        try:
-            all_buckets = s3.list_buckets().get("Buckets", [])
-        except ClientError as e:
-            logging.error(f"[S3] list_buckets failed: {e}")
-            return
-        if not all_buckets:
-            return
-
-        bucket_created_iso: Dict[str, str] = {}
-        for b in all_buckets:
-            c = b.get("CreationDate")
-            if isinstance(c, datetime) and c.tzinfo is None:
-                c = c.replace(tzinfo=timezone.utc)
-            bucket_created_iso[b["Name"]] = (c or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
-
-        # 2) Resolve region & tags
-        def _normalize_region(loc):
-            if not loc:
-                return "us-east-1"
-            if loc == "EU":
-                return "eu-west-1"
-            return loc
-
-        def fetch_meta(bucket_entry) -> Dict[str, Any]:
-            bname = bucket_entry["Name"]
-            created = bucket_created_iso.get(bname, "")
-            region, tags = "unknown", {}
-            try:
-                loc = s3.get_bucket_location(Bucket=bname)
-                region = _normalize_region(loc.get("LocationConstraint"))
-            except Exception as e:
-                logging.info(f"[S3] get_bucket_location({bname}) -> {e}")
-            if region != "unknown":
-                try:
-                    s3r = boto3.client("s3", region_name=region, config=SDK_CONFIG)
-                except Exception:
-                    s3r = s3
-                try:
-                    tagset = s3r.get_bucket_tagging(Bucket=bname).get("TagSet", [])
-                    tags = {t["Key"]: t.get("Value", "") for t in tagset}
-                except ClientError:
-                    tags = {}
-                except Exception:
-                    tags = {}
-            return {"Name": bname, "Region": region, "CreatedISO": created, "Tags": tags}
-
-        metas: List[Dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            futs = [ex.submit(fetch_meta, b) for b in all_buckets]
-            for f in as_completed(futs):
-                try:
-                    metas.append(f.result())
-                except Exception as e:
-                    logging.warning(f"[S3] fetch_meta error: {e}")
-
-        if not metas:
-            return
-
-        region_filter = {r.strip() for r in regions} if regions else None
-
-        # 3) Group by region; write minimal rows for unknown region
-        now = datetime.now(timezone.utc)
-        lookback_days = max(2, min(S3_LOOKBACK_DAYS, 7))
-        start = now - timedelta(days=lookback_days)
-
-        region_to_buckets: Dict[str, List[str]] = {}
-        bucket_meta: Dict[str, Dict[str, Any]] = {}
-
-        for m in metas:
-            bn = m["Name"]
-            bucket_meta[bn] = m
-            if m["Region"] == "unknown":
-                flags = ["RegionUnknown"]
-                miss = [k for k in REQUIRED_TAG_KEYS if not m["Tags"].get(k)]
-                if miss:
-                    flags.append(f"MissingRequiredTags={','.join(miss)}")
-                write_resource_to_csv(
-                    writer=writer,
-                    resource_id=bn,
-                    name=bn,
-                    resource_type="S3Bucket",
-                    owner_id=ACCOUNT_ID or "",
-                    state="",
-                    creation_date=m["CreatedISO"],
-                    storage_gb="",
-                    estimated_cost="",
-                    app_id=m["Tags"].get("ApplicationID", "NULL"),
-                    app=m["Tags"].get("Application", "NULL"),
-                    env=m["Tags"].get("Environment", "NULL"),
-                    referenced_in="",
-                    flags=flags,
-                    object_count="",
-                    potential_saving=None,
-                    confidence=None,
-                    signals={"Region": "unknown"},
-                )
-                continue
-
-            if region_filter and m["Region"] not in region_filter:
-                continue
-            region_to_buckets.setdefault(m["Region"], []).append(bn)
-
-        # 4) Per-region batch metrics & emit rows
-
-        for region, buckets in region_to_buckets.items():
-            if not buckets:
-                continue
-
-            try:
-                s3r = boto3.client("s3", region_name=region, config=SDK_CONFIG)
-            except Exception:
-                s3r = s3
-
-            batch = cw.CloudWatchBatcher(region)
-            for bn in buckets:
-                batch.add(cw.MDQ(
-                    id=f"s3_size_std__{bn}",
-                    namespace="AWS/S3",
-                    metric="BucketSizeBytes",
-                    dims=[{"Name": "BucketName", "Value": bn},
-                          {"Name": "StorageType", "Value": "StandardStorage"}],
-                    stat="Average",
-                    period=86400,
-                ))
-                batch.add(cw.MDQ(
-                    id=f"s3_obj__{bn}",
-                    namespace="AWS/S3",
-                    metric="NumberOfObjects",
-                    dims=[{"Name": "BucketName", "Value": bn},
-                          {"Name": "StorageType", "Value": "AllStorageTypes"}],
-                    stat="Average",
-                    period=86400,
-                ))
-
-            series = {}
-            try:
-                series = batch.execute(start, now, scan_by="TimestampDescending")
-            except Exception as e:
-                logging.exception(f"[S3] CloudWatch batch execute failed in {region}: {e}")
-
-            for bn in buckets:
-                try:
-                    m = bucket_meta[bn]
-
-                    size_bytes = cw.CloudWatchBatcher.latest(series.get(f"s3_size_std__{bn}", []), 0.0)
-                    obj_count  = cw.CloudWatchBatcher.latest(series.get(f"s3_obj__{bn}", []), 0.0)
-
-                    size_gb = round(float(size_bytes) / (1024.0 ** 3), 3)
-                    objects = int(obj_count)
-
-                    # Last modified via helper (no regression)
-                    try:
-                        lm_dt = get_bucket_last_modified(s3r, bn)
-                    except Exception:
-                        lm_dt = None
-                    days_since_last = (now - lm_dt).days if lm_dt else None
-
-                    # Guarded deep calls (only for big/stale)
-                    has_lifecycle = False
-                    versioning_status = ""
-                    if (size_gb >= BIG_BUCKET_THRESHOLD_GB) or (days_since_last is not None and days_since_last >= STALE_DAYS_THRESHOLD):
-                        try:
-                            s3r.get_bucket_lifecycle_configuration(Bucket=bn)
-                            has_lifecycle = True
-                        except Exception:
-                            has_lifecycle = False
-                        try:
-                            v = s3r.get_bucket_versioning(Bucket=bn) or {}
-                            versioning_status = (v.get("Status") or "").upper()
-                        except Exception:
-                            versioning_status = ""
-
-                    # Flags (keep legacy strings)
-                    flags: List[str] = []
-                    missing = [k for k in REQUIRED_TAG_KEYS if not m["Tags"].get(k)]
-                    if missing:
-                        flags.append(f"MissingRequiredTags={','.join(missing)}")
-
-                    if size_gb == 0.0 and objects == 0:
-                        flags += ["emptybucket", "confidence=100", "safedelete"]
-
-                    if days_since_last is None:
-                        flags.append("LastModifiedUnknown")
-                    elif days_since_last >= STALE_DAYS_THRESHOLD:
-                        flags.append(f"stale_data>{STALE_DAYS_THRESHOLD}d")
-
-                    if not has_lifecycle and size_gb >= BIG_BUCKET_THRESHOLD_GB:
-                        flags.append("nolifecycle_for_big_bucket")
-                    if not has_lifecycle and (days_since_last or 0) >= 90:
-                        flags.append("lifecycle_to_ia_recommended")
-                    if versioning_status == "ENABLED" and not has_lifecycle and size_gb >= (BIG_BUCKET_THRESHOLD_GB / 2):
-                        flags.append("versioning_wo_noncurrent_expiration")
-
-                    # Pricing (conservative: STANDARD only)
-                    s3_std_gb_month = get_price("S3", "STANDARD_GB_MONTH")
-                    est_cost = round(size_gb * s3_std_gb_month, 2)
-
-                    potential_saving = None
-                    if "lifecycle_to_ia_recommended" in flags:
-                        try:
-                            s3_ia_gb_month = get_price("S3", "STANDARD_IA_GB_MONTH")
-                            delta = max(0.0, s3_std_gb_month - s3_ia_gb_month)
-                            potential_saving = round(size_gb * delta * 0.7, 2)  # assume 70% moves to IA
-                        except Exception:
-                            potential_saving = None
-
-                    signals = {
-                        "Region": region,
-                        "DaysSinceLastModified": (str(days_since_last) if days_since_last is not None else ""),
-                        "Versioning": versioning_status or "",
-                        "HasLifecycle": str(bool(has_lifecycle)).lower(),
-                    }
-
-                    write_resource_to_csv(
-                        writer=writer,
-                        resource_id=bn,
-                        name=bn,
-                        resource_type="S3Bucket",
-                        owner_id=ACCOUNT_ID or "",
-                        state="",
-                        creation_date=m["CreatedISO"],
-                        storage_gb=size_gb,
-                        estimated_cost=est_cost,
-                        app_id=m["Tags"].get("ApplicationID", "NULL"),
-                        app=m["Tags"].get("Application", "NULL"),
-                        env=m["Tags"].get("Environment", "NULL"),
-                        referenced_in="",
-                        flags=flags,
-                        object_count=objects,
-                        potential_saving=potential_saving,
-                        confidence=None,
-                        signals=signals,
-                    )
-                except Exception as e:
-                    logging.exception(f"[S3] bucket emit failed for {bn} in {region}: {e}")
-
-    except Exception as e:
-        logging.exception(f"[S3] check_s3_buckets_refactored failed: {e}")
-        return
-
-
-def _is_wrong_region_error(e: ClientError) -> bool:
-    code = (e.response or {}).get("Error", {}).get("Code", "")
-    return code in ("PermanentRedirect", "AuthorizationHeaderMalformed", "301", "InvalidRequest")
-
-
-def _normalize_bucket_region(raw: Optional[str]) -> str:
-    # S3 quirks: None => us-east-1, "EU" => eu-west-1
-    if not raw:
-        return "us-east-1"
-    if raw == "EU":
-        return "eu-west-1"
-    return raw
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_s3_abandoned_multipart_uploads(writer: csv.writer, s3) -> None:
-    """
-    Fast, global MPU scan:
-      • Try global list_multipart_uploads first; only resolve region on 301/redirect.
-      • Per-upload, fetch only the FIRST page of parts (MaxParts=1000) by default.
-        - Exact if <=1000 parts; otherwise lower bound with 'CostLowerBound' flag.
-      • Parallel across buckets, with modest per-bucket concurrency.
-      • Keeps CSV schema/flags.
-    """
-    try:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=S3_MULTIPART_STALE_DAYS)
-        buckets = s3.list_buckets().get("Buckets", []) or []
-        if not buckets:
-            return
-
-        findings_count: int = 0
-        findings_lock = threading.Lock()
-
-        # Small caches for region-aware retries (used only on redirects)
-        s3_client_by_region: Dict[str, Any] = {}
-
-        def get_s3_client_for_region(region: str) -> Any:
-            cli = s3_client_by_region.get(region)
-            if cli is None:
-                try:
-                    cli = boto3.client("s3", region_name=region, config=SDK_CONFIG)
-                except Exception as e:
-                    logging.warning(f"[S3 MPU] init regional client {region} failed: {e}; fallback to global")
-                    cli = s3
-                s3_client_by_region[region] = cli
-            return cli
-
-        def list_stale_uploads_for_bucket(bname: str) -> List[Dict[str, Any]]:
-            """
-            List stale MPUs for a bucket with the global client first; if we hit a
-            region error, resolve region and retry with a regional client.
-            """
-            stale: List[Dict[str, Any]] = []
-
-            def _list_with(client) -> List[Dict[str, Any]]:
-                out: List[Dict[str, Any]] = []
-                paginator = client.get_paginator("list_multipart_uploads")
-                for page in paginator.paginate(
-                    Bucket=bname, PaginationConfig={"PageSize": _S3_MPU_PAGE_SIZE}
-                ):
-                    uploads = page.get("Uploads", []) or []
-                    if not uploads:
-                        continue
-                    for up in uploads:
-                        initiated = up.get("Initiated")
-                        if initiated and initiated < cutoff:
-                            out.append({
-                                "Key": up.get("Key", ""),
-                                "UploadId": up.get("UploadId", ""),
-                                "Initiated": initiated
-                            })
-                return out
-
-            try:
-                stale = _list_with(s3)
-                return stale
-            except ClientError as e:
-                if _is_wrong_region_error(e):
-                    # Resolve region only when necessary
-                    try:
-                        loc = s3.get_bucket_location(Bucket=bname)
-                        region = _normalize_bucket_region(loc.get("LocationConstraint"))
-                        s3r = get_s3_client_for_region(region)
-                        stale = _list_with(s3r)
-                        return stale
-                    except Exception as e2:
-                        logging.warning(f"[S3 MPU] regional retry failed for {bname}: {e2}")
-                        return []
-                else:
-                    code = e.response.get("Error", {}).get("Code")
-                    if code in ("AccessDenied", "AllAccessDisabled", "NoSuchBucket"):
-                        logging.info(f"[S3 MPU] Skipping {bname}: {code}")
-                        return []
-                    logging.warning(f"[S3 MPU] list_multipart_uploads failed for {bname}: {e}")
-                    return []
-            except Exception as e:
-                logging.warning(f"[S3 MPU] {bname} unexpected list_multipart_uploads error: {e}")
-                return []
-
-        def parts_first_page_size(s3_client, bname: str, key: str, upload_id: str) -> Tuple[float, bool]:
-            """
-            Return (bytes_sum_first_page, is_truncated) using a single call.
-            """
-            try:
-                resp = s3_client.list_parts(Bucket=bname, Key=key, UploadId=upload_id, MaxParts=1000)
-                parts = resp.get("Parts", []) or []
-                total_bytes = float(sum(int(p.get("Size", 0) or 0) for p in parts))
-                is_trunc = bool(resp.get("IsTruncated"))
-                return total_bytes, is_trunc
-            except ClientError as e:
-                logging.warning(f"[S3 MPU] list_parts first page failed for {bname}/{key}#{upload_id}: {e}")
-                return 0.0, False
-            except Exception as e:
-                logging.warning(f"[S3 MPU] list_parts first page unexpected for {bname}/{key}#{upload_id}: {e}")
-                return 0.0, False
-
-        def process_bucket(bucket_entry: Dict[str, Any]) -> List[Dict[str, Any]]:
-            """
-            Process one bucket: get stale uploads, then estimate bytes with one
-            list_parts call per upload (first page). Returns rows to write.
-            """
-            nonlocal findings_count
-            bname = bucket_entry.get("Name", "")
-            if not bname:
-                return []
-
-            with findings_lock:
-                if findings_count >= _S3_MPU_GLOBAL_FINDINGS_CAP:
-                    return []
-
-            # 1) List stale uploads
-            stale_uploads = list_stale_uploads_for_bucket(bname)
-            if not stale_uploads:
-                return []
-
-            # If we had to switch to regional client, re-use it for parts; else use global
-            s3_for_parts = s3
-            # Try to detect the client we used: if global worked, keep using it.
-            # If we need a regional client, list_stale_uploads_for_bucket already fetched region once.
-
-            # 2) Fetch a single parts page per upload (fast path)
-            rows_local: List[Dict[str, Any]] = []
-
-            def do_one(upd: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-                key = upd.get("Key") or ""
-                upload_id = upd.get("UploadId") or ""
-                initiated = upd.get("Initiated")
-                if not key or not upload_id:
-                    return None
-
-                # Try global first; on region error, find region once for parts
-                client_used = s3_for_parts
-                bytes_first = 0.0
-                is_trunc = False
-                try:
-                    bytes_first, is_trunc = parts_first_page_size(client_used, bname, key, upload_id)
-                except Exception:
-                    pass  # handled in helper
-
-                if bytes_first == 0.0 and _S3_MPU_PARTS_MODE == "first_page":
-                    # Maybe region needed — resolve and retry once
-                    try:
-                        loc = s3.get_bucket_location(Bucket=bname)
-                        region = _normalize_bucket_region(loc.get("LocationConstraint"))
-                        client_used = get_s3_client_for_region(region)
-                        bytes_first, is_trunc = parts_first_page_size(client_used, bname, key, upload_id)
-                    except Exception as e:
-                        logging.debug(f"[S3 MPU] parts region retry skipped for {bname}/{key}: {e}")
-
-                # If someone prefers exact sizes at the cost of time:
-                if _S3_MPU_PARTS_MODE == "full" and is_trunc:
-                    # Fallback to full pagination ONLY when requested
-                    try:
-                        total = bytes_first
-                        paginator = client_used.get_paginator("list_parts")
-                        for ppage in paginator.paginate(Bucket=bname, Key=key, UploadId=upload_id,
-                                                        PaginationConfig={"PageSize": 1000}):
-                            if "Parts" in ppage:
-                                total = float(sum(int(p.get("Size", 0) or 0) for p in ppage["Parts"]))
-                        bytes_first = total
-                        is_trunc = False
-                    except Exception as e:
-                        logging.warning(f"[S3 MPU] full parts scan failed for {bname}/{key}: {e}")
-
-                gb = round(bytes_first / (1024.0 ** 3), 2)
-                est_cost = round(gb * get_price("S3", "STANDARD_GB_MONTH"), 2)
-
-                flags: List[str] = [
-                    "AbandonedMultipart>{}d".format(S3_MULTIPART_STALE_DAYS),
-                    "Key={}".format(key),
-                    "ConsiderAbortMultipartUploads",
-                ]
-                if _S3_MPU_PARTS_MODE == "first_page" and is_trunc:
-                    flags.append("CostLowerBound")  # We saw only first 1000 parts
-
-                # Keep numeric column populated; mark lower-bound if applicable
-                if est_cost > 0:
-                    flags.append("PotentialSaving={}$".format(est_cost))
-                else:
-                    flags.append("PotentialSaving≈Low")
-
-                return {
-                    "resource_id": "{}/{}#{}".format(bname, key, upload_id),
-                    "name": bname,
-                    "resource_type": "S3MultipartUpload",
-                    "creation_date": initiated.isoformat() if hasattr(initiated, "isoformat") else "",
-                    "storage_gb": gb,
-                    "estimated_cost": est_cost,
-                    "flags": flags
-                }
-
-            with ThreadPoolExecutor(max_workers=_S3_MPU_PART_WORKERS) as pool:
-                futs = [pool.submit(do_one, u) for u in stale_uploads]
-                for f in as_completed(futs):
-                    row = f.result()
-                    if row:
-                        rows_local.append(row)
-
-            # Apply global cap
-            with findings_lock:
-                if findings_count >= _S3_MPU_GLOBAL_FINDINGS_CAP:
-                    return []
-                allowed = _S3_MPU_GLOBAL_FINDINGS_CAP - findings_count
-                if allowed <= 0:
-                    return []
-                if len(rows_local) > allowed:
-                    rows_local = rows_local[:allowed]
-                findings_count += len(rows_local)
-
-            return rows_local
-
-        all_rows: List[Dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=_S3_MPU_BUCKET_WORKERS) as pool:
-            futs = [pool.submit(process_bucket, b) for b in buckets]
-            for f in as_completed(futs):
-                rows = f.result()
-                if rows:
-                    all_rows.extend(rows)
-                with findings_lock:
-                    if findings_count >= _S3_MPU_GLOBAL_FINDINGS_CAP:
-                        break
-
-        for r in all_rows:
-            write_resource_to_csv(
-                writer=writer,
-                resource_id=r["resource_id"],
-                name=r["name"],
-                owner_id=ACCOUNT_ID,
-                resource_type=r["resource_type"],
-                creation_date=r["creation_date"],
-                storage_gb=r["storage_gb"],
-                estimated_cost=r["estimated_cost"],
-                flags=r["flags"],
-            )
-
-    except ClientError as e:
-        logging.error(f"[check_s3_abandoned_multipart_uploads] {e}")
-    except Exception as e:
-        logging.error(f"[check_s3_abandoned_multipart_uploads] fatal: {e}")
 
 #endregion
 
@@ -3606,26 +2872,87 @@ def main():
             # -------- Global / cross-region steps first
             try:
                 s3_global = boto3.client("s3", config=SDK_CONFIG)
+                cloudwatch_global = boto3.client("cloudwatch", config=SDK_CONFIG)
                 cloudfront_global = boto3.client("cloudfront", config=SDK_CONFIG)
+                region="GLOBAL"
             except Exception as e:
                 logging.error(f"[main] Failed to create global S3 client: {e}")
                 s3_global = boto3.client("s3")  # fallback
                 cloudfront_global = boto3.client("cloudfront")
+                cloudwatch_global = boto3.client("cloudwatch")
 
-            # S3 buckets (global)
-            run_check(profiler,
-                      check_name="check_s3_buckets_refactored",
-                      region="GLOBAL",
-                      fn=check_s3_buckets_refactored,
-                      writer=writer,
-                      s3=s3_global)
 
-            run_check(profiler,
-                    check_name="check_s3_abandoned_multipart_uploads",
-                    region="GLOBAL",
-                    fn=check_s3_abandoned_multipart_uploads,
-                    writer=writer,
-                    s3=s3_global)
+            run_check(
+                profiler,
+                "check_s3_public_buckets",
+                region,
+                s3_checks.check_s3_public_buckets,
+                writer=writer,
+                s3=s3_global,
+                cloudwatch=cloudwatch_global,
+            )
+
+            run_check(
+                profiler,
+                "check_s3_buckets_without_default_encryption",
+                region,
+                s3_checks.check_s3_buckets_without_default_encryption,
+                writer=writer,
+                s3=s3_global,
+                cloudwatch=cloudwatch_global,
+            )
+
+            run_check(
+                profiler,
+                "check_s3_versioned_without_lifecycle",
+                region,
+                s3_checks.check_s3_versioned_without_lifecycle,
+                writer=writer,
+                s3=s3_global,
+                cloudwatch=cloudwatch_global,
+            )
+
+            run_check(
+                profiler,
+                "check_s3_buckets_without_lifecycle",
+                region,
+                s3_checks.check_s3_buckets_without_lifecycle,
+                writer=writer,
+                s3=s3_global,
+                cloudwatch=cloudwatch_global,
+            )
+
+            run_check(
+                profiler,
+                "check_s3_empty_buckets",
+                region,
+                s3_checks.check_s3_empty_buckets,
+                writer=writer,
+                s3=s3_global,
+                cloudwatch=cloudwatch_global,
+            )
+
+            run_check(
+                profiler,
+                "check_s3_ia_tiering_candidates",
+                region,
+                s3_checks.check_s3_ia_tiering_candidates,
+                writer=writer,
+                s3=s3_global,
+                cloudwatch=cloudwatch_global,
+                # knobs: lookback_days=30, min_standard_gb=50, request_threshold=1000
+            )
+
+            run_check(
+                profiler,
+                "check_s3_stale_multipart_uploads",
+                region,
+                s3_checks.check_s3_stale_multipart_uploads,
+                writer=writer,
+                s3=s3_global,
+                cloudwatch=cloudwatch_global,
+                # knobs: stale_days=7
+            )
 
             run_check(
                 profiler=profiler,

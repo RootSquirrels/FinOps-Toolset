@@ -41,9 +41,14 @@ PRICING: PriceMap = {
     },
 
     "S3": {
-        "STANDARD_GB_MONTH": 0.019,
+        "STANDARD_GB_MONTH": 0.023,
         "STANDARD_IA_GB_MONTH": 0.0125,
-        "GLACIER_GB_MONTH": 0.004,
+        "ONEZONE_IA_GB_MONTH": 0.01,
+        "GLACIER_IR_GB_MONTH": 0.004,
+        "GLACIER_GB_MONTH": 0.0036,
+        "GLACIER_DEEP_GB_MONTH": 0.00099,
+        # Optional request-cost modelling if you ever want it:
+        # "PUT_1K": 0.005, "GET_1K": 0.0004,
     },
 
     "EFS": {
