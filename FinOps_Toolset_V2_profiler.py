@@ -147,20 +147,17 @@ Usage
 import boto3 # type: ignore
 import csv
 import os
-import time
 import logging
 from typing import Dict, Iterable, Optional, List, Tuple, Union, Callable, Any, TypeVar, Set, Type
 from datetime import datetime, timezone, timedelta
 import json
-from botocore.exceptions import ClientError, EndpointConnectionError, NoCredentialsError # type: ignore
+from botocore.exceptions import ClientError # type: ignore
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from botocore.config import Config # type: ignore
 from dataclasses import dataclass, field
 from statistics import fmean
 from enum import Enum
 import string
 import re
-from contextlib import contextmanager
 from time import perf_counter
 import threading
 #from correlator import build_certificate_graph, summarize_cert_usage
@@ -190,7 +187,7 @@ from finops_toolset.config import (
 
 from finops_toolset.pricing import PRICING as PRICING, get_price as get_price
 import core.cloudwatch as cw
-import checkers.eip as eip
+import aws_checkers.eip as eip
 from core.retry import retry_with_backoff
 
 #endregion

@@ -2,7 +2,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Iterable, Tuple, Optional, Union, Any
+import time
+from typing import Dict, List, Tuple, Union, Any
 
 import boto3 #type: ignore
 from botocore.config import Config #type: ignore
@@ -21,12 +22,11 @@ def _aws_call(fn, *args, **kwargs):
         except ClientError as e:
             code = (e.response or {}).get("Error", {}).get("Code", "")
             if code in {"Throttling","ThrottlingException","RequestLimitExceeded"} or code.startswith("5"):
-                import time
+
                 time.sleep(min(2 ** attempt, 8))
                 continue
             raise
         except Exception:
-            import time
             time.sleep(min(2 ** attempt, 8))
     raise RuntimeError("AWS call failed after retries")
 
