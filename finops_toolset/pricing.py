@@ -185,6 +185,11 @@ PRICING: PriceMap = {
         "BACKUP_WARM_GB_MONTH": 0.05,
         "BACKUP_COLD_GB_MONTH": 0.01,
     },
+    "CloudFront": {
+        "REQUESTS_1M": 0.6,
+        "DATA_OUT_GB": 0.085,
+
+    }
 }
 
 # --------------------------------------------------------------------------------------

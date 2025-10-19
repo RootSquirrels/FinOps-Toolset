@@ -43,15 +43,6 @@ def _to_utc_iso(dt_obj: Optional[datetime]) -> Optional[str]:
         dt_obj = dt_obj.astimezone(timezone.utc)
     return dt_obj.replace(microsecond=0).isoformat()
 
-
-def _safe_price(service: str, key: str) -> float:
-    try:
-        # type: ignore[arg-type]
-        return float(config.GET_PRICE(service, key))  # pylint: disable=not-callable
-    except Exception:  # pylint: disable=broad-except
-        return 0.0
-
-
 def _have_config() -> bool:
     return bool(config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE)
 
@@ -268,8 +259,8 @@ def check_backup_stale_recovery_points(  # pylint: disable=unused-argument
     region = getattr(getattr(backup, "meta", None), "region_name", "") or ""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=stale_days)).replace(microsecond=0)
 
-    price_warm = _safe_price("AWSBackup", "BACKUP_WARM_GB_MONTH")
-    price_cold = _safe_price("AWSBackup", "BACKUP_COLD_GB_MONTH")
+    price_warm = config.safe_price("AWSBackup", "BACKUP_WARM_GB_MONTH")
+    price_cold = config.safe_price("AWSBackup", "BACKUP_COLD_GB_MONTH")
 
     try:
         # enumerate vaults

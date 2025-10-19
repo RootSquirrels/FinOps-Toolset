@@ -3,6 +3,7 @@
 from __future__ import annotations
 from typing import Callable, Optional
 import logging
+from decimal import Decimal
 
 ACCOUNT_ID: Optional[str] = None
 WRITE_ROW: Optional[Callable[..., None]] = None
@@ -24,3 +25,28 @@ def setup(
     WRITE_ROW = write_row
     GET_PRICE = get_price
     LOGGER = logger or logging.getLogger("aws_checkers")
+
+
+def safe_price(service: str, key: str, default: float = 0.0) -> float:
+    """
+    Best-effort price lookup from your pricebook.
+
+    Returns:
+        The numeric price for (service, key), or `default` if GET_PRICE is not
+        configured or lookup/parsing fails.
+    """
+    try:
+        if GET_PRICE is None:
+            return float(default)
+        value = GET_PRICE(service, key)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, Decimal):
+            return float(value)
+        # handle string-y numbers
+        return float(value)  # type: ignore[arg-type]
+    except Exception:  # pylint: disable=broad-except
+        # Keep this quiet in normal runs; useful debug if a key is missing.
+        if LOGGER:
+            LOGGER.debug("safe_price fallback for %s.%s", service, key)
+        return float(default)

@@ -44,15 +44,6 @@ def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
 
 
-def _safe_price(service: str, key: str) -> float:
-    """Best-effort price lookup; falls back to 0.0 if the key is absent/invalid."""
-    try:
-        # type: ignore[arg-type] because config.GET_PRICE is provided at runtime
-        return float(config.GET_PRICE(service, key))  # pylint: disable=not-callable
-    except Exception:  # pylint: disable=broad-except
-        return 0.0
-
-
 def _to_utc(dt_obj: datetime) -> datetime:
     """Return a timezone-aware UTC datetime for comparison."""
     if dt_obj.tzinfo is None:
@@ -91,7 +82,7 @@ def check_ssm_plaintext_parameters(  # pylint: disable=unused-argument
                         name=name,
                         owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                         resource_type="SSMParameter",
-                        estimated_cost=_safe_price("SSMParameter", "PLAINTEXT_MONTH"),
+                        estimated_cost=config.safe_price("SSMParameter", "PLAINTEXT_MONTH"),
                         flags=["SSMParameterPlaintext"],
                         confidence=100,
                     )
@@ -146,7 +137,7 @@ def check_ssm_stale_parameters(  # pylint: disable=unused-argument
                         name=name,
                         owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                         resource_type="SSMParameter",
-                        estimated_cost=_safe_price("SSMParameter", "STALE_MONTH"),
+                        estimated_cost=config.safe_price("SSMParameter", "STALE_MONTH"),
                         flags=[f"SSMParameterStale{stale_days}d"],
                         confidence=100,
                     )
@@ -233,10 +224,10 @@ def check_ssm_maintenance_windows_gaps(  # pylint: disable=unused-argument
                     est_cost = 0.0
                     if missing_targets:
                         flags.append("MaintenanceWindowNoTargets")
-                        est_cost += _safe_price("SSMMaintenanceWindow", "NO_TARGETS_MONTH")
+                        est_cost += config.safe_price("SSMMaintenanceWindow", "NO_TARGETS_MONTH")
                     if missing_tasks:
                         flags.append("MaintenanceWindowNoTasks")
-                        est_cost += _safe_price("SSMMaintenanceWindow", "NO_TASKS_MONTH")
+                        est_cost += config.safe_price("SSMMaintenanceWindow", "NO_TASKS_MONTH")
 
                     # type: ignore[call-arg]
                     config.WRITE_ROW(
@@ -258,7 +249,7 @@ def check_ssm_maintenance_windows_gaps(  # pylint: disable=unused-argument
                             name=name,
                             owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                             resource_type="SSMMaintenanceWindow",
-                            estimated_cost=_safe_price("SSMMaintenanceWindow", "NO_TARGETS_MONTH"),
+                            estimated_cost=config.safe_price("SSMMaintenanceWindow", "NO_TARGETS_MONTH"),
                             flags=["MaintenanceWindowNoTargets"],
                             confidence=100,
                         )
@@ -270,7 +261,7 @@ def check_ssm_maintenance_windows_gaps(  # pylint: disable=unused-argument
                             name=name,
                             owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                             resource_type="SSMMaintenanceWindow",
-                            estimated_cost=_safe_price("SSMMaintenanceWindow", "NO_TASKS_MONTH"),
+                            estimated_cost=config.safe_price("SSMMaintenanceWindow", "NO_TASKS_MONTH"),
                             flags=["MaintenanceWindowNoTasks"],
                             confidence=100,
                         )

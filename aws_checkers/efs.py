@@ -13,8 +13,8 @@ Design:
       cw = CloudWatchBatcher(region=..., client=...)
       cw.add_q(id_hint=..., namespace=..., metric=..., dims=[(..., ...)], stat=..., period=...)
       results = cw.execute(start=..., end=...)
-  - No return value (legacy behavior).
-  - Retries handled by @retry_with_backoff on ClientError.
+  - Retries handled by @retry_with_backoff on ClientError, but individual AWS calls
+    are guarded so a single failure won't fail the whole check.
   - Logging uses lazy %s interpolation (pylint-friendly).
   - Time handling is timezone-aware (datetime.now(timezone.utc)).
 """
@@ -34,25 +34,8 @@ from core.cloudwatch import CloudWatchBatcher
 
 # ----------------------------- helpers --------------------------------- #
 
-def _require_config() -> None:
-    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        raise RuntimeError(
-            "Checkers not configured. Call "
-            "finops_toolset.checkers.config.setup(account_id=..., write_row=..., "
-            "get_price=..., logger=...) first."
-        )
-
-
 def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
-
-
-def _safe_price(service: str, key: str) -> float:
-    try:
-        # type: ignore[arg-type]
-        return float(config.GET_PRICE(service, key))  # pylint: disable=not-callable
-    except Exception:  # pylint: disable=broad-except
-        return 0.0
 
 
 def _signals_str(pairs: Dict[str, object]) -> str:
@@ -94,10 +77,9 @@ def _sum_from_result(res: Any) -> float:
     """Reduce CloudWatchBatcher result → sum of values."""
     if res is None:
         return 0.0
-    # Batcher returns List[Tuple[datetime, float]]
     if isinstance(res, list) and res and isinstance(res[0], tuple):
         try:
-            return float(sum(float(v) for _, v in res))  # type: ignore[misc]
+            return float(sum(float(v) for _, v in res))
         except Exception:  # pylint: disable=broad-except
             return 0.0
     if isinstance(res, dict):
@@ -131,10 +113,9 @@ def _max_from_result(res: Any) -> float:
     """Reduce CloudWatchBatcher result → max value."""
     if res is None:
         return 0.0
-    # Batcher returns List[Tuple[datetime, float]]
     if isinstance(res, list) and res and isinstance(res[0], tuple):
         try:
-            return float(max(float(v) for _, v in res))  # type: ignore[misc]
+            return float(max(float(v) for _, v in res))
         except Exception:  # pylint: disable=broad-except
             return 0.0
     if isinstance(res, dict):
@@ -164,25 +145,26 @@ def _max_from_result(res: Any) -> float:
     return 0.0
 
 
-def _name_tag(efs, fs_id: str) -> Optional[str]:
+def _name_tag(efs, fs_id: str, log: logging.Logger) -> Optional[str]:
     try:
         resp = efs.describe_tags(FileSystemId=fs_id)
         for t in resp.get("Tags", []) or []:
             if t.get("Key") == "Name":
                 return t.get("Value")
-    except ClientError:
-        return None
+    except ClientError as exc:
+        log.debug("[efs name tag] describe_tags failed for %s: %s", fs_id, exc)
     return None
 
 
-def _mount_target_count(efs, fs_id: str) -> int:
+def _mount_target_count(efs, fs_id: str, log: logging.Logger) -> int:
     try:
         paginator = efs.get_paginator("describe_mount_targets")
         total = 0
         for page in paginator.paginate(FileSystemId=fs_id):
             total += len(page.get("MountTargets", []) or [])
         return total
-    except ClientError:
+    except ClientError as exc:
+        log.debug("[efs mt count] describe_mount_targets failed for %s: %s", fs_id, exc)
         return 0
 
 
@@ -200,70 +182,88 @@ def check_unused_efs_filesystems(  # pylint: disable=unused-argument
     Flag EFS file systems 'unused' across [now - lookback_days, now]:
       - Sum(TotalIOBytes) <= io_threshold_bytes  AND
       - Max(ClientConnections) == 0
+
+    If CloudWatch metrics are unavailable, we do NOT set UnusedEFS to avoid
+    false positives, but we still emit other safe flags (e.g., EFSMountTargetsZero).
     """
-    _require_config()
-    log = _logger(logger)
+    log = _logger(kwargs.get("logger") or logger)
 
-    writer, efs, cloudwatch = _extract_writer_efs_cw(args, kwargs)
+    try:
+        writer, efs, cloudwatch = _extract_writer_efs_cw(args, kwargs)
+    except TypeError as exc:
+        log.warning("[check_unused_efs_filesystems] Skipping: %s", exc)
+        return
 
+    # Region / window
     region = getattr(getattr(efs, "meta", None), "region_name", "") or ""
     now_utc = datetime.now(timezone.utc).replace(microsecond=0)
     start_time = now_utc - timedelta(days=lookback_days)
     period = 3600  # 1 hour buckets
 
-    # Prepare CloudWatch batcher — ctor takes region and client
-    cw_batch = CloudWatchBatcher(region=region, client=cloudwatch)
-
-    # Collect file systems
+    # Collect file systems (guarded)
     fs_list: List[Dict[str, Any]] = []
-    fs_paginator = efs.get_paginator("describe_file_systems")
-    for page in fs_paginator.paginate():
-        fs_list.extend(page.get("FileSystems", []) or [])
+    try:
+        fs_paginator = efs.get_paginator("describe_file_systems")
+        for page in fs_paginator.paginate():
+            fs_list.extend(page.get("FileSystems", []) or [])
+    except ClientError as exc:
+        log.error("[check_unused_efs_filesystems] describe_file_systems failed: %s", exc)
+        # Don't raise — skip this region gracefully
+        return
 
-    # Map fs_id -> metric query ids (the exact Id strings we pass to add_q)
+    # Prepare CloudWatch batcher and queue queries (guarded)
+    cw_results: Dict[str, Any] = {}
     metric_ids: Dict[str, Dict[str, str]] = {}
+    metrics_available = True
+    try:
+        cw_batch = CloudWatchBatcher(region=region, client=cloudwatch)
 
-    for fs in fs_list:
-        fs_id = fs.get("FileSystemId")
-        if not fs_id:
-            continue
+        for fs in fs_list:
+            fs_id = fs.get("FileSystemId")
+            if not fs_id:
+                continue
 
-        total_id = f"totalio_{fs_id}"
-        conn_id = f"conn_{fs_id}"
+            total_id = f"totalio_{fs_id}"
+            conn_id = f"conn_{fs_id}"
 
-        # add_q requires keyword-only args
-        cw_batch.add_q(
-            id_hint=total_id,
-            namespace="AWS/EFS",
-            metric="TotalIOBytes",
-            dims=[("FileSystemId", fs_id)],
-            stat="Sum",
-            period=period,
-        )
-        cw_batch.add_q(
-            id_hint=conn_id,
-            namespace="AWS/EFS",
-            metric="ClientConnections",
-            dims=[("FileSystemId", fs_id)],
-            stat="Maximum",
-            period=period,
-        )
+            cw_batch.add_q(
+                id_hint=total_id,
+                namespace="AWS/EFS",
+                metric="TotalIOBytes",
+                dims=[("FileSystemId", fs_id)],
+                stat="Sum",
+                period=period,
+            )
+            cw_batch.add_q(
+                id_hint=conn_id,
+                namespace="AWS/EFS",
+                metric="ClientConnections",
+                dims=[("FileSystemId", fs_id)],
+                stat="Maximum",
+                period=period,
+            )
+            metric_ids[fs_id] = {"total": total_id, "conn": conn_id}
 
-        metric_ids[fs_id] = {"total": total_id, "conn": conn_id}
-
-    # Execute batched queries with the time window (API uses 'start'/'end')
-    results: Dict[str, Any] = cw_batch.execute(start=start_time, end=now_utc)
+        # Execute; if this fails, we continue without metrics
+        cw_results = cw_batch.execute(start=start_time, end=now_utc)
+    except ClientError as exc:
+        log.warning("[check_unused_efs_filesystems] CloudWatch metrics unavailable: %s", exc)
+        metrics_available = False
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning("[check_unused_efs_filesystems] CloudWatch batch error: %s", exc)
+        metrics_available = False
 
     # Pricing per GB-month (fallbacks to 0.0 if not present in pricebook)
-    price_std = _safe_price("EFS", "EFS_STANDARD_GB_MONTH")
-    price_ia = _safe_price("EFS", "EFS_IA_GB_MONTH")
+    price_std = config.safe_price("EFS", "EFS_STANDARD_GB_MONTH", default=0.0)
+    price_ia = config.safe_price("EFS", "EFS_IA_GB_MONTH", default=0.0)
 
+    # Emit rows
     for fs in fs_list:
         fs_id = fs.get("FileSystemId")
         if not fs_id:
             continue
 
-        name = _name_tag(efs, fs_id) or fs.get("Name") or fs_id
+        name = _name_tag(efs, fs_id, log) or fs.get("Name") or fs_id
         life = fs.get("LifeCycleState")
         perf_mode = fs.get("PerformanceMode")
         tp_mode = fs.get("ThroughputMode")
@@ -282,28 +282,40 @@ def check_unused_efs_filesystems(  # pylint: disable=unused-argument
         est_cost = gb_std * price_std + gb_ia * price_ia
 
         # Mount targets (best-effort)
-        mt_count = _mount_target_count(efs, fs_id)
+        mt_count = _mount_target_count(efs, fs_id, log)
 
-        # Reduce metrics
-        ids = metric_ids.get(fs_id, {})
-        total_series = results.get(ids.get("total"))
-        conn_series = results.get(ids.get("conn"))
-        total_io_sum = _sum_from_result(total_series)
-        max_conn = _max_from_result(conn_series)
+        # Metrics
+        total_io_sum = 0.0
+        max_conn = 0.0
+        if metrics_available:
+            ids = metric_ids.get(fs_id, {})
+            total_series = cw_results.get(ids.get("total"))
+            conn_series = cw_results.get(ids.get("conn"))
+            total_io_sum = _sum_from_result(total_series)
+            max_conn = _max_from_result(conn_series)
 
-        unused = (total_io_sum <= float(io_threshold_bytes)) and (max_conn <= 0.0)
+        # Only mark UnusedEFS when metrics were available and indicate inactivity
+        unused = metrics_available and (total_io_sum <= float(io_threshold_bytes)) and (max_conn <= 0.0)
 
-        # Potential savings heuristic
         potential_saving = est_cost if unused else 0.0
 
-        # Flags
         flags: List[str] = []
         if unused:
             flags.append("UnusedEFS")
         if mt_count == 0:
             flags.append("EFSMountTargetsZero")
 
-        # Signals
+        if not flags:
+            log.info(
+                "[check_unused_efs_filesystems] Processed EFS: %s (metrics_avail=%s io_sum=%s max_conn=%s mt=%s)",
+                fs_id,
+                metrics_available,
+                int(total_io_sum),
+                int(max_conn),
+                mt_count,
+            )
+            continue
+
         signals = _signals_str(
             {
                 "Region": region,
@@ -321,10 +333,11 @@ def check_unused_efs_filesystems(  # pylint: disable=unused-argument
                 "TotalIOBytesSum": int(total_io_sum),
                 "MaxClientConnections": int(max_conn),
                 "LookbackDays": lookback_days,
+                "MetricsAvailable": metrics_available,
             }
         )
 
-        if flags:
+        try:
             # type: ignore[call-arg]
             config.WRITE_ROW(
                 writer=writer,
@@ -338,12 +351,14 @@ def check_unused_efs_filesystems(  # pylint: disable=unused-argument
                 confidence=100,
                 signals=signals,
             )
+        except Exception as exc:  # pylint: disable=broad-except
+            # Never let a bad row writer crash the check
+            log.warning("[check_unused_efs_filesystems] write_row failed for %s: %s", fs_id, exc)
 
         log.info(
-            "[EFS] Processed EFS: %s (unused=%s io_sum=%s max_conn=%s mt=%s)",
+            "[check_unused_efs_filesystems] Wrote EFS: %s (flags=%s est=%.2f save=%.2f)",
             fs_id,
-            unused,
-            int(total_io_sum),
-            int(max_conn),
-            mt_count,
+            flags,
+            est_cost,
+            potential_saving,
         )

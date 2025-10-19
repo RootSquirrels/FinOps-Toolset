@@ -35,14 +35,6 @@ def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
 
 
-def _safe_price(service: str, key: str) -> float:
-    try:
-        # type: ignore[arg-type]
-        return float(config.GET_PRICE(service, key))  # pylint: disable=not-callable
-    except Exception:  # pylint: disable=broad-except
-        return 0.0
-
-
 def _signals_str(pairs: Dict[str, object]) -> str:
     """Build compact Signals cell from k=v pairs; skip Nones/empties."""
     items: List[str] = []
@@ -196,7 +188,7 @@ def check_kms_customer_managed_keys(  # pylint: disable=unused-argument
     start_time = now_utc - timedelta(days=lookback_days)
 
     # Base monthly price per CMK (fallback to 0.0 if not found in pricebook)
-    price_per_key = _safe_price("KMS", "CMK_MONTH")
+    price_per_key = config.safe_price("KMS", "CMK_MONTH")
 
     try:
         key_paginator = kms.get_paginator("list_keys")

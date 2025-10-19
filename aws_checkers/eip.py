@@ -9,13 +9,6 @@ from core.retry import retry_with_backoff
 from aws_checkers import config
 
 
-def _safe_price(service: str, key: str) -> float:
-    try:
-        return float(config.GET_PRICE(service, key))  # type: ignore[arg-type]
-    except Exception:  # pylint: disable=broad-except
-        return 0.0
-
-
 def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
 
@@ -65,7 +58,7 @@ def check_unused_elastic_ips(writer: csv.writer, ec2,
                     name="",
                     owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                     resource_type="ElasticIP",
-                    estimated_cost=_safe_price("EIP", "UNASSIGNED_MONTH"),
+                    estimated_cost=config.safe_price("EIP", "UNASSIGNED_MONTH"),
                     flags=["UnusedElasticIP"],
                     confidence=100,
                 )

@@ -30,14 +30,6 @@ def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
 
 
-def _safe_price(service: str, key: str) -> float:
-    try:
-        # type: ignore[arg-type]
-        return float(config.GET_PRICE(service, key))  # pylint: disable=not-callable
-    except Exception:  # pylint: disable=broad-except
-        return 0.0
-
-
 def _extract_writer_ec2(args: Tuple[Any, ...], kwargs: dict) -> Tuple[Any, Any]:
     """Accept writer/ec2 passed positionally or by keyword; prefer keywords."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
@@ -84,7 +76,7 @@ def check_detached_network_interfaces(
                         name="",  # keep legacy: empty name
                         owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                         resource_type="NetworkInterface",
-                        estimated_cost=_safe_price("ENI", "DETACHED_MONTH"),
+                        estimated_cost=config.safe_price("ENI", "DETACHED_MONTH"),
                         flags=["DetachedNetworkInterface"],
                         confidence=100,
                     )

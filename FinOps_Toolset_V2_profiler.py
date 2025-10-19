@@ -181,7 +181,6 @@ from finops_toolset.config import (
     _DDB_TABLE_WORKERS, _DDB_META_WORKERS, _DDB_GSI_METRICS_LIMIT, _DDB_CW_PERIOD,
     VALID_RETENTION_DAYS, SSM_ADV_STALE_DAYS, MAX_CUSTOM_METRICS_CHECK,
     EC2_LOOKBACK_DAYS, EC2_CW_PERIOD, EC2_IDLE_CPU_PCT, EC2_IDLE_NET_GB, EC2_IDLE_DISK_OPS,
-    CLOUDFRONT_LOOKBACK_DAYS, CLOUDFRONT_PERIOD, CLOUDFRONT_IDLE_REQUESTS, CLOUDFRONT_IDLE_BYTES_GB,
     LOAD_BALANCER_LOOKBACK_DAYS,
 )
 
@@ -196,7 +195,7 @@ from aws_checkers.private_ca import check_private_certificate_authorities
 from aws_checkers.kms import check_kms_customer_managed_keys
 from aws_checkers.efs import check_unused_efs_filesystems
 from aws_checkers import backup as backup_checks
-
+from aws_checkers.cloudfront import check_cloudfront_distributions
 #endregion
 
 # Configure logging
@@ -4954,199 +4953,6 @@ def check_acm_private_certificates(writer: csv.writer, cloudfront) -> None:
 
 #endregion
 
-#region CloudFront SECTION
-
-def check_cloudfront_idle_distributions(
-    writer,
-    cloudfront,
-    cloudwatch,
-) -> None:
-    """
-    Identify CloudFront distributions with near-zero usage and surface any
-    recurring monthly charges (e.g., Dedicated IP custom SSL at ~$600/month).
-
-    Method:
-      • List all CloudFront distributions (global).
-      • Pull CloudWatch metrics (namespace: AWS/CloudFront, Region="Global") using
-        a us-east-1 CloudWatch client, batched via GetMetricData:
-          - Requests (Sum)
-          - BytesDownloaded (Sum)
-      • Flag IdleDistribution when both:
-            total_requests < CLOUDFRONT_IDLE_REQUESTS
-            AND total_bytes_gb < CLOUDFRONT_IDLE_BYTES_GB
-      • If the distribution uses Dedicated IP custom SSL (ViewerCertificate.SSLSupportMethod == "vip"),
-        add "UsesDedicatedIPCustomSSL" and "PotentialSaving=600$" to flags (AWS charges ~$600/mo).  # See pricing page.
-    """
-    try:
-        region = (
-            getattr(getattr(cloudwatch, "meta", None), "region_name", "")
-            or getattr(getattr(cloudfront, "meta", None), "region_name", "")
-            or ""
-        )
-
-        now = datetime.now(timezone.utc)
-        lookback_days = max(1, CLOUDFRONT_LOOKBACK_DAYS)
-        start = now - timedelta(days=lookback_days)
-        PERIOD = max(60, CLOUDFRONT_PERIOD)  # keep your original period setting
-
-        # 1) List distributions (paginated)
-        dists = []
-        marker = None
-        while True:
-            try:
-                args = {"Marker": marker} if marker else {}
-                resp = cloudfront.list_distributions(**args)
-            except ClientError as e:
-                logging.error(f"[CF] list_distributions failed ({region}): {e}")
-                break
-
-            summary_list = ((resp.get("DistributionList") or {}).get("Items") or [])
-            dists.extend(summary_list)
-            marker = (resp.get("DistributionList") or {}).get("NextMarker")
-            if not marker:
-                break
-
-        if not dists:
-            return
-
-        # 2) Tags (best effort)
-        def _tdict(aws_tags):
-            if not aws_tags:
-                return {}
-            items = (aws_tags.get("Items") if isinstance(aws_tags, dict) else None) or []
-            return {t.get("Key", ""): t.get("Value", "") for t in items}
-
-        dist_tags: Dict[str, Dict[str, str]] = {}
-        for d in dists:
-            arn = d.get("ARN") or ""
-            t = {}
-            if arn:
-                try:
-                    t = cloudfront.list_tags_for_resource(Resource=arn).get("Tags", {})
-                except ClientError:
-                    t = {}
-                except Exception:
-                    t = {}
-            dist_tags[arn or d.get("Id", "")] = _tdict(t)
-
-        # 3) Batch CloudWatch metrics (use passed CW client)
-
-        batch = cw.CloudWatchBatcher(region, client=cloudwatch)
-        for d in dists:
-            did = d.get("Id", "")
-
-            # CloudFront metrics require Region='Global' dimension
-            dims = [{"Name": "DistributionId", "Value": did}, {"Name": "Region", "Value": "Global"}]
-
-            batch.add(cw.MDQ(id=f"cf_req__{did}",  namespace="AWS/CloudFront", metric="Requests",       dims=dims, stat="Sum",     period=PERIOD))
-            batch.add(cw.MDQ(id=f"cf_bdn__{did}",  namespace="AWS/CloudFront", metric="BytesDownloaded", dims=dims, stat="Sum",     period=PERIOD))
-            batch.add(cw.MDQ(id=f"cf_bup__{did}",  namespace="AWS/CloudFront", metric="BytesUploaded",   dims=dims, stat="Sum",     period=PERIOD))
-            batch.add(cw.MDQ(id=f"cf_4xx__{did}",  namespace="AWS/CloudFront", metric="4xxErrorRate",    dims=dims, stat="Average", period=PERIOD))
-            batch.add(cw.MDQ(id=f"cf_5xx__{did}",  namespace="AWS/CloudFront", metric="5xxErrorRate",    dims=dims, stat="Average", period=PERIOD))
-
-        try:
-            series = batch.execute(start, now, scan_by="TimestampDescending")
-        except Exception as e:
-            logging.exception(f"[CF] CloudWatch batch execute failed ({region}): {e}")
-            series = {}
-
-        # 4) Emit rows
-        for d in dists:
-            try:
-                did      = d.get("Id", "")
-                arn      = d.get("ARN", did)
-                domain   = d.get("DomainName", "")
-                status   = d.get("Status", "")
-                enabled  = bool(d.get("Enabled", True))
-                comment  = d.get("Comment", "")
-                last_mod = d.get("LastModifiedTime")
-
-                if isinstance(last_mod, datetime) and last_mod.tzinfo is None:
-                    last_mod = last_mod.replace(tzinfo=timezone.utc)
-                created_iso = (last_mod or now).astimezone(timezone.utc).isoformat()
-
-                tags = dist_tags.get(arn, {})
-                name = tags.get("Name", domain or did)
-
-                # metrics
-                req_sum   = float(sum(v for _, v in series.get(f"cf_req__{did}", [])))
-                bdn_sum   = float(sum(v for _, v in series.get(f"cf_bdn__{did}", [])))
-                bup_sum   = float(sum(v for _, v in series.get(f"cf_bup__{did}", [])))
-                e4_vals   = [v for _, v in series.get(f"cf_4xx__{did}", [])]
-                e5_vals   = [v for _, v in series.get(f"cf_5xx__{did}", [])]
-                e4_avg    = (sum(e4_vals) / len(e4_vals)) if e4_vals else 0.0
-                e5_avg    = (sum(e5_vals) / len(e5_vals)) if e5_vals else 0.0
-
-                bytes_gb  = (bdn_sum + bup_sum) / (1024.0 ** 3)
-
-                # ViewerCertificate → detect Dedicated-IP custom SSL (no-regression)
-                vc = d.get("ViewerCertificate", {}) or {}
-                ssl_method = (vc.get("SSLSupportMethod") or "").lower()  # 'sni-only' | 'vip' | ''
-                uses_dedicated_ip = (ssl_method == "vip")
-
-                flags: List[str] = []
-                missing = [k for k in REQUIRED_TAG_KEYS if not tags.get(k)]
-                if missing:
-                    flags.append(f"MissingRequiredTags={','.join(missing)}")
-
-                potential = None
-                est_monthly = ""
-                # "Idle" heuristic — keep your thresholds from config
-                is_idle = (req_sum <= CLOUDFRONT_IDLE_REQUESTS) and (bytes_gb <= CLOUDFRONT_IDLE_BYTES_GB) and enabled and (status.lower() == "deployed")
-                if is_idle:
-                    flags += ["idle_cloudfront_candidate", "confidence=100"]
-
-                if uses_dedicated_ip:
-                    # Dedicated-IP custom SSL carries ~$600/mo even if idle; SNI has $0 base fee.
-                    flags.append("UsesDedicatedIPCustomSSL")
-                    est_monthly = 600
-                    if is_idle:
-                        potential = 600
-
-                confidence = 100 if is_idle else None
-
-                signals = {
-                    "Region": region,                   
-                    "Scope": "Global",
-                    "Enabled": str(enabled).lower(),
-                    "Status": status,
-                    "DomainName": domain,
-                    "SSLSupportMethod": ssl_method or "",
-                    "CommentLen": str(len(comment or "")),
-                    f"Requests{lookback_days}d": f"{int(req_sum)}",
-                    f"BytesGB{lookback_days}d": f"{bytes_gb:.3f}",
-                    "Avg4xxRate": f"{e4_avg:.4f}",
-                    "Avg5xxRate": f"{e5_avg:.4f}",
-                    "LookbackDays": str(lookback_days),
-                }
-
-                write_resource_to_csv(
-                    writer=writer,
-                    resource_id=arn or did,
-                    name=name,
-                    resource_type="CloudFront",
-                    owner_id=ACCOUNT_ID,
-                    state=status,
-                    creation_date=created_iso,
-                    estimated_cost=est_monthly,    # left blank to avoid pricing regression
-                    app_id=tags.get("ApplicationID", "NULL"),
-                    app=tags.get("Application", "NULL"),
-                    env=tags.get("Environment", "NULL"),
-                    flags=flags,
-                    potential_saving=potential,
-                    confidence=confidence,
-                    signals=signals,
-                )
-            except Exception as e:
-                logging.exception(f"[CF] emit failed for {d.get('Id','?')}: {e}")
-
-    except Exception as e:
-        logging.exception(f"[CF] check_cloudfront_distributions_refactored failed: {e}")
-        return
-
-#endregion
-
-
 def main():
     """
     Orchestrate the analysis, write findings to cleanup_estimates.csv,
@@ -5326,7 +5132,7 @@ def main():
 
                 # CloudFront is global; no impact to put it in the region loop
                 run_check(profiler, check_name="check_cloudfront_idle_distributions", region=region,
-                          fn=check_cloudfront_idle_distributions, writer=writer,
+                          fn=check_cloudfront_distributions, writer=writer,
                           cloudfront=clients['cloudfront'], cloudwatch=clients['cloudwatch'])
 
                 run_check(profiler, check_name="check_rds_extended_support_mysql", region=region,
