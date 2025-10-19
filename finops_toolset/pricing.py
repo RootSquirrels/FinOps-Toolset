@@ -64,14 +64,12 @@ PRICING: PriceMap = {
         "PROVISIONED_CONCURRENCY_GB_SECOND": 0.0000041667,
     },
 
-    "DYNAMODB": {
-        "RCU_HOUR": 0.00013,
-        "WCU_HOUR": 0.00065,
-        # On-demand mode per-request:
-        "OD_RRU": 0.25 / 1_000_000,
-        "OD_WRU": 1.25 / 1_000_000,   
-        "STORAGE_GB_MONTH_STD": 0.25,
-        "STORAGE_GB_MONTH_STD_IA": 0.10,
+    "DynamoDB": {
+        "STORAGE_GB_MONTH": 0.25,       
+        "STORAGE_IA_GB_MONTH": 0.10,    
+        "PROV_RCU_HR": 0.00013,
+        "PROV_WCU_HR": 0.00065,
+        "PITR_GB_MONTH": 0.20,
     },
 
     "CLOUDWATCH": {
