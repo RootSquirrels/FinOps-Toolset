@@ -194,6 +194,7 @@ from aws_checkers.ssm import check_ssm_plaintext_parameters as check_ssm_plainte
 from aws_checkers.ssm import check_ssm_stale_parameters as check_ssm_stale_parameters
 from aws_checkers.ssm import check_ssm_maintenance_windows_gaps as check_ssm_maintenance_windows_gaps
 from core.retry import retry_with_backoff
+from aws_checkers import config as checkers_config
 
 #endregion
 
@@ -5814,6 +5815,7 @@ def main():
     """
     profiler = RunProfiler(profile_file=PROFILE_FILE)
 
+
     try:
         file_exists = os.path.exists(OUTPUT_FILE)
         with open(OUTPUT_FILE, "a", newline="", encoding="utf-8") as csvfile:
@@ -5825,6 +5827,14 @@ def main():
                     "ApplicationID", "Application", "Environment", "ReferencedIn",
                     "FlaggedForReview", "Confidence", "Signals"
                 ])
+
+
+            checkers_config.setup(
+            account_id=ACCOUNT_ID,
+            write_row=write_resource_to_csv,
+            get_price=get_price,
+            logger=LOGGER,
+            )
 
             # -------- Global / cross-region steps first
             try:
@@ -5882,21 +5892,11 @@ def main():
                 #graph = build_certificate_graph(regions=regions, account_id=ACCOUNT_ID)
                 #cert_summary = summarize_cert_usage(graph)
 
-                def _eip_adapter(*, writer, ec2):
-                    return eip(
-                        writer=writer,
-                        ec2=ec2,
-                        account_id=ACCOUNT_ID,
-                        write_row=write_resource_to_csv,
-                        get_price_fn=get_price,
-                        logger=LOGGER,
-                    )
-
                 run_check(
                     profiler,
                     check_name="check_unused_elastic_ips",
                     region=region,
-                    fn=_eip_adapter,
+                    fn=eip,  # <- function, not module
                     writer=writer,
                     ec2=clients["ec2"],
                 )

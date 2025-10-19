@@ -35,6 +35,7 @@ def _env_list(key: str, default: Iterable[str]) -> list[str]:
 def _env_set(key: str, default: Iterable[str]) -> Set[str]:
     return set(_env_list(key, default))
 
+
 # ---- SDK config
 SDK_CONFIG = Config(
     retries={"max_attempts": 10, "mode": "standard"},
