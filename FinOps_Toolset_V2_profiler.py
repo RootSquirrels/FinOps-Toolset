@@ -196,6 +196,7 @@ from aws_checkers.kms import check_kms_customer_managed_keys
 from aws_checkers.efs import check_unused_efs_filesystems
 from aws_checkers import backup as backup_checks
 from aws_checkers.cloudfront import check_cloudfront_distributions
+from aws_checkers import ecr as ecr_checks
 #endregion
 
 # Configure logging
@@ -2678,183 +2679,6 @@ def check_log_groups_with_infinite_retention(writer: csv.writer, logs) -> None:
 
 #endregion
 
-
-#region ECR SECTION
-
-@dataclass
-class ECRRepositoryMetadata:
-    name: str
-    arn: str
-    total_bytes: int
-    size_gb: float
-    estimated_cost: float
-    stale_images: int = 0
-    large_images: int = 0
-    flags: list[str] = field(default_factory=list)
-
-# Keep the stale/large thresholds consistent
-_ECR_STALE_DAYS = 180
-# Use a large page size to reduce API calls (service will cap if higher than allowed)
-_ECR_PAGE_SIZE = 1000
-
-def _sum_image_stats_from_page(page, cutoff_dt):
-    """Local helper to aggregate a describe_images page."""
-    total_bytes = 0
-    stale = 0
-    large = 0
-    for img in page.get("imageDetails", []) or []:
-        size = int(img.get("imageSizeInBytes", 0) or 0)
-        total_bytes += size
-        if size >= 1_000 * 1024 * 1024:  # >= 1 GB
-            large += 1
-        pushed = img.get("imagePushedAt")
-        if pushed and pushed < cutoff_dt:
-            stale += 1
-    return total_bytes, stale, large
-
-@retry_with_backoff(exceptions=(ClientError,))
-def _repo_has_lifecycle_policy(ecr, repo_name: str) -> bool:
-    """Return True if the repo has a lifecycle policy, False if not."""
-    try:
-        ecr.get_lifecycle_policy(repositoryName=repo_name)
-        return True
-    except getattr(ecr, "exceptions", object()).LifecyclePolicyNotFoundException:  # type: ignore[attr-defined]
-        return False
-    except ClientError as e:
-        # Treat “AccessDenied” or transient issues as unknown; do not block the scan
-        logging.warning(f"[ECR] lifecycle policy check for {repo_name} failed: {e}")
-        return True  # assume True to avoid noisy "NoLifecyclePolicy" in case of perms issues
-
-
-def _describe_images_iter(ecr, repo_name: str):
-    """Yield pages from describe_images with large page size and tagStatus=ANY."""
-    paginator = ecr.get_paginator("describe_images")
-    # NOTE: boto3 PaginationConfig 'PageSize' maps to service 'maxResults'
-    for page in paginator.paginate(
-        repositoryName=repo_name,
-        filter={"tagStatus": "ANY"},
-        PaginationConfig={"PageSize": _ECR_PAGE_SIZE},
-    ):
-        yield page
-
-@retry_with_backoff(exceptions=(ClientError,))
-def build_ecr_repo_metadata_fast(ecr, repo_info: dict) -> Optional[ECRRepositoryMetadata]:
-    """
-    Faster per-repository aggregation:
-      - Single pass over describe_images pages with large page size
-      - Optional lifecycle-policy check (fast path)
-    """
-    repo_name = repo_info.get("repositoryName", "")
-    arn = repo_info.get("repositoryArn", "")
-
-    total_bytes = 0
-    stale_images = 0
-    large_images = 0
-    flags: list[str] = []
-
-    cutoff_dt = datetime.now(timezone.utc) - timedelta(days=_ECR_STALE_DAYS)
-
-    # Lifecycle policy (used as a hygiene signal, not a blocker)
-    has_lifecycle = _repo_has_lifecycle_policy(ecr, repo_name)
-    if not has_lifecycle:
-        flags.append("NoLifecyclePolicy")
-
-    # Aggregate images
-    try:
-        for page in _describe_images_iter(ecr, repo_name):
-            t, s, l = _sum_image_stats_from_page(page, cutoff_dt)
-            total_bytes += t
-            stale_images += s
-            large_images += l
-    except ClientError as e:
-        logging.warning(f"[ECR] describe_images failed for {repo_name}: {e}")
-        # If we completely fail to list images, still emit a review row so user investigates
-        flags.append("DescribeImagesFailed")
-        total_bytes = 0
-        stale_images = 0
-        large_images = 0
-
-    size_gb = round(total_bytes / (1024 ** 3), 2)
-    estimated_cost = round(size_gb * get_price("ECR", "STORAGE_GB_MONTH"), 2)
-
-    if stale_images > 0:
-        flags.append(f"StaleImages>={stale_images}@{_ECR_STALE_DAYS}d")
-    if large_images > 0:
-        flags.append(f"LargeImages>={large_images}")
-    if not flags and estimated_cost == 0:
-        flags.append("Review")
-
-    return ECRRepositoryMetadata(
-        name=repo_name,
-        arn=arn,
-        total_bytes=total_bytes,
-        size_gb=size_gb,
-        estimated_cost=estimated_cost,
-        stale_images=stale_images,
-        large_images=large_images,
-        flags=flags,
-    )
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ecr_storage_and_staleness(writer: csv.writer, ecr) -> None:
-    """
-    Refactored ECR checker:
-      - Paginates through repositories
-      - Processes repos in parallel (ThreadPoolExecutor)
-      - Writes CSV rows on the main thread
-    """
-    try:
-        repos: list[dict] = []
-        paginator = ecr.get_paginator("describe_repositories")
-        for page in paginator.paginate(PaginationConfig={"PageSize": 1000}):
-            repos.extend(page.get("repositories", []) or [])
-
-        if not repos:
-            return
-
-        # Choose a sensible level of parallelism without overwhelming API (tune if needed)
-        max_workers = min(16, max(4, len(repos)))
-        results: list[ECRRepositoryMetadata] = []
-
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {
-                pool.submit(build_ecr_repo_metadata_fast, ecr, r): r.get("repositoryName", "?")
-                for r in repos
-            }
-            for fut in as_completed(futures):
-                repo_name = futures[fut]
-                try:
-                    meta = fut.result()
-                except Exception as e:
-                    logging.error(f"[ECR] repo {repo_name} failed in worker: {e}")
-                    meta = None
-                if meta and (meta.flags or meta.estimated_cost > 0):
-                    results.append(meta)
-
-        # CSV writes in main thread to avoid race conditions on file handle
-        for m in results:
-            write_resource_to_csv(
-                writer=writer,
-                resource_id=m.arn,
-                name=m.name,
-                owner_id=ACCOUNT_ID,
-                resource_type="ECRRepository",
-                storage_gb=m.size_gb,
-                estimated_cost=m.estimated_cost,
-                flags=m.flags,
-            )
-            logging.info(
-                f"[ECR] {m.name} size={m.size_gb}GB cost≈{m.estimated_cost}$ flags={m.flags}"
-            )
-
-    except ClientError as e:
-        logging.error(f"[check_ecr_storage_and_staleness] Failed to describe repositories: {e}")
-    except Exception as e:
-        logging.error(f"[check_ecr_storage_and_staleness] Unexpected error: {e}")
-
-#endregion
-
-
 #region VPC/TGW SECTION
 
 @retry_with_backoff(exceptions=(ClientError,))
@@ -5101,8 +4925,17 @@ def main():
                           region=region, fn=check_inter_region_vpc_and_tgw_peerings,
                           writer=writer, ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
 
-                run_check(profiler, check_name="check_ecr_storage_and_staleness", region=region,
-                          fn=check_ecr_storage_and_staleness, writer=writer, ecr=clients['ecr'])
+                run_check(profiler, "check_ecr_repositories_without_lifecycle_policy", region,
+                        ecr_checks.check_ecr_repositories_without_lifecycle_policy,
+                        writer=writer, ecr=clients["ecr"])
+
+                run_check(profiler, "check_ecr_empty_repositories", region,
+                        ecr_checks.check_ecr_empty_repositories,
+                        writer=writer, ecr=clients["ecr"])
+
+                run_check(profiler, "check_ecr_stale_or_untagged_images", region,
+                        ecr_checks.check_ecr_stale_or_untagged_images,
+                        writer=writer, ecr=clients["ecr"])
 
                 run_check(profiler, check_name="check_ebs_fast_snapshot_restore", region=region,
                           fn=check_ebs_fast_snapshot_restore, writer=writer, ec2=clients['ec2'])
