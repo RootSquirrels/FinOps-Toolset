@@ -148,18 +148,14 @@ import boto3 # type: ignore
 import csv
 import os
 import logging
-from typing import Dict, Iterable, Optional, List, Tuple, Union, Callable, Any, TypeVar, Set, Type
+from typing import Dict, Optional, List, Tuple, Union, Callable, Any, TypeVar, Set, Type
 from datetime import datetime, timezone, timedelta
-import json
 from botocore.exceptions import ClientError # type: ignore
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from statistics import fmean
 from enum import Enum
-import string
 import re
 from time import perf_counter
-import threading
 #from correlator import build_certificate_graph, summarize_cert_usage
 
 from finops_toolset.config import (
@@ -194,6 +190,7 @@ from aws_checkers import ebs as ebs_checks
 from aws_checkers import kinesis as kinesis_checks
 from aws_checkers import dynamodb as ddb_checks
 from aws_checkers import s3 as s3_checks
+from aws_checkers import ami as ami_checks
 #endregion
 
 # Configure logging
@@ -204,202 +201,6 @@ logging.basicConfig(
 )
 
 #logger = logging.getLogger("aws-finops")  # base logger for your script
-
-
-#region CW Helpers
-
-# ---------- CloudWatch Bulk (GetMetricData) ----------
-
-def _ebs_mdq_id(volume_id: str, metric: str, stat: str = "Sum") -> str:
-    # Build a stable, CW-safe id (reuses your _cw_make_id helper)
-    return _cw_make_id("ebs", volume_id, metric, stat)
-
-def _ebs_build_mdqs(vol_ids: list[str],
-                    need_bytes: set[str],
-                    need_ops: set[str],
-                    period: int = 86400) -> tuple[list[dict], dict[tuple[str, str], str]]:
-    """
-    Build MetricDataQueries for a set of volumes:
-      - need_bytes: VolumeIds that require (ReadBytes, WriteBytes)
-      - need_ops:   VolumeIds that require (ReadOps, WriteOps)
-    Returns (queries, id_index) where id_index[(vol_id, metric)] -> mdq_id
-    """
-    queries: list[dict] = []
-    id_index: dict[tuple[str, str], str] = {}
-    for vid in vol_ids:
-        dims = [{"Name": "VolumeId", "Value": vid}]
-        if vid in need_bytes:
-            for metric in ("VolumeReadBytes", "VolumeWriteBytes"):
-                qid = _ebs_mdq_id(vid, metric, "Sum")
-                queries.append(build_mdq(
-                    id_hint=qid, namespace="AWS/EBS", metric=metric,
-                    dims=dims, stat="Sum", period=period
-                ))
-                id_index[(vid, metric)] = qid
-        if vid in need_ops:
-            for metric in ("VolumeReadOps", "VolumeWriteOps"):
-                qid = _ebs_mdq_id(vid, metric, "Sum")
-                queries.append(build_mdq(
-                    id_hint=qid, namespace="AWS/EBS", metric=metric,
-                    dims=dims, stat="Sum", period=period
-                ))
-                id_index[(vid, metric)] = qid
-    return queries, id_index
-
-def _ebs_collect_cw(cloudwatch_region: str,
-                    mdqs: list[dict],
-                    start: datetime,
-                    end: datetime,
-                    scan_by: str = "TimestampAscending") -> dict[str, list[tuple[datetime, float]]]:
-    """
-    Create a thread-local CloudWatch client (to be safe) and run a single GetMetricData
-    batch for the given MDQs. Returns id -> [(ts, value), ...].
-    """
-    cw_local = boto3.client("cloudwatch", region_name=cloudwatch_region, config=SDK_CONFIG)
-    return cw_get_metric_data_bulk(cw_local, mdqs, start, end, scan_by=scan_by)
-
-def _sum_values(series: list[tuple[datetime, float]]) -> float:
-    return float(sum(v for _, v in (series or [])))
-
-def _cw_id_safe(s: str) -> str:
-    """CloudWatch MetricDataQuery.Id must be [a-zA-Z0-9_]."""
-    return "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in s)[:255]
-
-
-def _cw_make_id(*parts: str, max_len: int = 255) -> str:
-    """
-    Build a CloudWatch MetricDataQuery Id that matches ^[a-z][a-zA-Z0-9_]*$.
-
-    - Joins the given parts, lowercases them.
-    - Replaces any non [a-z0-9_] char with underscore.
-    - Ensures the first character is a lowercase letter by prefixing 'a' if needed.
-    - Collapses repeated underscores and trims to `max_len`.
-
-    Args:
-        *parts: Pieces to combine into an Id (e.g., prefixes and resource names).
-        max_len: Maximum length of the resulting Id (CW allows up to 255).
-
-    Returns:
-        A safe Id string usable in GetMetricData.
-    """
-    raw = "_".join(p for p in parts if p is not None).lower()
-
-    allowed = set(string.ascii_lowercase + string.digits + "_")
-    cleaned_chars = []
-    prev_us = False
-    for ch in raw:
-        if ch in allowed:
-            cleaned_chars.append(ch)
-            prev_us = (ch == "_")
-        else:
-            # replace with single underscore
-            if not prev_us:
-                cleaned_chars.append("_")
-                prev_us = True
-    safe = "".join(cleaned_chars).strip("_")
-
-    if not safe or safe[0] not in string.ascii_lowercase:
-        safe = "a_" + safe
-
-    # final collapse and trim
-    while "__" in safe:
-        safe = safe.replace("__", "_")
-    if len(safe) > max_len:
-        safe = safe[:max_len]
-    return safe
-
-
-def build_mdq(
-    *,
-    id_hint: str,
-    namespace: str,
-    metric: str,
-    dims: list[dict],
-    stat: str,
-    period: int,
-    unit: Optional[str] = None,
-) -> dict:
-    """Build a single MetricDataQuery for GetMetricData."""
-    mdq_id = _cw_id_safe(id_hint)
-    q = {
-        "Id": mdq_id,
-        "MetricStat": {
-            "Metric": {
-                "Namespace": namespace,
-                "MetricName": metric,
-                "Dimensions": dims,
-            },
-            "Period": period,
-            "Stat": stat,
-        },
-        "ReturnData": True,
-    }
-    if unit:
-        q["MetricStat"]["Unit"] = unit
-    return q
-
-def cw_get_metric_data_bulk(
-    cloudwatch,
-    queries: list[dict],
-    start: datetime,
-    end: datetime,
-    scan_by: str = "TimestampAscending",
-    max_batch: int = 500,
-) -> dict[str, list[tuple[datetime, float]]]:
-    """
-    Execute GetMetricData in batches (<=500 MDQs per call), handling NextToken.
-    Returns: mapping id -> [(timestamp, value), ...] in ascending time order.
-    """
-    results: dict[str, list[tuple[datetime, float]]] = {}
-    if not queries:
-        return results
-
-    for i in range(0, len(queries), max_batch):
-        batch = queries[i : i + max_batch]
-        next_token = None
-        while True:
-            kwargs = {
-                "MetricDataQueries": batch,
-                "StartTime": start,
-                "EndTime": end,
-                "ScanBy": scan_by,
-            }
-            if next_token:
-                kwargs["NextToken"] = next_token
-            resp = cloudwatch.get_metric_data(**kwargs)
-            for r in resp.get("MetricDataResults", []):
-                rid = r.get("Id")
-                if not rid:
-                    continue
-                pts = list(zip(r.get("Timestamps", []), r.get("Values", [])))
-                # CloudWatch may return timestamps unordered without ScanBy; we set ScanBy but sort anyway
-                pts.sort(key=lambda x: x[0])
-                results.setdefault(rid, []).extend((ts, float(val)) for ts, val in pts)
-            next_token = resp.get("NextToken")
-            if not next_token:
-                break
-
-    # Ensure each id is strictly time-ascending and merged (if multiple pages)
-    for rid, pts in results.items():
-        pts.sort(key=lambda x: x[0])
-        results[rid] = pts
-    return results
-
-def series_sum(values: list[float]) -> float:
-    return float(sum(values))
-
-def series_avg(values: list[float]) -> float:
-    return float(fmean(values)) if values else 0.0
-
-def series_p95(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    s = sorted(values)
-    idx = int(round(0.95 * (len(s) - 1)))
-    return float(s[idx])
-
-#endregion
-
 
 #region CSV Helpers 
 
@@ -695,61 +496,8 @@ def run_step(profiler: RunProfiler,
         logging.info("[PROFILE] %-40s  %-12s  %6.2fs  rows=%d  ok=%s",
                      step_name, region, dt, 0, ok)
 
-
-def _region_of(client) -> str:
-    return getattr(getattr(client, "meta", None), "region_name", "") or ""
-
 #endregion
 
-#region POO SECTION
-
-class ResourceFlagger:
-    def __init__(self, tags: Dict[str, str], last_modified: Optional[datetime] = None):
-        self.tags = tags
-        self.last_modified = last_modified
-        self.flags = []
-
-    def check_missing_tags(self, required_keys: List[str]):
-        if not all(self.tags.get(k) for k in required_keys):
-            self.flags.append("MissingRequiredTags")
-
-    def check_age(self, threshold_days: int = 91):
-        if self.last_modified and self.last_modified < datetime.now(timezone.utc) - timedelta(days=threshold_days):
-            self.flags.append("OlderThan3Months")
-
-    def get_flags(self) -> List[str]:
-        return self.flags
-
-class AMIFlagger(ResourceFlagger):
-    def __init__(self, tags: Dict[str, str], creation_date: str, referenced: str, shared: str):
-        super().__init__(tags)
-        self.creation_date_str = creation_date
-        self.referenced = referenced
-        self.shared = shared
-
-    def apply_rules(self):
-        self.check_missing_tags(REQUIRED_TAG_KEYS)
-        self.check_creation_date()
-        self.check_reference()
-        self.check_shared()
-
-    def check_creation_date(self):
-        try:
-            creation_dt = datetime.strptime(self.creation_date_str, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
-            self.last_modified = creation_dt
-            self.check_age()
-        except Exception:
-            pass
-
-    def check_reference(self):
-        if self.referenced == "No":
-            self.flags.append("Unreferenced")
-
-    def check_shared(self):
-        if self.shared == "Yes":
-            self.flags.append("SharedExternally")
-
-#endregion
 
 #region LB SECTION
 
@@ -2192,369 +1940,6 @@ def check_rds_extended_support_mysql(writer: csv.writer, rds) -> None:
 
 #endregion
 
-
-#region AMI SECTION
-@retry_with_backoff(exceptions=(ClientError,))
-def get_tags(resource_id: str, ec2) -> dict[str, str]:
-    """
-    Retrieve tags for a given AWS resource.
-    Args:
-        resource_id (str): The ID of the AWS resource.
-    Returns:
-        dict: Dictionary of tag key-value pairs.
-    """
-    try:
-        tags = ec2.describe_tags(Filters=[{"Name": "resource-id", "Values": [resource_id]}])["Tags"]
-        return {tag["Key"]: tag["Value"] for tag in tags}
-    except ClientError as e:
-        logging.warning(f"Error retrieving tags for {resource_id}: {e}")
-        return {}
-
-def is_referenced_in_cfn(ami_id, cached_templates):
-    """
-    Check if the AMI ID is referenced in any cached CloudFormation templates.
-
-    Args:
-        ami_id (str): The AMI ID to search for.
-        cached_templates (list): List of (stack_name, template_str) tuples.
-
-    Returns:
-        str: Description of reference or "No".
-    """
-    try:
-        for stack_name, template_str in cached_templates:
-            if ami_id in template_str:
-                return f"Yes (in CloudFormation stack {stack_name})"
-    except Exception as e:
-        logging.warning(f"Error searching AMI ID {ami_id} in cached templates: {e}")
-    return "No"
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def get_ami_ids(ec2):
-    """
-    Retrieve a list of AMI IDs owned by the current AWS account.
-    Returns:
-        list: A list of AMI IDs.
-    """
-    try:
-        response = ec2.describe_images(Owners=["self"])
-        return [img["ImageId"] for img in response["Images"]]
-    except ClientError as e:
-        logging.error(f"Error retrieving AMIs: {e}")
-        return []
-
-
-def is_referenced_in_templates(ami_id):
-    """
-    Check if the AMI ID is referenced in local template files (YAML, YML, JSON).
-    Args:
-        ami_id (str): The AMI ID to search for.
-    Returns:
-        str: Description of reference or "No".
-    """
-    for ext in ("yaml", "yml", "json"):
-        for root, _, files in os.walk("."):
-            for file in files:
-                if file.endswith(ext):
-                    try:
-                        with open(os.path.join(root, file), "r", encoding="utf-8", errors="ignore") as f:
-                            if ami_id in f.read():
-                                return f"Yes (in {file})"
-                    except Exception as e:
-                        logging.warning(f"Error reading file {file}: {e}")
-                        return "Error"
-    return "No"
-
-@retry_with_backoff(exceptions=(ClientError,))
-def is_referenced_in_ec2(ami_id, ec2):
-    """
-    Check if the AMI ID is used by any EC2 instances.
-    Args:
-        ami_id (str): The AMI ID to check.
-    Returns:
-        str: Description of reference or "No".
-    """
-    try:
-        paginator = ec2.get_paginator("describe_instances")
-        for page in paginator.paginate():
-            for reservation in page.get("Reservations", []):
-                for instance in reservation.get("Instances", []):
-                    if instance.get("ImageId") == ami_id:
-                        return f"Yes (in EC2 instance {instance.get('InstanceId')})"
-    except ClientError as e:
-        logging.warning(f"Error checking EC2 references for {ami_id}: {e}")
-    return "No"
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def is_referenced_in_launch_templates(ami_id, ec2):
-    """
-    Check if the AMI ID is used in any EC2 launch templates.
-    Args:
-        ami_id (str): The AMI ID to check.
-    Returns:
-        str: Description of reference or "No".
-    """
-    try:
-        templates = ec2.describe_launch_templates()["LaunchTemplates"]
-        for tpl in templates:
-            versions = ec2.describe_launch_template_versions(LaunchTemplateId=tpl["LaunchTemplateId"])["LaunchTemplateVersions"]
-            for ver in versions:
-                if ver["LaunchTemplateData"].get("ImageId") == ami_id:
-                    return f"Yes (in Launch Template {tpl['LaunchTemplateId']})"
-    except ClientError as e:
-        logging.warning(f"Error checking launch templates for {ami_id}: {e}")
-    return "No"
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def is_referenced_in_asg(ami_id, autoscaling):
-    """
-    Check if the AMI ID is used in any Auto Scaling Groups.
-    Args:
-        ami_id (str): The AMI ID to check.
-    Returns:
-        str: Description of reference or "No".
-    """
-    try:
-        groups = autoscaling.describe_auto_scaling_groups()["AutoScalingGroups"]
-        for group in groups:
-            lc_name = group.get("LaunchConfigurationName")
-            if lc_name:
-                lcs = autoscaling.describe_launch_configurations(LaunchConfigurationNames=[lc_name])["LaunchConfigurations"]
-                if lcs and lcs[0]["ImageId"] == ami_id:
-                    return f"Yes (in Auto Scaling Group {group['AutoScalingGroupName']})"
-    except ClientError as e:
-        logging.warning(f"Error checking ASG references for {ami_id}: {e}")
-    return "No"
-
-
-def load_existing_ami_ids():
-    """
-    Load existing AMI IDs from the output CSV file to avoid duplication.
-    Returns:
-        set: Set of existing AMI IDs.
-    """
-    if not os.path.exists(OUTPUT_FILE):
-        return set()
-    with open(OUTPUT_FILE, "r", newline="") as f:
-        reader = csv.reader(f)
-        next(reader, None)
-        return {row[0] for row in reader if row}
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def get_launch_permissions(ami_id, ec2):
-    """
-    Check if the AMI is shared with other AWS accounts or is public.
-    Returns "Yes" if shared, "No" if private, "Unknown" on error.
-    """
-    try:
-        attr = ec2.describe_image_attribute(ImageId=ami_id, Attribute='launchPermission')
-        permissions = attr.get('LaunchPermissions', [])
-        return "Yes" if permissions else "No"
-    except ClientError as e:
-        logging.warning(f"Error checking launch permissions for {ami_id}: {e}")
-        return "Unknown"
-
-
-def cache_all_cfn_templates(cfn):
-    """
-    Retrieve and cache all CloudFormation templates in the region.
-    Returns:
-        list of tuples: Each tuple contains (stack_name, template_str)
-    """
-    templates = []
-    try:
-        paginator = cfn.get_paginator("describe_stacks")
-        for page in paginator.paginate():
-            for stack in page.get("Stacks", []):
-                try:
-                    template = cfn.get_template(StackName=stack["StackName"]).get("TemplateBody", "")
-                    if isinstance(template, dict):
-                        template_str = json.dumps(template)
-                    else:
-                        template_str = template
-                    templates.append((stack["StackName"], template_str))
-                except Exception as e:
-                    logging.warning(f"Error retrieving template for stack {stack['StackName']}: {e}")
-    except Exception as e:
-        logging.warning(f"Error describing CloudFormation stacks: {e}")
-    return templates
-
-
-# In-memory caches
-tag_cache = {}
-permission_cache = {}
-reference_cache = {}
-
-def get_cached_tags(resource_id: str, ec2) -> dict:
-    if resource_id in tag_cache:
-        return tag_cache[resource_id]
-    tags = get_tags(resource_id, ec2)
-    tag_cache[resource_id] = tags
-    return tags
-
-def get_cached_permissions(ami_id: str, ec2) -> str:
-    if ami_id in permission_cache:
-        return permission_cache[ami_id]
-    perm = get_launch_permissions(ami_id, ec2)
-    permission_cache[ami_id] = perm
-    return perm
-
-
-def get_cached_reference(ami_id: str, cached_templates, ec2, autoscaling) -> str:
-    if ami_id in reference_cache:
-        return reference_cache[ami_id]
-    ref_template = is_referenced_in_templates(ami_id)
-    ref_ec2 = is_referenced_in_ec2(ami_id, ec2)
-    ref_lt = is_referenced_in_launch_templates(ami_id, ec2)
-    ref_asg = is_referenced_in_asg(ami_id, autoscaling)
-    ref_cfn = is_referenced_in_cfn(ami_id, cached_templates)
-    referenced = next((r for r in [ref_template, ref_ec2, ref_lt, ref_asg, ref_cfn] if r != "No"), "No")
-    reference_cache[ami_id] = referenced
-    return referenced
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def get_snapshot_storage(snapshot_ids: List[str], ec2) -> float:
-    """
-    Calculate the total storage size in GB for a list of snapshot IDs.
-    Args:
-        snapshot_ids (List[str]): List of snapshot IDs.
-    Returns:
-        float: Total storage size in GB.
-    """
-    total_gb = 0.0
-    for i in range(0, len(snapshot_ids), BATCH_SIZE):
-        batch = snapshot_ids[i:i+BATCH_SIZE]
-        try:
-            snapshots = ec2.describe_snapshots(SnapshotIds=batch)["Snapshots"]
-            for snap in snapshots:
-                size_gb = snap.get("StorageSize", snap.get("VolumeSize", 0))
-                
-                if size_gb is None:
-                    logging.warning(f"[get_snapshot_storage] Snapshot {snap.get('SnapshotId')} has no size info.")
-                    continue 
-
-                total_gb += size_gb
-        except ClientError as e:
-            logging.warning(f"Error retrieving snapshot batch: {e}")
-    return total_gb
-
-
-def process_ami(image, cached_templates, existing_ids, ec2, autoscaling):
-    ami_id = image["ImageId"]
-    if ami_id in existing_ids:
-        logging.info(f"{ami_id} already in CSV, skipping.")
-        return None
-
-    try:
-        creation_date = image.get("CreationDate", "")
-        name = image.get("Name", "")
-        description = image.get("Description", "")
-        owner_id = ACCOUNT_ID
-        state = image.get("State", "")
-
-        if "This image is created by the AWS Backup" in description:
-            return None
-
-        snapshot_ids = [
-            bdm["Ebs"]["SnapshotId"]
-            for bdm in image.get("BlockDeviceMappings", [])
-            if "Ebs" in bdm and "SnapshotId" in bdm["Ebs"]
-        ]
-
-        total_storage_gb = get_snapshot_storage(snapshot_ids, ec2)
-        cost_usd = round(total_storage_gb * get_price("EBS", "SNAPSHOT_GB_MONTH"), 2)
-
-        tags = get_cached_tags(ami_id, ec2)
-        app_id = tags.get("ApplicationID", "")
-        app = tags.get("Application", "")
-        env = tags.get("Environment", "")
-
-        referenced = get_cached_reference(ami_id, cached_templates, ec2, autoscaling)
-        shared = get_cached_permissions(ami_id, ec2)
-
-        flagger = AMIFlagger(
-            tags={"ApplicationID": app_id, "Application": app, "Environment": env},
-            creation_date=creation_date,
-            referenced=referenced,
-            shared=shared
-        )
-        flagger.apply_rules()
-        flags = flagger.get_flags()
-
-        logging.info(f"{ami_id} analysis complete.")
-
-        # Return a structured payload for main-thread CSV writing
-        return {
-            "resource_id": ami_id,
-            "name": name,
-            "resource_type": "AMI",
-            "owner_id": owner_id,
-            "state": state,
-            "creation_date": creation_date,
-            "storage_gb": total_storage_gb,
-            "estimated_cost": cost_usd,
-            "app_id": app_id or "Not Found",
-            "app": app or "Not Found",
-            "env": env or "Not Found",
-            "referenced_in": referenced,
-            "flags": flags,
-        }
-
-    except Exception as e:
-        logging.error(f"Error processing AMI {ami_id}: {e}")
-        return None
-
-
-def check_amis(writer, cached_templates, ec2, autoscaling, cfn):
-    existing_ids = load_existing_ami_ids()
-    ami_ids = get_ami_ids(ec2)
-    if not ami_ids:
-        logging.info("No AMIs found or error retrieving AMIs.")
-        return
-
-    for i in range(0, len(ami_ids), BATCH_SIZE):
-        batch_ids = ami_ids[i:i + BATCH_SIZE]
-        try:
-            images = ec2.describe_images(ImageIds=batch_ids)["Images"]
-        except Exception as e:
-            logging.warning(f"Error fetching AMI batch: {e}")
-            continue
-
-        results = []
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(process_ami, image, cached_templates, existing_ids, ec2, autoscaling)
-                       for image in images]
-            for f in futures:
-                payload = f.result()
-                if payload:
-                    results.append(payload)
-
-        # Write on the main thread via the unified helper (correct columns)
-        for p in results:
-            write_resource_to_csv(
-                writer=writer,
-                resource_id=p["resource_id"],
-                name=p["name"],
-                resource_type=p["resource_type"],
-                owner_id=p["owner_id"],
-                state=p["state"],
-                creation_date=p["creation_date"],
-                storage_gb=p["storage_gb"],
-                estimated_cost=p["estimated_cost"],
-                app_id=p["app_id"],
-                app=p["app"],
-                env=p["env"],
-                referenced_in=p["referenced_in"],
-                flags=p["flags"],
-            )
-
-#endregion
-
 #region EC2 SECTION
 
 def _ec2_hourly_price(instance_type: str, region: str) -> float:
@@ -2972,15 +2357,6 @@ def main():
                     logging.error(f"[main] init_clients({region}) failed: {e}")
                     continue
 
-                # Cache CFN templates (this is used by check_amis)
-                cached_templates = run_step(
-                    profiler,
-                    step_name="cache_all_cfn_templates",
-                    region=region,
-                    fn=cache_all_cfn_templates,
-                    cfn=clients['cfn']
-                )
-
                 #correlator WIP
                 #regions = REGIONS
                 #graph = build_certificate_graph(regions=regions, account_id=ACCOUNT_ID)
@@ -3029,11 +2405,6 @@ def main():
                 run_check(profiler, check_name="check_lambda_efficiency", region=region,
                           fn=check_lambda_efficiency, writer=writer,
                           lambda_client=clients['lambda'], cloudwatch=clients['cloudwatch'])
-
-                run_check(profiler, check_name="check_amis", region=region,
-                          fn=check_amis, writer=writer,
-                          cached_templates=cached_templates, ec2=clients['ec2'],
-                          autoscaling=clients['autoscaling'], cfn=clients['cfn'])
 
                 run_check(profiler, check_name="check_inter_region_vpc_and_tgw_peerings",
                           region=region, fn=check_inter_region_vpc_and_tgw_peerings,
@@ -3163,6 +2534,30 @@ def main():
                 run_check(profiler, "check_ebs_snapshots_missing_description", region,
                           ebs_checks.check_ebs_snapshots_missing_description, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
+                
+                run_check(
+                            profiler, "check_ami_public_or_shared",
+                            region, ami_checks.check_ami_public_or_shared,
+                            writer=writer, ec2=clients["ec2"],)
+
+                run_check(
+                            profiler, "check_ami_unused_and_snapshot_cost",
+                            region, ami_checks.check_ami_unused_and_snapshot_cost,
+                            writer=writer, ec2=clients["ec2"],
+                            autoscaling=clients.get("autoscaling"),  # optional
+                            # knobs: min_age_days=14
+                        )
+
+                run_check(
+                            profiler, "check_ami_old_images",
+                            region, ami_checks.check_ami_old_images,
+                            writer=writer, ec2=clients["ec2"],
+                            # knobs: age_days=180
+                        )
+
+                run_check(profiler, "check_ami_unencrypted_snapshots",
+                          region, ami_checks.check_ami_unencrypted_snapshots,
+                          writer=writer, ec2=clients["ec2"],)
 
 
         profiler.dump_csv()

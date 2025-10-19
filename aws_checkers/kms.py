@@ -1,42 +1,40 @@
-"""Checker: AWS KMS Customer-Managed Keys (CMKs).
+"""Checkers: AWS KMS – Customer Managed Keys.
 
-Finds customer-managed KMS keys and flags those that appear unused within a
-lookback window using CloudTrail, plus other hygiene issues (disabled, pending
-deletion, rotation disabled). Outputs Flags, Estimated_Cost_USD, Potential_Saving_USD,
-and a compact Signals string.
+Contains:
+  - check_kms_customer_managed_keys:
+      Flags unused/disabled/pending-deletion/no-rotation/no-alias keys and
+      estimates monthly key cost and potential savings.
 
+Performance:
+  - Only one CloudTrail lookup per key (by ResourceName).
+  - Never raises on CloudTrail errors → avoids function-level backoff retries.
+  - Aliases fetched once and mapped to KeyIds.
+
+Design:
+  - Dependencies via finops_toolset.checkers.config.setup(...).
+  - Tolerant signature for run_check; no returns.
+  - Timezone-aware datetimes; lazy %s logging; lines ≤ 100 chars.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
 
-from core.retry import retry_with_backoff
 from aws_checkers import config
+from core.retry import retry_with_backoff
 
 
-# ----------------------------- helpers --------------------------------- #
-
-def _require_config() -> None:
-    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        raise RuntimeError(
-            "Checkers not configured. Call "
-            "finops_toolset.checkers.config.setup(account_id=..., write_row=..., "
-            "get_price=..., logger=...) first."
-        )
-
+# --------------------------------- helpers -------------------------------- #
 
 def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
 
 
 def _signals_str(pairs: Dict[str, object]) -> str:
-    """Build compact Signals cell from k=v pairs; skip Nones/empties."""
     items: List[str] = []
     for k, v in pairs.items():
         if v is None or v == "":
@@ -55,250 +53,255 @@ def _to_utc_iso(dt_obj: Optional[datetime]) -> Optional[str]:
     return dt_obj.replace(microsecond=0).isoformat()
 
 
-def _extract_writer_kms_cloudtrail(
+def _extract_writer_kms_ct(
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
 ) -> Tuple[Any, Any, Any]:
-    """Accept writer/kms/cloudtrail passed positionally or by keyword; prefer keywords."""
+    """Accept writer/kms/cloudtrail (positional or keyword)."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
     kms = kwargs.get("kms", args[1] if len(args) >= 2 else None)
     cloudtrail = kwargs.get("cloudtrail", args[2] if len(args) >= 3 else None)
     if writer is None or kms is None or cloudtrail is None:
         raise TypeError(
-            "check_kms_customer_managed_keys expected 'writer', 'kms', and 'cloudtrail' "
+            "Expected 'writer', 'kms' and 'cloudtrail' "
             f"(got writer={writer!r}, kms={kms!r}, cloudtrail={cloudtrail!r})"
         )
     return writer, kms, cloudtrail
 
 
-# KMS data-plane operations that indicate real usage.
-_USAGE_EVENTS: frozenset[str] = frozenset(
-    {
-        "Encrypt",
-        "Decrypt",
-        "ReEncrypt",
-        "ReEncryptFrom",
-        "ReEncryptTo",
-        "GenerateDataKey",
-        "GenerateDataKeyWithoutPlaintext",
-        "GenerateDataKeyPair",
-        "GenerateDataKeyPairWithoutPlaintext",
-        "Sign",
-        "Verify",
-        # For asymmetric keys:
-        "GetPublicKey",
-    }
-)
+def _list_customer_keys(kms, log: logging.Logger) -> List[str]:
+    """List KeyIds for CUSTOMER managed keys."""
+    key_ids: List[str] = []
+    try:
+        paginator = kms.get_paginator("list_keys")
+        for page in paginator.paginate():
+            for k in page.get("Keys", []) or []:
+                kid = k.get("KeyId")
+                if not kid:
+                    continue
+                # Filter after describe_key
+                try:
+                    md = kms.describe_key(KeyId=kid).get("KeyMetadata", {}) or {}
+                    if (md.get("KeyManager") or "").upper() == "CUSTOMER":
+                        key_ids.append(kid)
+                except ClientError as exc:  # skip keys we cannot describe
+                    log.debug("[kms] describe_key failed for %s: %s", kid, exc)
+    except ClientError as exc:
+        log.error("[kms] list_keys failed: %s", exc)
+    return key_ids
 
 
-def _cloudtrail_has_recent_kms_usage(
+def _alias_map(kms, log: logging.Logger) -> Dict[str, List[str]]:
+    """Return {TargetKeyId: [alias/...]} across the account/region."""
+    out: Dict[str, List[str]] = {}
+    try:
+        paginator = kms.get_paginator("list_aliases")
+        for page in paginator.paginate():
+            for a in page.get("Aliases", []) or []:
+                tgt = a.get("TargetKeyId")
+                name = a.get("AliasName")
+                if tgt and name:
+                    out.setdefault(tgt, []).append(name)
+    except ClientError as exc:
+        log.debug("[kms] list_aliases failed: %s", exc)
+    return out
+
+
+def _rotation_eligible(md: Dict[str, Any]) -> bool:
+    """Only symmetric CMKs support automatic rotation."""
+    spec = (md.get("KeySpec") or "").upper()
+    # SYMMETRIC_DEFAULT is the common one for AES-256 keys
+    return spec.startswith("SYMMETRIC")
+
+
+def _rotation_enabled(kms, key_id: str, log: logging.Logger) -> Optional[bool]:
+    try:
+        resp = kms.get_key_rotation_status(KeyId=key_id)
+        return bool(resp.get("KeyRotationEnabled"))
+    except ClientError as exc:
+        # For asymmetric keys/KMS constraints, this may fail → treat as unknown
+        log.debug("[kms] get_key_rotation_status failed for %s: %s", key_id, exc)
+        return None
+
+
+def _latest_kms_use_fast(
     cloudtrail,
     key_arn: str,
-    key_id: str,
-    start_time: datetime,
-    end_time: datetime,
+    lookback_days: int,
     log: logging.Logger,
-) -> bool:
+) -> Optional[datetime]:
     """
-    Return True if CloudTrail shows at least one usage event for the key
-    between start_time and end_time (inclusive).
-    Tries both ResourceName=key_arn and ResourceName=key_id.
+    Best-effort 'last used' from CloudTrail with a single LookupEvents call.
+    Returns a timezone-aware datetime or None. Never raises.
     """
-    def _lookup(resource_name: str) -> bool:
-        paginator = cloudtrail.get_paginator("lookup_events")
-        for page in paginator.paginate(
-            LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": resource_name}],
-            StartTime=start_time,
-            EndTime=end_time,
-        ):
-            for event in page.get("Events", []):
-                try:
-                    if event.get("EventSource") != "kms.amazonaws.com":
-                        continue
-                    # EventName is directly on the event; still, be defensive:
-                    event_name = event.get("EventName")
-                    if event_name in _USAGE_EVENTS:
-                        return True
-                    # Fallback: parse CloudTrail event JSON for deeper signals if needed
-                    event_data = event.get("CloudTrailEvent")
-                    if event_data:
-                        data = json.loads(event_data)
-                        name = data.get("eventName")
-                        if name in _USAGE_EVENTS:
-                            return True
-                except Exception:  # pylint: disable=broad-except
-                    # If parsing fails, just ignore this event
-                    continue
-        return False
-
-    # Try matching by ARN first, then by key_id.
-    if _lookup(key_arn):
-        return True
-    if _lookup(key_id):
-        return True
-    log.debug("[kms usage] No usage found for %s in CloudTrail within window.", key_arn)
-    return False
-
-
-def _first_alias_for_key(kms, key_id: str) -> Optional[str]:
-    """Return the first alias name (e.g., 'alias/app/key'), if any."""
-    try:
-        resp = kms.list_aliases(KeyId=key_id)
-        for alias in resp.get("Aliases", []) or []:
-            name = alias.get("AliasName")
-            if name:
-                return name
-    except ClientError:
-        # Ignore alias lookup errors
+    if cloudtrail is None:
         return None
-    return None
+
+    end = datetime.now(timezone.utc).replace(microsecond=0)
+    start = end - timedelta(days=int(lookback_days))
+
+    try:
+        resp = cloudtrail.lookup_events(
+            LookupAttributes=[
+                {"AttributeKey": "ResourceName", "AttributeValue": key_arn}
+            ],
+            StartTime=start,
+            EndTime=end,
+            MaxResults=50,  # one page only
+        )
+    except ClientError as exc:
+        log.debug("[kms] lookup_events skipped for %s: %s", key_arn, exc)
+        return None
+
+    latest = None
+    for e in resp.get("Events") or []:
+        et = e.get("EventTime")
+        if isinstance(et, datetime):
+            et = et if et.tzinfo else et.replace(tzinfo=timezone.utc)
+            latest = et if latest is None else max(latest, et)
+    return latest
 
 
-# ------------------------------ checker -------------------------------- #
+# ------------------------------ main checker ----------------------------- #
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_kms_customer_managed_keys(  # pylint: disable=unused-argument
     *args,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 90,
+    use_cloudtrail: bool = True,
     **kwargs,
 ) -> None:
     """
-    Enumerate customer-managed KMS keys and write CSV rows with Flags, Estimated_Cost_USD,
-    Potential_Saving_USD and Signals.
+    Flag:
+      - KMSKeyUnused            : no CloudTrail events in lookback window
+      - KMSKeyDisabled          : key state != Enabled
+      - KMSKeyPendingDeletion   : key is PendingDeletion
+      - KMSKeyNoRotation        : rotation not enabled (if eligible)
+      - KMSKeyNoAlias           : key has no aliases
 
-    Flags:
-      - CustomerManagedKeyUnused          (no data-plane usage in lookback window)
-      - CustomerManagedKeyDisabled        (KeyState != 'Enabled')
-      - CustomerManagedKeyPendingDeletion (KeyState == 'PendingDeletion')
-      - CustomerManagedKeyNoRotation      (rotation is False, when queryable)
-
-    Potential savings heuristic:
-      - If key is pending deletion or disabled: potential_saving = estimated_cost
-      - Else if unused in lookback window:     potential_saving = estimated_cost
-      - Else:                                  potential_saving = 0.0
+    Estimated cost:
+      - price("KMS","CMK_MONTH") per key (heuristic)
+      - potential_saving = estimated_cost if unused (heuristic)
     """
-    _require_config()
-    log = _logger(logger)
-
-    writer, kms, cloudtrail = _extract_writer_kms_cloudtrail(args, kwargs)
-
-    region = getattr(getattr(kms, "meta", None), "region_name", "") or ""
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
-    start_time = now_utc - timedelta(days=lookback_days)
-
-    # Base monthly price per CMK (fallback to 0.0 if not found in pricebook)
-    price_per_key = config.safe_price("KMS", "CMK_MONTH")
+    log = _logger(kwargs.get("logger") or logger)
 
     try:
-        key_paginator = kms.get_paginator("list_keys")
-        for key_page in key_paginator.paginate():
-            for key_ref in key_page.get("Keys", []) or []:
-                key_id = key_ref.get("KeyId")
-                if not key_id:
-                    continue
+        writer, kms, cloudtrail = _extract_writer_kms_ct(args, kwargs)
+    except TypeError as exc:
+        log.warning("[check_kms_customer_managed_keys] Skipping: %s", exc)
+        return
+    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
+        log.warning("[check_kms_customer_managed_keys] Skipping: checker config not provided.")
+        return
 
-                # Describe to filter for CUSTOMER-managed + richer metadata
-                try:
-                    meta_resp = kms.describe_key(KeyId=key_id)
-                except ClientError as exc:
-                    log.debug("DescribeKey failed for %s: %s", key_id, exc)
-                    continue
+    region = getattr(getattr(kms, "meta", None), "region_name", "") or ""
 
-                meta = (meta_resp or {}).get("KeyMetadata", {}) or {}
-                key_manager = meta.get("KeyManager")  # 'CUSTOMER' or 'AWS'
-                if key_manager != "CUSTOMER":
-                    continue  # we only report customer-managed keys
+    # Preload aliases for all keys to avoid per-key calls
+    aliases_by_key = _alias_map(kms, log)
 
-                key_arn = meta.get("Arn", key_id)
-                key_state = meta.get("KeyState")
-                enabled = key_state == "Enabled"
-                pending_deletion = key_state == "PendingDeletion"
-                key_spec = meta.get("KeySpec")
-                key_usage = meta.get("KeyUsage")
-                origin = meta.get("Origin")
-                multi_region = bool(meta.get("MultiRegion"))
-                creation_date = meta.get("CreationDate")
-                deletion_date = meta.get("DeletionDate")
-                rotation_enabled: Optional[bool] = None
+    # List CUSTOMER keys
+    key_ids = _list_customer_keys(kms, log)
+    if not key_ids:
+        log.info("[check_kms_customer_managed_keys] No customer keys in %s", region)
+        return
 
-                # Rotation is only supported for certain symmetric keys; ignore errors.
-                try:
-                    rot_resp = kms.get_key_rotation_status(KeyId=key_id)
-                    rotation_enabled = bool(rot_resp.get("KeyRotationEnabled"))
-                except ClientError:
-                    rotation_enabled = None
+    price_key_month = config.safe_price("KMS", "CMK_MONTH", 1.0)
 
-                alias_name = _first_alias_for_key(kms, key_id)
+    for kid in key_ids:
+        try:
+            d = kms.describe_key(KeyId=kid).get("KeyMetadata", {}) or {}
+        except ClientError as exc:
+            log.debug("[kms] describe_key failed for %s: %s", kid, exc)
+            continue
 
-                # Determine usage in CloudTrail within the lookback window
-                used_recently = _cloudtrail_has_recent_kms_usage(
-                    cloudtrail=cloudtrail,
-                    key_arn=key_arn,
-                    key_id=key_id,
-                    start_time=start_time,
-                    end_time=now_utc,
-                    log=log,
-                )
+        arn = d.get("Arn") or kid
+        state = (d.get("KeyState") or "").upper()
+        created = d.get("CreationDate")
+        deletion_date = d.get("DeletionDate")
+        key_spec = d.get("KeySpec")
+        multi_region = bool(d.get("MultiRegion"))
+        manager = d.get("KeyManager")
+        origin = d.get("Origin")
+        aliases = aliases_by_key.get(kid, [])  # may be empty
 
-                flags: List[str] = []
-                if not used_recently:
-                    flags.append("CustomerManagedKeyUnused")
-                if not enabled:
-                    flags.append("CustomerManagedKeyDisabled")
-                if pending_deletion:
-                    flags.append("CustomerManagedKeyPendingDeletion")
-                if rotation_enabled is False:
-                    flags.append("CustomerManagedKeyNoRotation")
+        # Rotation
+        rot_enabled = None
+        if _rotation_eligible(d):
+            rot_enabled = _rotation_enabled(kms, kid, log)
 
-                estimated_cost = price_per_key
-                potential_saving = 0.0
-                if pending_deletion or (not enabled) or (not used_recently):
-                    potential_saving = estimated_cost
+        # CloudTrail last use (fast/optional)
+        last_used_dt = None
+        if use_cloudtrail:
+            last_used_dt = _latest_kms_use_fast(cloudtrail, arn, lookback_days, log)
 
-                signals = _signals_str(
-                    {
-                        "Region": region,
-                        "KeyId": key_id,
-                        "Arn": key_arn,
-                        "Alias": alias_name or "",
-                        "KeyState": key_state,
-                        "Enabled": enabled,
-                        "Manager": key_manager,
-                        "MultiRegion": multi_region,
-                        "KeySpec": key_spec,
-                        "KeyUsage": key_usage,
-                        "Origin": origin,
-                        "RotationEnabled": rotation_enabled,
-                        "CreationDate": _to_utc_iso(creation_date),
-                        "DeletionDate": _to_utc_iso(deletion_date),
-                        "UsedRecently": used_recently,
-                        "LookbackDays": lookback_days,
-                    }
-                )
+        # Flags
+        flags: List[str] = []
+        if state != "ENABLED":
+            flags.append("KMSKeyDisabled")
+        if state == "PENDINGDELETION":
+            flags.append("KMSKeyPendingDeletion")
+        if _rotation_eligible(d) and rot_enabled is False:
+            flags.append("KMSKeyNoRotation")
+        if not aliases:
+            flags.append("KMSKeyNoAlias")
 
-                # type: ignore[call-arg]
-                config.WRITE_ROW(
-                    writer=writer,
-                    resource_id=key_arn,
-                    name=alias_name or key_arn,  # prefer alias for readability
-                    owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                    resource_type="KMSCustomerManagedKey",
-                    estimated_cost=estimated_cost,
-                    potential_saving=potential_saving,
-                    flags=flags if flags else [""],  
-                    confidence=100,
-                    signals=signals,
-                )
+        unused = False
+        if use_cloudtrail:
+            if last_used_dt is None:
+                unused = True
+            else:
+                cutoff = datetime.now(timezone.utc) - timedelta(days=int(lookback_days))
+                unused = last_used_dt < cutoff
+        if unused:
+            flags.append("KMSKeyUnused")
 
-                log.info(
-                    "[check_kms_customer_managed_keys] Wrote key: %s (flags=%s est=%.2f save=%.2f)",
-                    key_arn,
-                    flags,
-                    estimated_cost,
-                    potential_saving,
-                )
+        if not flags:
+            log.info("[kms] Processed key: %s (no flags)", kid)
+            continue
 
-    except ClientError as exc:
-        log.error("Error checking KMS Customer-Managed Keys: %s", exc)
-        raise
+        estimated_cost = float(price_key_month)
+        potential_saving = estimated_cost if unused else 0.0
+
+        signals = _signals_str(
+            {
+                "Region": region,
+                "KeyId": kid,
+                "Arn": arn,
+                "State": state,
+                "KeySpec": key_spec,
+                "Manager": manager,
+                "Origin": origin,
+                "MultiRegion": multi_region,
+                "Aliases": ",".join(aliases),
+                "CreatedAt": _to_utc_iso(created) if isinstance(created, datetime) else None,
+                "DeletionAt": _to_utc_iso(deletion_date)
+                if isinstance(deletion_date, datetime) else None,
+                "LastUsedAt": _to_utc_iso(last_used_dt) if last_used_dt else None,
+                "LookbackDays": lookback_days,
+                "RotationEligible": _rotation_eligible(d),
+                "RotationEnabled": rot_enabled,
+            }
+        )
+
+        # Name hint: first alias without 'alias/' prefix, else KeyId
+        name = aliases[0].split("/", 1)[-1] if aliases else kid
+
+        try:
+            # type: ignore[call-arg]
+            config.WRITE_ROW(
+                writer=writer,
+                resource_id=arn,
+                name=name,
+                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
+                resource_type="KMSKey",
+                estimated_cost=estimated_cost,
+                potential_saving=potential_saving,
+                flags=flags,
+                confidence=100,
+                signals=signals,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            log.warning("[kms] write_row failed for %s: %s", kid, exc)
+
+        log.info("[kms] Wrote key: %s (flags=%s)", kid, flags)
