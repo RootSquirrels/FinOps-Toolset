@@ -152,8 +152,6 @@ import logging
 from typing import Dict, Iterable, Optional, List, Tuple, Union, Callable, Any, TypeVar, Set, Type
 from datetime import datetime, timezone, timedelta
 import json
-import random
-from functools import wraps
 from botocore.exceptions import ClientError, EndpointConnectionError, NoCredentialsError # type: ignore
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from botocore.config import Config # type: ignore
@@ -162,7 +160,6 @@ from statistics import fmean
 from enum import Enum
 import string
 import re
-from statistics import median
 from contextlib import contextmanager
 from time import perf_counter
 import threading
@@ -194,43 +191,9 @@ from finops_toolset.config import (
 from finops_toolset.pricing import PRICING as PRICING, get_price as get_price
 import core.cloudwatch as cw
 import checkers.eip as eip
+from core.retry import retry_with_backoff
 
 #endregion
-
-#region RETRY
-
-def retry_with_backoff(max_retries=3, backoff_factor=1.5, jitter=True, exceptions=(ClientError, EndpointConnectionError, NoCredentialsError)):
-    """
-    Decorator to retry a function with exponential backoff and optional jitter. -> Used of jitter to avoid thundering herd 
-    
-    Args:
-        max_retries (int): Maximum number of retries.
-        backoff_factor (float): Multiplier for delay between retries.
-        jitter (bool): Whether to add random jitter to delay.
-        exceptions (tuple): Exceptions to catch and retry on.
-    """
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            retries = 0
-            delay = 1.0
-            while retries < max_retries:
-                try:
-                    return func(*args, **kwargs)
-                except exceptions as e:
-                    error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', '')
-                    if error_code == 'UnauthorizedOperation':
-                        logging.error(f"[{func.__name__}] Permission denied: {e}")
-                        return None
-                    retries += 1
-                    sleep_time = delay * (random.uniform(1.5, 2.5) if jitter else 1)
-                    logging.warning(f"[{func.__name__}] Retry {retries}/{max_retries} after error: {e}. Retrying in {sleep_time:.2f}s...")
-                    time.sleep(sleep_time)
-                    delay *= backoff_factor
-            logging.error(f"[{func.__name__}] Max retries exceeded.")
-            return None
-        return wrapper
-    return decorator
 
 # Configure logging
 logging.basicConfig(
@@ -240,7 +203,6 @@ logging.basicConfig(
 )
 
 #logger = logging.getLogger("aws-finops")  # base logger for your script
-#endregion
 
 
 #region CW Helpers
@@ -810,7 +772,7 @@ def get_bucket_metrics_via_cw(bucket_name: str, cw) -> tuple[Optional[float], Op
     return total_size_gb, number_of_objects, size_breakdown_gb, flags
 
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def get_bucket_last_modified(s3, bucket_name: str) -> Optional[datetime]:
     """
     Return the most recent LastModified (UTC) across all objects in the bucket.
@@ -1218,7 +1180,7 @@ def _normalize_bucket_region(raw: Optional[str]) -> str:
     return raw
 
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_s3_abandoned_multipart_uploads(writer: csv.writer, s3) -> None:
     """
     Fast, global MPU scan:
@@ -1519,7 +1481,7 @@ class AMIFlagger(ResourceFlagger):
 
 #region ENI SECTION
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_detached_network_interfaces(writer: csv.writer, ec2):
     try:
         enis = ec2.describe_network_interfaces().get("NetworkInterfaces", [])
@@ -2139,7 +2101,7 @@ BACKUP_RULE_CHECKS: List[Callable[[BackupRuleMetadata], List[str]]] = [
 ]
 
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_backup_retention_misconfigurations(writer: csv.writer, backup) -> None:
     """
     Check AWS Backup plans for misconfigured rules:
@@ -2862,7 +2824,7 @@ def flag_record(record: dict, lb_dnsnames: set[str], s3) -> list[str]:
     return flags
 
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_redundant_route53_records(writer: csv.writer, route53, elbv2, s3) -> None:
     """
     Flags potentially redundant or stale Route53 records:
@@ -2953,7 +2915,7 @@ def build_fsx_backup_metadata(backup: dict) -> FSxBackupMetadata:
         tags=tags,
     )
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_orphaned_fsx_backups(writer: csv.writer, fsx):
     """
     Check for FSx backups that are not associated with any existing FSx file system.
@@ -3047,7 +3009,7 @@ def build_log_group_metadata(log_group: dict) -> LogGroupMetadata:
     )
 
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_log_groups_with_infinite_retention(writer: csv.writer, logs) -> None:
     """
     Identify CloudWatch Log Groups with infinite retention.
@@ -3126,7 +3088,7 @@ def _sum_image_stats_from_page(page, cutoff_dt):
             stale += 1
     return total_bytes, stale, large
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def _repo_has_lifecycle_policy(ecr, repo_name: str) -> bool:
     """Return True if the repo has a lifecycle policy, False if not."""
     try:
@@ -3139,7 +3101,7 @@ def _repo_has_lifecycle_policy(ecr, repo_name: str) -> bool:
         logging.warning(f"[ECR] lifecycle policy check for {repo_name} failed: {e}")
         return True  # assume True to avoid noisy "NoLifecyclePolicy" in case of perms issues
 
-@retry_with_backoff()
+
 def _describe_images_iter(ecr, repo_name: str):
     """Yield pages from describe_images with large page size and tagStatus=ANY."""
     paginator = ecr.get_paginator("describe_images")
@@ -3151,7 +3113,7 @@ def _describe_images_iter(ecr, repo_name: str):
     ):
         yield page
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def build_ecr_repo_metadata_fast(ecr, repo_info: dict) -> Optional[ECRRepositoryMetadata]:
     """
     Faster per-repository aggregation:
@@ -3209,7 +3171,7 @@ def build_ecr_repo_metadata_fast(ecr, repo_info: dict) -> Optional[ECRRepository
         flags=flags,
     )
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_ecr_storage_and_staleness(writer: csv.writer, ecr) -> None:
     """
     Refactored ECR checker:
@@ -3271,7 +3233,7 @@ def check_ecr_storage_and_staleness(writer: csv.writer, ecr) -> None:
 
 #region VPC/TGW SECTION
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_inter_region_vpc_and_tgw_peerings(writer: csv.writer, ec2, cloudwatch) -> None:
     """
     Detect and cost-estimate inter-region VPC Peering and Transit Gateway (TGW) peering attachments.
@@ -3418,7 +3380,7 @@ def check_snapshot_replication(snapshot: EBSSnapshotMetadata, source_snapshot_id
         return ["SnapshotReplicated"]
     return []
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_ebs_snapshot_replication(writer: csv.writer, ec2) -> None:
     """
     Identify EBS snapshots that are replicated to other regions.
@@ -3940,7 +3902,7 @@ def check_dynamodb_cost_optimization(
 
 #region FSR SECTION
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_ebs_fast_snapshot_restore(writer: csv.writer, ec2):
     try:
         resp = ec2.describe_fast_snapshot_restores().get("FastSnapshotRestores", [])
@@ -3964,7 +3926,7 @@ def check_ebs_fast_snapshot_restore(writer: csv.writer, ec2):
 
 
 #region EKS SECTION
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_eks_empty_clusters(writer: csv.writer, eks, ec2) -> None:
     """
     Flag clusters with no nodegroups and no Fargate profiles; estimate control-plane burn.
@@ -4027,7 +3989,7 @@ def check_unattached_volume(vol: EBSVolumeMetadata) -> List[str]:
         return flags
     return []
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_ebs_unattached_and_rightsize(
     writer: csv.writer,
     ec2,
@@ -4334,7 +4296,7 @@ def check_unassociated_waf_acl(acl: WAFV2WebACLMetadata, wafv2) -> List[str]:
     return []
 
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_wafv2_unassociated_acls(writer: csv.writer, wafv2, region_name: str) -> None:
     """
     Identify unassociated WAFv2 Web ACLs and write potential savings to CSV.
@@ -4474,7 +4436,7 @@ RDS_SNAPSHOT_CHECKS: List[Callable[..., List[str]]] = [
 ]
 
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_rds_snapshots(writer: csv.writer, rds) -> None:
     """
     Flags RDS snapshots that are:
@@ -4533,7 +4495,7 @@ def check_rds_snapshots(writer: csv.writer, rds) -> None:
 
 #region EXTENDED SUPPORT
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_rds_extended_support_mysql(writer: csv.writer, rds) -> None:
     """
     Detect RDS MySQL 5.7 and Aurora MySQL 2.x instances under extended support.
@@ -4593,7 +4555,7 @@ def check_rds_extended_support_mysql(writer: csv.writer, rds) -> None:
 
 
 #region AMI SECTION
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def get_tags(resource_id: str, ec2) -> dict[str, str]:
     """
     Retrieve tags for a given AWS resource.
@@ -4629,7 +4591,7 @@ def is_referenced_in_cfn(ami_id, cached_templates):
     return "No"
 
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def get_ami_ids(ec2):
     """
     Retrieve a list of AMI IDs owned by the current AWS account.
@@ -4644,7 +4606,6 @@ def get_ami_ids(ec2):
         return []
 
 
-@retry_with_backoff()
 def is_referenced_in_templates(ami_id):
     """
     Check if the AMI ID is referenced in local template files (YAML, YML, JSON).
@@ -4666,7 +4627,7 @@ def is_referenced_in_templates(ami_id):
                         return "Error"
     return "No"
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def is_referenced_in_ec2(ami_id, ec2):
     """
     Check if the AMI ID is used by any EC2 instances.
@@ -4686,7 +4647,8 @@ def is_referenced_in_ec2(ami_id, ec2):
         logging.warning(f"Error checking EC2 references for {ami_id}: {e}")
     return "No"
 
-@retry_with_backoff()
+
+@retry_with_backoff(exceptions=(ClientError,))
 def is_referenced_in_launch_templates(ami_id, ec2):
     """
     Check if the AMI ID is used in any EC2 launch templates.
@@ -4706,7 +4668,8 @@ def is_referenced_in_launch_templates(ami_id, ec2):
         logging.warning(f"Error checking launch templates for {ami_id}: {e}")
     return "No"
 
-@retry_with_backoff()
+
+@retry_with_backoff(exceptions=(ClientError,))
 def is_referenced_in_asg(ami_id, autoscaling):
     """
     Check if the AMI ID is used in any Auto Scaling Groups.
@@ -4727,6 +4690,7 @@ def is_referenced_in_asg(ami_id, autoscaling):
         logging.warning(f"Error checking ASG references for {ami_id}: {e}")
     return "No"
 
+
 def load_existing_ami_ids():
     """
     Load existing AMI IDs from the output CSV file to avoid duplication.
@@ -4741,7 +4705,7 @@ def load_existing_ami_ids():
         return {row[0] for row in reader if row}
 
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def get_launch_permissions(ami_id, ec2):
     """
     Check if the AMI is shared with other AWS accounts or is public.
@@ -4755,7 +4719,7 @@ def get_launch_permissions(ami_id, ec2):
         logging.warning(f"Error checking launch permissions for {ami_id}: {e}")
         return "Unknown"
 
-@retry_with_backoff()
+
 def cache_all_cfn_templates(cfn):
     """
     Retrieve and cache all CloudFormation templates in the region.
@@ -4814,7 +4778,7 @@ def get_cached_reference(ami_id: str, cached_templates, ec2, autoscaling) -> str
     return referenced
 
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def get_snapshot_storage(snapshot_ids: List[str], ec2) -> float:
     """
     Calculate the total storage size in GB for a list of snapshot IDs.
@@ -5030,7 +4994,7 @@ KINESIS_CHECKS: List[Callable[..., List[str]]] = [
 ]
 
 
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_kinesis_streams(writer: csv.writer, kinesis, cw) -> None:
     """
     Identify potentially wasteful Kinesis Streams:
@@ -5119,7 +5083,8 @@ def build_ssm_metadata(param: dict) -> SSMParameterMetadata:
         monthly_cost=monthly_cost,
     )
 
-@retry_with_backoff()
+
+@retry_with_backoff(exceptions=(ClientError,))
 def check_ssm_advanced_parameters(writer: csv.writer, ssm):
     """
     Flags Advanced tier parameters, highlighting stale ones (> SSM_ADV_STALE_DAYS).
@@ -5343,7 +5308,7 @@ def check_idle_ec2_instances(writer, ec2, cloudwatch,) -> None:
 #endregion
 
 #region ACM & KMS SECTION
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_acm_private_certificates(writer: csv.writer, cloudfront) -> None:
     """
     Find ACM private certificates that are not in use (InUseBy == []) and flag them.
@@ -5367,7 +5332,7 @@ def check_acm_private_certificates(writer: csv.writer, cloudfront) -> None:
         for region in REGIONS:
             try:
                 acm = boto3.client("acm", region_name=region, config=SDK_CONFIG)  # type: ignore
-            except Exception as e:
+            except ClientError as e:
                 logging.warning(f"[ACM] Init client failed for {region}: {e}")
                 continue
 
@@ -5442,8 +5407,9 @@ def check_acm_private_certificates(writer: csv.writer, cloudfront) -> None:
         logging.error(f"[check_acm_private_certificates] Unexpected error: {e}")
 
 
-@retry_with_backoff()
-def check_kms_customer_managed_keys(writer: csv.writer, cloudtrail, kms, lookback_days: int = 90) -> None:
+@retry_with_backoff(exceptions=(ClientError,))
+def check_kms_customer_managed_keys(writer: csv.writer, 
+    cloudtrail, kms, lookback_days: int = 90) -> None:
     """
     Analyze KMS Customer Managed Keys (CMKs):
     - Estimate monthly storage cost (~$1/key/month; +$1 for first/second rotation; prorated).
@@ -5791,7 +5757,7 @@ def check_cloudfront_idle_distributions(
 
 
 #region PRIVATE CA SECTION
-@retry_with_backoff()
+@retry_with_backoff(exceptions=(ClientError,))
 def check_private_certificate_authorities(writer: csv.writer) -> None:
     """
     Flag potentially idle or misconfigured AWS Private CAs and estimate monthly cost.
@@ -5904,7 +5870,7 @@ def check_private_certificate_authorities(writer: csv.writer) -> None:
                         flags.append("IdlePrivateCA")
                         flags.append(f"PotentialSaving={est_monthly}$")
                     if status == "DISABLED":
-                        flags.append("DisabledCA(StillBilled)")  # disabled still billed until deleted
+                        flags.append("DisabledCA(StillBilled)")
                     if status not in ("ACTIVE", "DISABLED"):
                         flags.append(f"Status={status}")
 
@@ -5981,14 +5947,14 @@ def main():
                       fn=check_s3_buckets_refactored,
                       writer=writer,
                       s3=s3_global)
-              
+
             run_check(profiler,
                     check_name="check_s3_abandoned_multipart_uploads",
                     region="GLOBAL",
                     fn=check_s3_abandoned_multipart_uploads,
                     writer=writer,
                     s3=s3_global)
-            
+
             run_check(
                 profiler=profiler,
                 check_name="check_acm_private_certificates",
@@ -5997,7 +5963,7 @@ def main():
                 writer=writer,
                 cloudfront=cloudfront_global
             )
-    
+
             # -------- Per-region steps
             for region in REGIONS:
                 logging.info(f"Running cleanup for region: {region}")
@@ -6070,9 +6036,9 @@ def main():
                           fn=check_dynamodb_cost_optimization, writer=writer,
                           dynamodb=clients['dynamodb'], cloudwatch=clients['cloudwatch'])
 
-                run_check(profiler, check_name="check_inter_region_vpc_and_tgw_peerings", region=region,
-                          fn=check_inter_region_vpc_and_tgw_peerings, writer=writer,
-                          ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
+                run_check(profiler, check_name="check_inter_region_vpc_and_tgw_peerings", 
+                          region=region, fn=check_inter_region_vpc_and_tgw_peerings, 
+                          writer=writer, ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
 
                 run_check(profiler, check_name="check_ecr_storage_and_staleness", region=region,
                           fn=check_ecr_storage_and_staleness, writer=writer, ecr=clients['ecr'])
@@ -6081,7 +6047,8 @@ def main():
                           fn=check_ebs_fast_snapshot_restore, writer=writer, ec2=clients['ec2'])
 
                 run_check(profiler, check_name="check_eks_empty_clusters", region=region,
-                          fn=check_eks_empty_clusters, writer=writer, eks=clients['eks'], ec2=clients['ec2'])
+                          fn=check_eks_empty_clusters, writer=writer, 
+                          eks=clients['eks'], ec2=clients['ec2'])
 
                 run_check(profiler, check_name="check_ebs_unattached_and_rightsize", region=region,
                           fn=check_ebs_unattached_and_rightsize, writer=writer,
@@ -6116,11 +6083,13 @@ def main():
                 run_check(profiler, "check_private_certificate_authorities", region, 
                 check_private_certificate_authorities, writer)
 
-                run_check(profiler=profiler, check_name="check_kms_customer_managed_keys", region=region,
-                fn=check_kms_customer_managed_keys, writer=writer, cloudtrail=clients['cloudtrail'], kms=clients['kms'])
+                run_check(profiler=profiler, check_name="check_kms_customer_managed_keys", 
+                          region=region, fn=check_kms_customer_managed_keys, writer=writer, 
+                          cloudtrail=clients['cloudtrail'], kms=clients['kms'])
 
-                run_check(profiler=profiler, check_name="check_nat_replacement_opps", region=region,
-                fn=check_nat_replacement_opps, writer=writer, ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
+                run_check(profiler=profiler, check_name="check_nat_replacement_opps", 
+                          region=region, fn=check_nat_replacement_opps, writer=writer, 
+                          ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
 
 
         profiler.dump_csv()
@@ -6129,8 +6098,7 @@ def main():
         logging.info(f"Profile export complete: {PROFILE_FILE}")
 
     except Exception as e:
-        logging.error(f"[main] Fatal error: {e}")    
-        
+        logging.error(f"[main] Fatal error: {e}")       
 
 if __name__ == "__main__":
     main()
