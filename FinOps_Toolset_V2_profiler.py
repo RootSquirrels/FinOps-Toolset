@@ -5882,17 +5882,44 @@ def main():
                 #graph = build_certificate_graph(regions=regions, account_id=ACCOUNT_ID)
                 #cert_summary = summarize_cert_usage(graph)
 
-                run_check(profiler, check_name="EIP", region=region,
-                          fn=eip, ec2=clients['ec2'], account_id=ACCOUNT_ID, write_row=writer,
-                          get_price_fn=get_price, logger=LOGGER, writer=writer)
+                eip_fn = partial(
+                    eip,
+                    account_id=ACCOUNT_ID,
+                    write_row=write_resource_to_csv,
+                    get_price_fn=get_price,
+                    logger=LOGGER,
+                )
+
+                run_check(
+                    profiler,
+                    check_name="check_unused_elastic_ips",
+                    region=region,
+                    fn=eip_fn,
+                    writer=writer,             
+                    ec2=clients["ec2"],
+                )
 
                 run_check(profiler, check_name="check_idle_load_balancers", region=region,
                           fn=check_idle_load_balancers, writer=writer,
                           elbv2=clients['elbv2'], cloudwatch=clients['cloudwatch'])
 
-                run_check(profiler, check_name="ENI", ec2=clients['ec2'], fn=eni,
-                          account_id=ACCOUNT_ID, write_row=writer,
-                          get_price_fn=get_price, logger=LOGGER, writer=writer)
+
+                eni_fn = partial(
+                    eni,
+                    account_id=ACCOUNT_ID,
+                    write_row=write_resource_to_csv,
+                    get_price_fn=get_price,
+                    logger=LOGGER,
+                )
+
+                run_check(
+                    profiler,
+                    check_name="eni",
+                    region=region,
+                    fn=eni_fn,
+                    writer=writer,             
+                    ec2=clients["ec2"],
+                )
 
                 run_check(profiler, check_name="check_unused_efs_filesystems", region=region,
                           fn=check_unused_efs_filesystems, writer=writer,
