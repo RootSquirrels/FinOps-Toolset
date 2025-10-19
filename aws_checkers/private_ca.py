@@ -20,13 +20,13 @@ from core.retry import retry_with_backoff
 from aws_checkers import config
 
 
-def _require_config() -> None:
+def _require_config(log) -> None:
     if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        raise RuntimeError(
-            "Checkers not configured. Call "
-            "finops_toolset.checkers.config.setup(account_id=..., write_row=..., "
-            "get_price=..., logger=...) first."
+        log.warning(
+            "[check_private_certificate_authorities] Skipping: checker config not provided "
+            "(call config.setup(...) or pass account_id/write_row/get_price)."
         )
+        return
 
 
 def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
@@ -126,8 +126,9 @@ def check_private_certificate_authorities(  # pylint: disable=unused-argument
         (i.e., eliminate the current bill for that CA).
       - For ACTIVE, set potential_saving = 0.0 by default (cannot infer usage here).
     """
-    _require_config()
     log = _logger(logger)
+    _require_config(log)
+    
     region = getattr(getattr(acmpca, "meta", None), "region_name", "") or ""
 
     try:
