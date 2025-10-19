@@ -50,6 +50,7 @@ def check_unused_elastic_ips(
                     owner_id=account_id,
                     resource_type="ElasticIP",
                     estimated_cost=get_price_fn("EIP", "UNASSIGNED_MONTH"),
+                    potential_saving=get_price_fn("EIP", "UNASSIGNED_MONTH"),
                     flags=["UnusedElasticIP"],
                     confidence=100,
                 )
