@@ -74,15 +74,9 @@ PRICING: PriceMap = {
         # (Logs Insights per-GB-scanned exists but we omit)
     },
 
-    "NAT": {
-        "HOUR": {
-            "default": 0.065,
-            "eu-west-1": 0.065,
-            "eu-west-3": 0.070,
-        },
-        "GB_PROCESSED": {
-            "default": 0.045,
-        },
+    "NATGateway": {
+        "NATGW_MONTH": 32.85,  # ≈ $0.045/h * 730h
+        "NATGW_DATA_GB": 0.045
     },
 
     "ALB": {

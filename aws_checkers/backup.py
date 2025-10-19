@@ -5,13 +5,20 @@ Includes three checks:
   - check_backup_rules_no_lifecycle: rules missing cold-storage or delete lifecycle.
   - check_backup_stale_recovery_points: old recovery points likely ready to prune.
 
+Design:
+  - Dependencies (account_id, write_row, get_price, logger) are injected once via
+    finops_toolset.checkers.config.setup(...).
+  - Each checker signature tolerates run_check calling style and will skip
+    gracefully if a required client or config is missing.
+  - Emits Flags, Signals (compact k=v pairs), Estimated_Cost_USD, Potential_Saving_USD.
+  - Time handling is timezone-aware (datetime.now(timezone.utc)).
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 
 from botocore.exceptions import ClientError
 
@@ -43,6 +50,7 @@ def _to_utc_iso(dt_obj: Optional[datetime]) -> Optional[str]:
         dt_obj = dt_obj.astimezone(timezone.utc)
     return dt_obj.replace(microsecond=0).isoformat()
 
+
 def _have_config() -> bool:
     return bool(config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE)
 
@@ -56,6 +64,52 @@ def _extract_writer_backup(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tup
             "Expected 'writer' and 'backup' (got writer=%r, backup=%r)" % (writer, backup)
         )
     return writer, backup
+
+
+# ---- robust wrapper for list_recovery_points_by_vault (handles env diffs/mocks) ---- #
+
+def _iter_recovery_points_by_vault(
+    backup,
+    vault_name: str,
+    log: logging.Logger,
+) -> Iterable[Dict[str, Any]]:
+    """
+    Yield recovery points in a vault using the best-available method name.
+
+    Tries, in order:
+      - backup.list_recovery_points_by_vault
+      - backup.list_recovery_points_by_backup_vault   (fallback seen in some stubs)
+
+    If neither exists, logs a warning and yields nothing.
+    """
+    method: Optional[Callable[..., Dict[str, Any]]] = getattr(backup, "list_recovery_points_by_vault", None)
+    if method is None:
+        method = getattr(backup, "list_recovery_points_by_backup_vault", None)
+
+    if method is None:
+        log.warning(
+            "[backup] client has no 'list_recovery_points_by_vault' method; skipping vault %s",
+            vault_name,
+        )
+        return  # nothing to iterate
+
+    next_token: Optional[str] = None
+    while True:
+        try:
+            params = {"BackupVaultName": vault_name}
+            if next_token:
+                params["NextToken"] = next_token
+            resp = method(**params)
+        except ClientError as exc:
+            log.debug("[backup] list_recovery_points_by_vault failed for %s: %s", vault_name, exc)
+            return
+
+        for rp in resp.get("RecoveryPoints", []) or []:
+            yield rp
+
+        next_token = resp.get("NextToken")
+        if not next_token:
+            break
 
 
 # ----------------------------- 1) plans without selections ---------------- #
@@ -91,11 +145,11 @@ def check_backup_plans_without_selections(  # pylint: disable=unused-argument
     region = getattr(getattr(backup, "meta", None), "region_name", "") or ""
 
     try:
-        paginator = backup.list_backup_plans
+        list_plans = backup.list_backup_plans
         next_token: Optional[str] = None
 
         while True:
-            resp = paginator(NextToken=next_token) if next_token else paginator()
+            resp = list_plans(NextToken=next_token) if next_token else list_plans()
             for bp in resp.get("BackupPlansList", []) or []:
                 plan_id = bp.get("BackupPlanId")
                 plan_name = bp.get("BackupPlanName") or plan_id
@@ -259,8 +313,8 @@ def check_backup_stale_recovery_points(  # pylint: disable=unused-argument
     region = getattr(getattr(backup, "meta", None), "region_name", "") or ""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=stale_days)).replace(microsecond=0)
 
-    price_warm = config.safe_price("AWSBackup", "BACKUP_WARM_GB_MONTH")
-    price_cold = config.safe_price("AWSBackup", "BACKUP_COLD_GB_MONTH")
+    price_warm = config.safe_price("AWSBackup", "BACKUP_WARM_GB_MONTH", default=0.0)
+    price_cold = config.safe_price("AWSBackup", "BACKUP_COLD_GB_MONTH", default=0.0)
 
     try:
         # enumerate vaults
@@ -272,75 +326,64 @@ def check_backup_stale_recovery_points(  # pylint: disable=unused-argument
                 if not vault_name:
                     continue
 
-                # enumerate recovery points
-                next_token_rp: Optional[str] = None
-                while True:
-                    rp_resp = backup.list_recovery_points_by_vault(
-                        BackupVaultName=vault_name,
-                        NextToken=next_token_rp,
-                    ) if next_token_rp else backup.list_recovery_points_by_vault(BackupVaultName=vault_name)
+                # enumerate recovery points (robust method resolution)
+                for rp in _iter_recovery_points_by_vault(backup, vault_name, log):
+                    arn = rp.get("RecoveryPointArn")
+                    created = rp.get("CreationDate")  # datetime
+                    status = rp.get("Status")
+                    sc = (rp.get("StorageClass") or "").upper()
+                    size_bytes = float(rp.get("BackupSizeInBytes") or 0)
+                    resource_type = rp.get("ResourceType") or ""
+                    resource_arn = rp.get("ResourceArn") or ""
+                    calc_lc = rp.get("CalculatedLifecycle") or {}
+                    delete_at = calc_lc.get("DeleteAt")
 
-                    for rp in rp_resp.get("RecoveryPoints", []) or []:
-                        arn = rp.get("RecoveryPointArn")
-                        created = rp.get("CreationDate")  # datetime
-                        status = rp.get("Status")
-                        sc = (rp.get("StorageClass") or "").upper()
-                        size_bytes = float(rp.get("BackupSizeInBytes") or 0)
-                        resource_type = rp.get("ResourceType") or ""
-                        resource_arn = rp.get("ResourceArn") or ""
-                        calc_lc = rp.get("CalculatedLifecycle") or {}
-                        delete_at = calc_lc.get("DeleteAt")
+                    if not isinstance(created, datetime) or not arn:
+                        continue
+                    created_utc = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
 
-                        if not isinstance(created, datetime) or not arn:
-                            continue
-                        created_utc = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+                    # stale if older than cutoff and still present (not EXPIRED/DELETED)
+                    if created_utc >= cutoff or status in {"EXPIRED", "DELETED"}:
+                        continue
 
-                        # stale if older than cutoff and still present (not EXPIRED/DELETED)
-                        if created_utc >= cutoff or status in {"EXPIRED", "DELETED"}:
-                            continue
+                    gb = size_bytes / (1024 ** 3) if size_bytes > 0 else 0.0
+                    est_cost = gb * (price_cold if sc == "COLD" else price_warm)
+                    potential_saving = est_cost  # heuristic: drop this old RP
 
-                        gb = size_bytes / (1024 ** 3) if size_bytes > 0 else 0.0
-                        est_cost = gb * (price_cold if sc == "COLD" else price_warm)
-                        potential_saving = est_cost  # heuristic: drop this old RP
+                    # type: ignore[call-arg]
+                    config.WRITE_ROW(
+                        writer=writer,
+                        resource_id=arn,
+                        name=vault_name,
+                        owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
+                        resource_type="AWSBackupRecoveryPoint",
+                        estimated_cost=est_cost,
+                        potential_saving=potential_saving,
+                        flags=["BackupRecoveryPointStale"],
+                        confidence=100,
+                        signals=_signals_str(
+                            {
+                                "Region": region,
+                                "Vault": vault_name,
+                                "ResourceType": resource_type,
+                                "ResourceArn": resource_arn,
+                                "StorageClass": sc,
+                                "SizeGB": round(gb, 3),
+                                "CreatedAt": _to_utc_iso(created),
+                                "DeleteAt": _to_utc_iso(delete_at) if isinstance(delete_at, datetime) else None,
+                                "Status": status,
+                                "StaleDays": stale_days,
+                            }
+                        ),
+                    )
 
-                        # type: ignore[call-arg]
-                        config.WRITE_ROW(
-                            writer=writer,
-                            resource_id=arn,
-                            name=vault_name,
-                            owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                            resource_type="AWSBackupRecoveryPoint",
-                            estimated_cost=est_cost,
-                            potential_saving=potential_saving,
-                            flags=["BackupRecoveryPointStale"],
-                            confidence=100,
-                            signals=_signals_str(
-                                {
-                                    "Region": region,
-                                    "Vault": vault_name,
-                                    "ResourceType": resource_type,
-                                    "ResourceArn": resource_arn,
-                                    "StorageClass": sc,
-                                    "SizeGB": round(gb, 3),
-                                    "CreatedAt": _to_utc_iso(created),
-                                    "DeleteAt": _to_utc_iso(delete_at) if isinstance(delete_at, datetime) else None,
-                                    "Status": status,
-                                    "StaleDays": stale_days,
-                                }
-                            ),
-                        )
-
-                        log.info(
-                            "[check_backup_stale_recovery_points] Wrote RP: %s (vault=%s sizeGB=%.3f sc=%s)",
-                            arn,
-                            vault_name,
-                            gb,
-                            sc,
-                        )
-
-                    next_token_rp = rp_resp.get("NextToken")
-                    if not next_token_rp:
-                        break
+                    log.info(
+                        "[Backup Stale] Wrote RP: %s (vault=%s sizeGB=%.3f sc=%s)",
+                        arn,
+                        vault_name,
+                        gb,
+                        sc,
+                    )
 
             next_token_v = v_resp.get("NextToken")
             if not next_token_v:
