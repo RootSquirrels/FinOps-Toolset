@@ -88,37 +88,11 @@ PRICING: PriceMap = {
         "NATGW_DATA_GB": 0.045
     },
 
-    "ALB": {
-        "HOUR": {
-            "default": 0.0225,
-            "eu-west-1": 0.0225,
-            "eu-west-3": 0.0225,
-        },
-        "LCU_HOUR": {
-            "default": 0.008,
-            "eu-west-1": 0.008,
-            "eu-west-3": 0.008,
-        },
-    },
-
-    "NLB": {
-        "HOUR": {
-            "default": 0.0225,
-            "eu-west-1": 0.0225,
-            "eu-west-3": 0.0225,
-        },
-        "NLCU_HOUR": {
-            "default": 0.006,
-            "eu-west-1": 0.006,
-            "eu-west-3": 0.006,
-        },
-    },
-
-    "CLB": {
-        "HOUR": {
-            "default": 0.0225,
-            "eu-west-1": 0.0225,
-        }
+    "ELBv2": {
+        "ALB_HR": 0.0225,
+        "NLB_HR": 0.0225,
+        "GWLB_HR": 0.0225
+        # (LCU or data processing not modeled for idle checks)
     },
 
     "NETWORK": {
@@ -132,7 +106,7 @@ PRICING: PriceMap = {
 
     "RDS": {
         # Automated backup storage (beyond free quota ~= size of DB)
-        "BACKUP_GB_MONTH": 0.095,
+        "SNAPSHOT_GB_MONTH": 0.095,
     },
 
     "EKS": {
@@ -174,6 +148,11 @@ PRICING: PriceMap = {
     "ENI": {
         "DETACHED_MONTH": 0.0
     },
+
+    "ACM": {
+        "PRIVATE_CERT_MONTH": 0.75
+    },
+
     "ACMPCA": {
         # Private CA monthly fee per CA (root or subordinate). Charged until deleted.
         "ACTIVE_MONTH": 400.00,

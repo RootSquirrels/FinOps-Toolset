@@ -148,7 +148,7 @@ Usage
 import csv
 import os
 import logging
-from typing import Dict, Optional, List, Tuple, Union, Callable, Any, TypeVar, Set, Type
+from typing import Dict, Optional, List, Union, Callable, Any, Set
 from datetime import datetime, timezone, timedelta
 
 from dataclasses import dataclass, field
@@ -161,14 +161,11 @@ from botocore.exceptions import ClientError # type: ignore
 
 from finops_toolset.config import (
     SDK_CONFIG,
-    REGIONS, OUTPUT_FILE, LOG_FILE, REQUIRED_TAG_KEYS,
+    REGIONS, OUTPUT_FILE, LOG_FILE,
     VPC_LOOKBACK_DAYS, MIN_COST_THRESHOLD,
-    EC2_LOOKBACK_DAYS, EC2_CW_PERIOD, EC2_IDLE_CPU_PCT, EC2_IDLE_NET_GB, EC2_IDLE_DISK_OPS,
-    LOAD_BALANCER_LOOKBACK_DAYS,
 )
 
-from finops_toolset.pricing import PRICING, get_price
-import core.cloudwatch as cw
+from finops_toolset.pricing import get_price
 from aws_checkers.eip import check_unused_elastic_ips as eip
 from aws_checkers.network_interfaces import check_detached_network_interfaces as eni
 from aws_checkers import ssm as ssm_checks
@@ -191,6 +188,9 @@ from aws_checkers import ec2 as ec2_checks
 from aws_checkers import loggroups as lg_checks
 from aws_checkers import fsx as fsx_checks
 from aws_checkers import rds_snapshots as rds_snaps
+from aws_checkers import lb as lb_checks
+from aws_checkers import wafv2 as waf_checks
+from aws_checkers import acm as acm_checks
 #endregion
 
 # Configure logging
@@ -293,6 +293,9 @@ def _fmt_dt(dt: Optional[datetime]) -> str:
 
 #region ENGINE SECTION
 
+LOGGER = logging.getLogger(__name__)
+LOGGER.addHandler(logging.NullHandler())
+
 def init_clients(region: str):
     """Create boto3 clients for the toolset."""
     return {
@@ -321,6 +324,7 @@ def init_clients(region: str):
         "cloudtrail": boto3.client("cloudtrail", config=SDK_CONFIG),
         "kms": boto3.client("kms", region_name=region, config=SDK_CONFIG),
         "acm-pca": boto3.client("acm-pca", region_name=region, config=SDK_CONFIG),
+        "acm": boto3.client("acm", region_name=region, config=SDK_CONFIG),
         "firehose": boto3.client("firehose", region_name=region, config=SDK_CONFIG),
     }
 
@@ -497,303 +501,6 @@ def run_step(profiler: RunProfiler,
                      ok=ok, error=err, started_at=start_ts, ended_at=datetime.now(timezone.utc))
         logging.info("[PROFILE] %-40s  %-12s  %6.2fs  rows=%d  ok=%s",
                      step_name, region, dt, 0, ok)
-
-#endregion
-
-
-#region LB SECTION
-
-_T = TypeVar("_T")
-LOGGER = logging.getLogger(__name__)
-LOGGER.addHandler(logging.NullHandler())
-
-ExceptionTypes = Union[Type[BaseException], Tuple[Type[BaseException], ...]]
-
-def _normalize_swallow(swallow: Optional[ExceptionTypes]) -> Tuple[Type[BaseException], ...]:
-    """Normalize the `swallow` argument to a tuple of exception classes.
-
-    - None  -> (Exception,)
-    - Class -> (Class,)
-    - Tuple -> Tuple (validated)
-    """
-    if swallow is None:
-        return (Exception,)  # catch broad exceptions by default
-    if isinstance(swallow, type) and issubclass(swallow, BaseException):
-        return (swallow,)
-    if isinstance(swallow, tuple) and all(isinstance(t, type) and issubclass(t, BaseException) for t in swallow):
-        return swallow
-    # Fallback to broad catch if a bad value is passed
-    return (Exception,)
-
-def safe_aws_call(
-    func: Callable[[], _T],
-    *,
-    default: Optional[_T] = None,
-    context: str = "",
-    fallback: Optional[_T] = None,
-    swallow: Optional[ExceptionTypes] = None,
-    logger: Optional[logging.Logger] = None,
-) -> Optional[_T]:
-    """Run ``func()`` and return its value, or a default/fallback on exception.
-
-    Args:
-        func: Zero-arg callable to execute.
-        default: Preferred value when an exception is raised.
-        context: Short label for logs (e.g., 'ec2.describe_instances').
-        fallback: Secondary value if ``default`` is None (kept for backward compatibility).
-        swallow: Exception class or tuple of classes to catch. Defaults to ``Exception``.
-        logger: Optional logger (defaults to this module's ``LOGGER``).
-
-    Returns:
-        The function's return value on success; otherwise ``default`` if provided,
-        else ``fallback`` (which may be ``None``).
-    """
-    log = logger or LOGGER
-    catch: Tuple[Type[BaseException], ...] = _normalize_swallow(swallow)
-    try:
-        return func()
-    except catch as exc:  # pylint: disable=broad-exception-caught
-        log.debug("safe_aws_call(%s) failed: %s", context, exc, exc_info=True)
-        return default if default is not None else fallback
-
-
-def estimate_lb_cost(lb_type: str, region: Optional[str] = None) -> float:
-    """Return monthly base cost for a load balancer, based on hourly pricing."""
-    t = (lb_type or "").lower()
-    key = "ALB" if t in ("application", "alb") else ("NLB" if t in ("network", "nlb") else "CLB")
-    hourly_price = get_price(key, "HOUR", region=region)
-    return round(float(hourly_price) * 24 * 30, 2)
-
-
-def check_idle_load_balancers(
-    writer,
-    elbv2,       # boto3.client('elbv2') for THIS region (orchestrator-provided)
-    cloudwatch,  # boto3.client('cloudwatch') for THIS region (orchestrator-provided)
-) -> None:
-    """
-    LB checker using CloudWatch batcher with cross-AZ transfer detection.
-    - Supports both ALB and NLB.
-    - Adds per-AZ ProcessedBytes to detect skew when cross-zone is enabled.
-    - Appends flags: 'cross_az_transfer_high', 'disable_cross_zone_candidate' (conservative).
-    - Estimated cost is not asserted here (to avoid pricing regressions). Potential saving is provided for cross-AZ only.
-    """
-    try:
-        region = (
-            getattr(getattr(cloudwatch, "meta", None), "region_name", "")
-            or getattr(getattr(elbv2, "meta", None), "region_name", "")
-            or ""
-        )
-
-        now = datetime.now(timezone.utc)
-        lookback_days = max(1, LOAD_BALANCER_LOOKBACK_DAYS)  # from config.py
-        start = now - timedelta(days=lookback_days)
-        PERIOD = 300  # 5 min granularity is reasonable for ELB metrics
-
-        # ---------- 1) list LBs (ALB + NLB) ----------
-        load_balancers = []
-        marker = None
-        while True:
-            try:
-                kwargs = {"Marker": marker} if marker else {}
-                resp = elbv2.describe_load_balancers(**kwargs)
-            except ClientError as e:
-                logging.error(f"[ELB] describe_load_balancers failed in {region}: {e}")
-                break
-            load_balancers.extend(resp.get("LoadBalancers", []) or [])
-            marker = resp.get("NextMarker")
-            if not marker:
-                break
-
-        if not load_balancers:
-            return
-
-        # ---------- 2) tags ----------
-        arn_to_tags: Dict[str, Dict[str, str]] = {}
-        try:
-            # elbv2.describe_tags supports up to 20 arns per call
-            for i in range(0, len(load_balancers), 20):
-                chunk = load_balancers[i:i+20]
-                arns = [lb["LoadBalancerArn"] for lb in chunk]
-                try:
-                    tresp = elbv2.describe_tags(ResourceArns=arns) or {}
-                    for td in (tresp.get("TagDescriptions") or []):
-                        tmap = {t.get("Key",""): t.get("Value","") for t in (td.get("Tags") or [])}
-                        arn_to_tags[td.get("ResourceArn","")] = tmap
-                except ClientError:
-                    for a in arns:
-                        arn_to_tags[a] = {}
-        except Exception:
-            pass
-
-        # ---------- 3) attributes (for cross-zone) ----------
-        lb_attrs: Dict[str, Dict[str, str]] = {}
-        for lb in load_balancers:
-            arn = lb["LoadBalancerArn"]
-            try:
-                aresp = elbv2.describe_load_balancer_attributes(LoadBalancerArn=arn)
-                lb_attrs[arn] = {kv["Key"]: kv["Value"] for kv in (aresp.get("Attributes") or [])}
-            except ClientError:
-                lb_attrs[arn] = {}
-            except Exception:
-                lb_attrs[arn] = {}
-
-        # ---------- 4) batch CloudWatch metrics ----------
-        batch = cw.CloudWatchBatcher(region, client=cloudwatch)
-
-        for lb in load_balancers:
-            arn = lb["LoadBalancerArn"]
-            lb_id = arn.split("/", 1)[-1]  # CW dimension value
-            lb_type = (lb.get("Type") or "").lower()  # 'application' | 'network' | 'gateway'
-
-            if lb_type not in ("application", "network"):
-                continue  # skip GWLB here
-
-            namespace = "AWS/ApplicationELB" if lb_type == "application" else "AWS/NetworkELB"
-
-            # Total processed bytes for idle heuristics & magnitude
-            dims_lb = [{"Name": "LoadBalancer", "Value": lb_id}]
-            batch.add_q(id_hint=f"lb_bytes__{lb_id}", namespace=namespace, metric="ProcessedBytes",
-                        dims=dims_lb, stat="Sum", period=PERIOD)
-
-            # Requests (ALB only) — harmless to skip for NLB
-            if lb_type == "application":
-                batch.add_q(id_hint=f"alb_req__{lb_id}", namespace="AWS/ApplicationELB",
-                            metric="RequestCount", dims=dims_lb, stat="Sum", period=PERIOD)
-
-            # Per-AZ ProcessedBytes for skew & cross-zone analysis
-            az_list = [az.get("ZoneName") for az in (lb.get("AvailabilityZones") or []) if az.get("ZoneName")]
-            for az in az_list:
-                dims_az = [{"Name": "LoadBalancer", "Value": lb_id}, {"Name": "AvailabilityZone", "Value": az}]
-                batch.add_q(id_hint=f"lb_bytes_az__{lb_id}__{az}", namespace=namespace,
-                            metric="ProcessedBytes", dims=dims_az, stat="Sum", period=PERIOD)
-
-        try:
-            series = batch.execute(start, now, scan_by="TimestampDescending")
-        except Exception as e:
-            logging.exception(f"[ELB] CloudWatch batch execute failed in {region}: {e}")
-            series = {}
-
-        # ---------- 5) pricing (optional, only for cross-AZ potential) ----------
-        try:
-            inter_az_price = get_price("NETWORK", "INTER_AZ_GB", region)
-        except Exception:
-            inter_az_price = None
-        if inter_az_price is None:
-            try:
-                inter_az_price = get_price("NETWORK", "INTER_REGION_GB", region)
-            except Exception:
-                inter_az_price = 0.0
-
-        # ---------- 6) emit rows ----------
-        for lb in load_balancers:
-            try:
-                arn = lb["LoadBalancerArn"]
-                lb_id = arn.split("/", 1)[-1]
-                lb_name = lb.get("LoadBalancerName", lb_id)
-                lb_type = (lb.get("Type") or "").lower()
-                if lb_type not in ("application", "network"):
-                    continue
-
-                namespace = "AWS/ApplicationELB" if lb_type == "application" else "AWS/NetworkELB"
-                state = (lb.get("State") or {}).get("Code", "")
-                created = lb.get("CreatedTime") or now
-                if hasattr(created, "tzinfo") and created.tzinfo is None:
-                    created = created.replace(tzinfo=timezone.utc)
-                created_iso = created.astimezone(timezone.utc).isoformat()
-
-                tags = arn_to_tags.get(arn, {})
-                name = tags.get("Name", lb_name)
-
-                # Aggregate totals
-                total_bytes = float(sum(v for _, v in series.get(f"lb_bytes__{lb_id}", [])))
-                total_gb = total_bytes / (1024.0 ** 3)
-
-                req_sum = 0.0
-                if lb_type == "application":
-                    req_sum = float(sum(v for _, v in series.get(f"alb_req__{lb_id}", [])))
-
-                # Flags & signals
-                flags: List[str] = []
-                missing = [k for k in REQUIRED_TAG_KEYS if not tags.get(k)]
-                if missing:
-                    flags.append(f"MissingRequiredTags={','.join(missing)}")
-
-                # Extremely conservative idle indicator (no thresholds from config -> zero-traffic only)
-                is_idle = (total_bytes == 0.0) and ((req_sum == 0.0) if lb_type == "application" else True) and state.lower() == "active"
-                if is_idle:
-                    flags += ["idle_load_balancer_candidate", "confidence=100"]
-                    confidence = 100
-                    potential_saving = None  # we do not assert LB pricing here
-                else:
-                    confidence = None
-                    potential_saving = None
-
-                # Cross-zone analysis
-                attrs = lb_attrs.get(arn, {})
-                cross_zone = (
-                    str(attrs.get("load_balancing.cross_zone.enabled", "false")).lower() == "true"
-                    or str(attrs.get("routing.cross-zone.enabled", "false")).lower() == "true"
-                )
-
-                az_list = [az.get("ZoneName") for az in (lb.get("AvailabilityZones") or []) if az.get("ZoneName")]
-                az_bytes = []
-                for az in az_list:
-                    sid = f"lb_bytes_az__{lb_id}__{az}"
-                    az_sum = float(sum(v for _, v in series.get(sid, [])))
-                    az_bytes.append((az, az_sum))
-
-                worst = float(max((b for _, b in az_bytes), default=0.0))
-                skew = (worst / total_bytes) if total_bytes > 0 else 0.0
-
-                if cross_zone and total_bytes > 0 and skew >= 0.70:
-                    flags.append("cross_az_transfer_high")
-                    flags.append("disable_cross_zone_candidate")
-                    # Potential saving (conservative): (skew-0.5) fraction of bytes as avoidable cross-AZ
-                    avoidable_gb = max(0.0, (skew - 0.5)) * total_gb
-                    potential_xaz = round(avoidable_gb * float(inter_az_price), 2) if inter_az_price > 0 else None
-                    if potential_xaz:
-                        potential_saving = (potential_saving or 0.0) + potential_xaz
-                        potential_saving = round(potential_saving, 2)
-
-                # Signals (compact)
-                signals = {
-                    "Region": region,
-                    "Type": lb_type,
-                    "CrossZone": str(cross_zone).lower(),
-                    "AZSkew": f"{skew:.3f}",
-                    f"BytesGB{lookback_days}d": f"{total_gb:.3f}",
-                }
-                if lb_type == "application":
-                    signals[f"Requests{lookback_days}d"] = f"{int(req_sum)}"
-
-                # Estimated cost left unchanged here to avoid regression; keep as blank string
-                write_resource_to_csv(
-                    writer=writer,
-                    resource_id=arn,
-                    name=name,
-                    resource_type="ALB" if lb_type == "application" else "NLB",
-                    owner_id=ACCOUNT_ID,
-                    state=state,
-                    creation_date=created_iso,
-                    storage_gb="",                 # n/a
-                    estimated_cost="",             # avoid pricing regression
-                    app_id=tags.get("ApplicationID", "NULL"),
-                    app=tags.get("Application", "NULL"),
-                    env=tags.get("Environment", "NULL"),
-                    referenced_in="",
-                    flags=flags,
-                    object_count="",               # n/a
-                    potential_saving=potential_saving,
-                    confidence=confidence,
-                    signals=signals,
-                )
-
-            except Exception as e:
-                logging.exception(f"[ELB] emit failed for {lb.get('LoadBalancerName','?')} in {region}: {e}")
-
-    except Exception as e:
-        logging.exception(f"[ELB] check_idle_load_balancers_refactored failed: {e}")
-        return
 
 #endregion
 
@@ -1083,101 +790,6 @@ def check_eks_empty_clusters(writer: csv.writer, eks, ec2) -> None:
         logging.error(f"[check_eks_empty_clusters] {e}")
 #endregion
 
-#region WAFV2 SECTION
-
-@dataclass
-class WAFV2WebACLMetadata:
-    name: str
-    arn: str
-    acl_id: str
-    scope: str
-    monthly_cost: float
-    flags: Set[str] = field(default_factory=set)
-
-
-def estimate_wafv2_web_acl_cost() -> float:
-    """Return the base monthly cost for a Web ACL."""
-    return get_price("WAFV2", "WEBACL_MONTH")
-
-
-def check_unassociated_waf_acl(acl: WAFV2WebACLMetadata, wafv2) -> List[str]:
-    """Flag Web ACLs with no associated resources."""
-    assoc = safe_aws_call(
-        lambda: wafv2.list_resources_for_web_acl(WebACLArn=acl.arn),
-        fallback={"ResourceArns": []},
-        context=f"WAFv2:{acl.name}:ListResources"
-    )
-    resources = assoc.get("ResourceArns", [])
-    if not resources:
-        flags = [f"UnassociatedWebACL(scope={acl.scope})"]
-        if acl.monthly_cost > 0:
-            flags.append(f"PotentialSaving={acl.monthly_cost}$")
-        return flags
-    return []
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_wafv2_unassociated_acls(writer: csv.writer, wafv2, region_name: str) -> None:
-    """
-    Identify unassociated WAFv2 Web ACLs and write potential savings to CSV.
-    Handles REGIONAL and CLOUDFRONT scopes (CLOUDFRONT only in us-east-1).
-    """
-    try:
-        scopes = ["REGIONAL"]
-        if region_name == "us-east-1":
-            scopes.append("CLOUDFRONT")
-
-        for scope in scopes:
-            next_marker = None
-            while True:
-                params = {"Scope": scope, "Limit": 100}
-                if next_marker:
-                    params["NextMarker"] = next_marker
-
-                resp = safe_aws_call(
-                    lambda: wafv2.list_web_acls(**params),
-                    fallback={"WebACLs": []},
-                    context=f"WAFv2:{scope}:ListWebACLs"
-                )
-
-                for acl in resp.get("WebACLs", []):
-                    metadata = WAFV2WebACLMetadata(
-                        name=acl.get("Name", ""),
-                        arn=acl.get("ARN", ""),
-                        acl_id=acl.get("Id", ""),
-                        scope=scope,
-                        monthly_cost=estimate_wafv2_web_acl_cost(),
-                    )
-
-                    metadata.flags.update(check_unassociated_waf_acl(metadata, wafv2))
-
-                    sig_region = "global" if scope == "CLOUDFRONT" else region_name
-
-                    if metadata.flags:
-                        write_resource_to_csv(
-                            writer=writer,
-                            resource_id=metadata.acl_id,
-                            name=metadata.name,
-                            resource_type="WAFv2WebACL",
-                            owner_id=ACCOUNT_ID,
-                            state=metadata.scope,
-                            estimated_cost=metadata.monthly_cost,
-                            flags=list(metadata.flags),
-                            confidence=100,
-                            signals={"Region": sig_region, "Scope": scope}
-                        )
-                        logging.info(f"[WAF:{metadata.name}] flags={metadata.flags} estCost≈${metadata.monthly_cost}")
-
-                next_marker = resp.get("NextMarker")
-                if not next_marker:
-                    break
-
-    except ClientError as e:
-        logging.error(f"[check_wafv2_unassociated_acls] AWS error: {e}")
-
-
-#endregion
-
 #region EXTENDED SUPPORT
 
 @retry_with_backoff(exceptions=(ClientError,))
@@ -1235,107 +847,6 @@ def check_rds_extended_support_mysql(writer: csv.writer, rds) -> None:
         logging.error(f"[check_rds_extended_support_mysql] AWS error: {e}")
     except Exception as e:
         logging.error(f"[check_rds_extended_support_mysql] Unexpected error: {e}")
-
-#endregion
-
-#region ACM SECTION
-@retry_with_backoff(exceptions=(ClientError,))
-def check_acm_private_certificates(writer: csv.writer, cloudfront) -> None:
-    """
-    Find ACM private certificates that are not in use (InUseBy == []) and flag them.
-
-    Why it matters:
-    - Private certs are usually issued from AWS Private CA. While the per-certificate
-      fee is assessed at issuance (not monthly), keeping unused certs around can still
-      drive operational risk and OCSP response handling charges; and they’re often a
-      smell that a Private CA continues to run without real consumers.  # Pricing refs:
-      - AWS Private CA: $400/mo per CA (general-purpose) or $50/mo (short-lived).  # noqa
-      - CUR dimensions include PrivateCertificatesIssued & OCSP* items.           # noqa
-    Signals include Status, NotAfter, and InUseBy count to help reviewers decide.
-
-    Notes:
-    - ACM is regional: we iterate REGIONS.
-    - The function uses boto3.client('acm') internally and guards API calls via safe_aws_call.
-      In your unit tests, safe_aws_call is patched to return fallbacks without raising.
-    """
-    try:
-        total_unused = 0
-        for region in REGIONS:
-            try:
-                acm = boto3.client("acm", region_name=region, config=SDK_CONFIG)  # type: ignore
-            except ClientError as e:
-                logging.warning(f"[ACM] Init client failed for {region}: {e}")
-                continue
-
-            # list_certificates is cheap; we filter Type=PRIVATE
-            cert_summaries = safe_aws_call(
-                lambda: acm.list_certificates().get("CertificateSummaryList", []),
-                fallback=[], context=f"ACM:{region}:ListCertificates",
-            )
-
-            # Quick filter on 'Type' where available; otherwise describe per item
-            for s in cert_summaries:
-                arn = s.get("CertificateArn", "")
-                # We still need details for InUseBy & NotAfter
-                desc = safe_aws_call(
-                    lambda: acm.describe_certificate(CertificateArn=arn).get("Certificate", {}),
-                    fallback={}, context=f"ACM:{region}:DescribeCertificate",
-                )
-                if not desc:
-                    continue
-
-                ctype = desc.get("Type") or s.get("Type") or ""
-                if str(ctype).upper() != "PRIVATE":
-                    continue
-
-                in_use_by = desc.get("InUseBy", []) or []
-                status = desc.get("Status", "")
-                not_after = desc.get("NotAfter")
-                not_after_str = not_after.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if hasattr(not_after, "astimezone") else ""
-
-                if len(in_use_by) == 0:
-                    # We do not assert a high dollar saving per cert (per-cert fee is one-time on issuance),
-                    # but we still emit a review row with clear signals.
-                    flags = ["PrivateCertNotInUse", "ConsiderRevokeOrDelete"]
-                    # Optional: tag hygiene
-                    tags = {}
-                    try:
-                        t = acm.list_tags_for_certificate(CertificateArn=arn).get("Tags", [])
-                        tags = {kv.get("Key",""): kv.get("Value","") for kv in t if kv.get("Key")}
-                    except Exception:
-                        pass
-
-                    signals = {
-                        "Region": region,
-                        "Status": status,
-                        "InUseBy": len(in_use_by),
-                        "NotAfter": not_after_str,
-                        "LookbackDays": "",  # N/A for ACM directly
-                    }
-                    # Confidence: simple—if 'InUseBy' is empty we have strong evidence
-                    confidence = score_confidence({"inuse_zero": 1.0}, evidence_ok=True)
-
-                    write_resource_to_csv(
-                        writer=writer,
-                        resource_id=arn,
-                        name=s.get("DomainName", ""),
-                        resource_type="ACMPrivateCertificate",
-                        owner_id=ACCOUNT_ID,
-                        state=status,
-                        creation_date="",     # not exposed directly in describe_certificate
-                        estimated_cost=0,     # per-cert issuance is one-time; OCSP may exist but small/variable
-                        app_id=tags.get("ApplicationID", "NULL"),
-                        app=tags.get("Application", "NULL"),
-                        env=tags.get("Environment", "NULL"),
-                        flags=flags,
-                        confidence=confidence,
-                        signals=signals,
-                    )
-                    total_unused += 1
-
-        logging.info(f"[ACM] Unused private certificates flagged: {total_unused}")
-    except Exception as e:
-        logging.error(f"[check_acm_private_certificates] Unexpected error: {e}")
 
 #endregion
 
@@ -1452,15 +963,6 @@ def main():
                 # knobs: stale_days=7
             )
 
-            run_check(
-                profiler=profiler,
-                check_name="check_acm_private_certificates",
-                region="GLOBAL",
-                fn=check_acm_private_certificates,
-                writer=writer,
-                cloudfront=cloudfront_global
-            )
-
             # -------- Per-region steps
             for region in REGIONS:
                 logging.info(f"Running cleanup for region: {region}")
@@ -1479,10 +981,6 @@ def main():
                     profiler, check_name="check_unused_elastic_ips",
                     region=region, fn=eip, writer=writer, ec2=clients["ec2"],
                 )
-
-                run_check(profiler, check_name="check_idle_load_balancers", region=region,
-                          fn=check_idle_load_balancers, writer=writer,
-                          elbv2=clients['elbv2'], cloudwatch=clients['cloudwatch'])
 
                 run_check(
                     profiler, check_name="eni",
@@ -1619,10 +1117,43 @@ def main():
                           ebs_checks.check_ebs_snapshots_old_or_orphaned, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
 
-                run_check(profiler, check_name="check_wafv2_unassociated_acls", region=region,
-                          fn=check_wafv2_unassociated_acls, writer=writer,
-                          wafv2=clients['wafv2'], region_name=region)
 
+                run_check(
+                    profiler,
+                    "check_acm_expiring_certificates",
+                    region,
+                    acm_checks.check_acm_expiring_certificates,
+                    writer=writer,
+                    acm=clients["acm"],
+                    # knobs: days=30
+                )
+
+                run_check(
+                    profiler,
+                    "check_acm_unused_certificates",
+                    region,
+                    acm_checks.check_acm_unused_certificates,
+                    writer=writer,
+                    acm=clients["acm"],
+                )
+
+                run_check(
+                    profiler,
+                    "check_acm_validation_issues",
+                    region,
+                    acm_checks.check_acm_validation_issues,
+                    writer=writer,
+                    acm=clients["acm"],
+                )
+
+                run_check(
+                    profiler,
+                    "check_acm_renewal_problems",
+                    region,
+                    acm_checks.check_acm_renewal_problems,
+                    writer=writer,
+                    acm=clients["acm"],
+                )
                 #TODO: ignore slave instances (sap db)
                 run_check(
                     profiler,
@@ -1794,6 +1325,91 @@ def main():
                     profiler, "check_loggroups_unencrypted", region,
                     lg_checks.check_loggroups_unencrypted, writer=writer,
                     logs=clients["logs"], cloudwatch=clients["cloudwatch"],
+                )
+
+
+                run_check(
+                    profiler, "check_rds_manual_snapshots_old", region,
+                    rds_snaps.check_rds_manual_snapshots_old,
+                    writer=writer, rds=clients["rds"],
+                    # knobs: stale_days=30
+                )
+
+                run_check(
+                    profiler, "check_rds_snapshots_public_or_shared", region,
+                    rds_snaps.check_rds_snapshots_public_or_shared,
+                    writer=writer, rds=clients["rds"],
+                )
+
+                run_check(
+                    profiler, "check_rds_snapshots_unencrypted", region,
+                    rds_snaps.check_rds_snapshots_unencrypted,
+                    writer=writer, rds=clients["rds"],
+                )
+
+                run_check(
+                    profiler, "check_rds_snapshots_orphaned",
+                    region, rds_snaps.check_rds_snapshots_orphaned,
+                    writer=writer, rds=clients["rds"],
+                )
+
+                run_check(
+                    profiler, "check_elbv2_idle_load_balancers",
+                    region, lb_checks.check_elbv2_idle_load_balancers,
+                    writer=writer, elbv2=clients["elbv2"],
+                    cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, min_requests=10, min_processed_bytes=10_000_000
+                )
+
+                run_check(
+                    profiler, "check_elbv2_no_registered_targets",
+                    region, lb_checks.check_elbv2_no_registered_targets,
+                    writer=writer, elbv2=clients["elbv2"], cloudwatch=clients["cloudwatch"],
+                )
+
+                run_check(
+                    profiler, "check_elbv2_unused_target_groups",
+                    region, lb_checks.check_elbv2_unused_target_groups, writer=writer,
+                    elbv2=clients["elbv2"], cloudwatch=clients["cloudwatch"],
+                )
+
+                run_check(
+                    profiler,
+                    "check_wafv2_unassociated_web_acls",
+                    region,
+                    waf_checks.check_wafv2_unassociated_web_acls,
+                    writer=writer,
+                    wafv2=clients["wafv2"],
+                    # knobs: include_cloudfront=False
+                )
+
+                run_check(
+                    profiler,
+                    "check_wafv2_logging_disabled",
+                    region,
+                    waf_checks.check_wafv2_logging_disabled,
+                    writer=writer,
+                    wafv2=clients["wafv2"],
+                )
+
+                run_check(
+                    profiler,
+                    "check_wafv2_rules_no_matches",
+                    region,
+                    waf_checks.check_wafv2_rules_no_matches,
+                    writer=writer,
+                    wafv2=clients["wafv2"],
+                    cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, include_cloudfront=False
+                )
+
+                run_check(
+                    profiler,
+                    "check_wafv2_empty_acl_associated",
+                    region,
+                    waf_checks.check_wafv2_empty_acl_associated,
+                    writer=writer,
+                    wafv2=clients["wafv2"],
                 )
 
 
