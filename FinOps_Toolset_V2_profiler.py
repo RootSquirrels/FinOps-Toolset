@@ -167,10 +167,7 @@ from finops_toolset.config import (
     REGIONS, OUTPUT_FILE, LOG_FILE, BATCH_SIZE, REQUIRED_TAG_KEYS,
     _S3_MPU_BUCKET_WORKERS, _S3_MPU_PART_WORKERS, _S3_MPU_PAGE_SIZE,
     _S3_MPU_GLOBAL_FINDINGS_CAP, _S3_MPU_PARTS_MODE,
-    DDB_LOOKBACK_DAYS, DDB_CW_PERIOD, DDB_BACKUP_AGE_DAYS,
-    EFS_LOOKBACK_DAYS, EFS_IA_LARGE_THRESHOLD_GB, EFS_IA_READS_HIGH_GB_PER_DAY,
-    EFS_IDLE_THRESHOLD_GB_PER_DAY, EFS_STANDARD_THRESHOLD_GB,
-    EFS_STANDARD_ARCHIVE_THRESHOLD_GB, EFS_BURST_CREDIT_LOW_WATERMARK, HOURS_PER_MONTH,
+    DDB_LOOKBACK_DAYS, DDB_CW_PERIOD, DDB_BACKUP_AGE_DAYS, HOURS_PER_MONTH,
     LAMBDA_LOOKBACK_DAYS, LAMBDA_ERROR_RATE_THRESHOLD, LAMBDA_LOW_CONCURRENCY_THRESHOLD,
     LAMBDA_LOW_TRAFFIC_THRESHOLD, LAMBDA_LARGE_PACKAGE_MB,
     LAMBDA_LOW_PROVISIONED_UTILIZATION, LAMBDA_VERSION_SPRAWL_THRESHOLD,
@@ -198,6 +195,8 @@ from aws_checkers import backup as backup_checks
 from aws_checkers.cloudfront import check_cloudfront_distributions
 from aws_checkers import ecr as ecr_checks
 from aws_checkers.nat_gateways import check_nat_gateways
+from aws_checkers import ebs as ebs_checks
+from aws_checkers import kinesis as kinesis_checks
 #endregion
 
 # Configure logging
@@ -3185,319 +3184,6 @@ def check_eks_empty_clusters(writer: csv.writer, eks, ec2) -> None:
         logging.error(f"[check_eks_empty_clusters] {e}")
 #endregion
 
-
-#region EBS SECTION
-
-@dataclass
-class EBSVolumeMetadata:
-    volume_id: str
-    name: str
-    volume_type: str
-    size_gb: int
-    iops: int
-    throughput: int
-    state: str
-    tags: Dict[str, str]
-    monthly_cost: float = 0.0
-    flags: Set[str] = field(default_factory=set)
-
-
-def estimate_ebs_cost(vol: EBSVolumeMetadata) -> float:
-    """Estimate monthly cost for the EBS volume including add-ons (gp3)."""
-    if vol.volume_type == "gp2":
-        return round(vol.size_gb * get_price("EBS", "GP2_GB_MONTH"), 2)
-    elif vol.volume_type == "gp3":
-        base = vol.size_gb * get_price("EBS", "GP3_GB_MONTH")
-        addl_iops = max(0, vol.iops - 3000)
-        addl_tput = max(0, vol.throughput - 125)
-        addl_cost = addl_iops * get_price("EBS", "GP3_IOPS_PER_MONTH") + addl_tput * get_price("EBS", "GP3_TPUT_MIBPS_MONTH")
-        return round(base + addl_cost, 2)
-    else:
-        return 0.0
-
-
-def check_unattached_volume(vol: EBSVolumeMetadata) -> List[str]:
-    if vol.state == "available" and vol.size_gb > 0:
-        flags = ["UnattachedEBSVolume"]
-        if vol.monthly_cost > 0:
-            flags.append(f"PotentialSaving={vol.monthly_cost}$")
-        return flags
-    return []
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_unattached_and_rightsize(
-    writer: csv.writer,
-    ec2,
-    cloudwatch,
-    chunk_size: int = 120,
-    max_workers: int = 3,
-) -> None:
-    """
-    Fast EBS analyzer:
-      • Scans volumes via DescribeVolumes (paged) with large page size
-      • Early-exits & writes unattached volumes (no CloudWatch)
-      • Batches CloudWatch GetMetricData per chunk for attached volumes
-      • Computes cold-volume, gp3 over-provision, io1/io2 -> consider gp3 in one pass
-      • Writes exactly one row per volume with all flags
-
-    Tunables:
-      chunk_size  : volumes per CW batch (<= ~120 is safe; 4 metrics/vol → ~480 MDQs)
-      max_workers : # of chunk workers; keep low (<=4) to avoid API throttling
-    """
-    try:
-        region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or ec2.meta.region_name
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=30)
-        period = 86400
-
-        # 1) Gather volumes and process in chunks
-        paginator = ec2.get_paginator("describe_volumes")
-        page_iter = paginator.paginate(PaginationConfig={"PageSize": 500})
-
-        # Storage for pending chunk (attached volumes only)
-        pending_chunk: list[dict] = []
-
-        # To write rows after processing (keep CSV writes single-threaded for safety)
-        rows_to_write: list[tuple[dict, list[str], float]] = []  # (vol_meta_dict, flags, monthly_cost)
-
-        def process_chunk(chunk: list[dict]) -> list[tuple[dict, list[str], float]]:
-            """
-            Process a chunk of *attached* volumes:
-              - Build one CW batch for bytes and/or ops
-              - Apply heuristics
-              - Return list of (vol_meta, flags, monthly_cost)
-            """
-            if not chunk:
-                return []
-
-            vol_meta: dict[str, dict] = {}
-            need_bytes: set[str] = set()  # for cold-volume check
-            need_ops: set[str] = set()    # for gp3/io1/io2 checks
-
-            for v in chunk:
-                vid = v["VolumeId"]
-                vtype = (v.get("VolumeType") or "").lower()
-                size_gb = int(v.get("Size", 0) or 0)
-                iops = int(v.get("Iops", 0) or 0)
-                throughput = int(v.get("Throughput", 0) or 0)
-                state = v.get("State", "")
-                tags = {t["Key"]: t["Value"] for t in v.get("Tags", [])} if v.get("Tags") else {}
-
-                meta = {
-                    "volume_id": vid,
-                    "name": tags.get("Name", ""),
-                    "volume_type": vtype,
-                    "size_gb": size_gb,
-                    "iops": iops,
-                    "throughput": throughput,
-                    "state": state,
-                    "tags": tags,
-                }
-                vol_meta[vid] = meta
-
-                need_bytes.add(vid)
-
-                # Collect ops for gp3 & io1/io2 only
-                if vtype in ("gp3", "io1", "io2"):
-                    need_ops.add(vid)
-
-            # 1 batch: build MDQs & fetch
-            mdqs, id_index = _ebs_build_mdqs(list(vol_meta.keys()), need_bytes, need_ops, period=period)
-            md = _ebs_collect_cw(region, mdqs, start, end)
-
-            # Apply heuristics and build results
-            out: list[tuple[dict, list[str], float]] = []
-            for vid, meta in vol_meta.items():
-                vtype = meta["volume_type"]
-                size_gb = meta["size_gb"]
-                iops = meta["iops"]
-                throughput = meta["throughput"]
-                tags = meta["tags"]
-
-                vol = EBSVolumeMetadata(
-                    volume_id=vid,
-                    name=meta["name"],
-                    volume_type=vtype,
-                    size_gb=size_gb,
-                    iops=iops,
-                    throughput=throughput,
-                    state=meta["state"],
-                    tags=tags,
-                )
-                monthly_cost = estimate_ebs_cost(vol)
-
-                flags: set[str] = set()
-
-                # ---- Cold volume (attached only) ----
-                # Sum 30d bytes
-                rb = _sum_values(md.get(id_index.get((vid, "VolumeReadBytes"), ""), []))
-                wb = _sum_values(md.get(id_index.get((vid, "VolumeWriteBytes"), ""), []))
-                total_bytes = rb + wb
-                # Threshold: < 1 GB per 100 GB of volume over 30d (same heuristic)
-                threshold_bytes = max(1, size_gb // 100) * (1024 ** 3)
-                if total_bytes <= threshold_bytes and size_gb > 0:
-                    flags.add(f"ColdVolume30d(io≈{round(total_bytes/(1024**3), 2)}GB)")
-                    flags.add("ConsiderSnapshotAndShrinkOrDetach")
-
-                # ---- gp2 -> gp3 savings (no CW) ----
-                if vtype == "gp2" and size_gb > 0:
-                    gp2 = get_price("EBS", "GP2_GB_MONTH")
-                    gp3 = get_price("EBS", "GP3_GB_MONTH")
-                    delta = (gp2 - gp3) * size_gb
-                    if delta > 0.01:
-                        flags.add("ConsiderGP3")
-                        flags.add(f"PotentialSaving={round(delta,2)}$")
-
-                # ---- gp3 over-provision (uses ops + bytes) ----
-                if vtype == "gp3" and size_gb > 0:
-                    ro = _sum_values(md.get(id_index.get((vid, "VolumeReadOps"), ""), []))
-                    wo = _sum_values(md.get(id_index.get((vid, "VolumeWriteOps"), ""), []))
-                    total_ops = ro + wo
-                    seconds = 30 * 24 * 3600
-                    avg_ops_sec = total_ops / seconds if total_ops else 0.0
-                    avg_mibps = (total_bytes / seconds) / (1024 ** 2)
-
-                    suggested_iops = max(3000, int(avg_ops_sec * 1.5))
-                    suggested_tput = max(125, int(avg_mibps * 1.5))
-                    reduce_iops = max(0, iops - suggested_iops)
-                    reduce_tput = max(0, throughput - suggested_tput)
-
-                    potential = 0.0
-                    if reduce_iops > 0:
-                        current_addl_iops = max(0, iops - 3000)
-                        new_addl_iops = max(0, suggested_iops - 3000)
-                        potential += max(0, current_addl_iops - new_addl_iops) * get_price("EBS", "GP3_IOPS_PER_MONTH")
-                    if reduce_tput > 0:
-                        current_addl_tput = max(0, throughput - 125)
-                        new_addl_tput = max(0, suggested_tput - 125)
-                        potential += max(0, current_addl_tput - new_addl_tput) * get_price("EBS", "GP3_TPUT_MIBPS_MONTH")
-
-                    if potential > 0.01:
-                        flags.add(f"OverProvisionedGP3(curIOPS={iops},->~{suggested_iops}; curTPUT={throughput}MiB/s,->~{suggested_tput}MiB/s)")
-                        flags.add(f"PotentialSaving={round(potential,2)}$")
-
-                # ---- io1/io2 -> consider gp3 (uses ops) ----
-                if vtype in ("io1", "io2"):
-                    ro = _sum_values(md.get(id_index.get((vid, "VolumeReadOps"), ""), []))
-                    wo = _sum_values(md.get(id_index.get((vid, "VolumeWriteOps"), ""), []))
-                    total_ops = ro + wo
-                    seconds = 30 * 24 * 3600
-                    avg_ops_sec = total_ops / seconds if total_ops else 0.0
-                    if avg_ops_sec < 200:
-                        flags.add("ConsiderGP3")
-
-                if flags:
-                    out.append((meta, list(flags), monthly_cost))
-
-            return out
-
-        # Optional chunk-level concurrency
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        futures = []
-        results_accum: list[tuple[dict, list[str], float]] = []
-
-        def flush_chunk():
-            nonlocal futures, results_accum, pending_chunk
-            if not pending_chunk:
-                return
-            chunk = pending_chunk
-            pending_chunk = []
-            if max_workers > 1:
-                futures.append(executor.submit(process_chunk, chunk))
-            else:
-                results_accum.extend(process_chunk(chunk))
-
-        # 2) Iterate pages
-        if max_workers > 1:
-            executor = ThreadPoolExecutor(max_workers=max_workers)
-
-        try:
-            for page in page_iter:
-                for v in page.get("Volumes", []) or []:
-                    vid = v["VolumeId"]
-                    state = v.get("State", "")
-                    vtype = (v.get("VolumeType") or "").lower()
-                    size_gb = int(v.get("Size", 0) or 0)
-                    iops = int(v.get("Iops", 0) or 0)
-                    throughput = int(v.get("Throughput", 0) or 0)
-                    tags = {t["Key"]: t["Value"] for t in v.get("Tags", [])} if v.get("Tags") else {}
-                    name = tags.get("Name", "")
-
-                    # Build light meta for possible early decision
-                    vol = EBSVolumeMetadata(
-                        volume_id=vid,
-                        name=name,
-                        volume_type=vtype,
-                        size_gb=size_gb,
-                        iops=iops,
-                        throughput=throughput,
-                        state=state,
-                        tags=tags,
-                    )
-                    monthly_cost = estimate_ebs_cost(vol)
-
-                    # (a) Unattached volumes → fast path (write now, skip CW)
-                    if state == "available" and size_gb > 0:
-                        flags = set(["UnattachedEBSVolume"])
-                        if monthly_cost > 0:
-                            flags.add(f"PotentialSaving={monthly_cost}$")
-                        rows_to_write.append((
-                            {
-                                "volume_id": vid, "name": name, "volume_type": vtype, "size_gb": size_gb,
-                                "state": state, "tags": tags
-                            },
-                            list(flags),
-                            monthly_cost
-                        ))
-                        continue
-
-                    # (b) Attached → add to CW chunk
-                    pending_chunk.append(v)
-                    if len(pending_chunk) >= chunk_size:
-                        flush_chunk()
-
-            flush_chunk()
-
-            # Collect futures if used
-            if futures:
-                for f in as_completed(futures):
-                    try:
-                        results_accum.extend(f.result())
-                    except Exception as e:
-                        logging.error(f"[EBS] chunk worker failed: {e}")
-
-            # Combine results to write
-            for meta, flags, monthly_cost in results_accum:
-                rows_to_write.append((meta, flags, monthly_cost))
-
-            for meta, flags, monthly_cost in rows_to_write:
-                tags = meta.get("tags", {})
-                write_resource_to_csv(
-                    writer=writer,
-                    resource_id=meta["volume_id"],
-                    name=meta.get("name", ""),
-                    resource_type="EBSVolume",
-                    owner_id=ACCOUNT_ID,
-                    state=meta.get("state", ""),
-                    storage_gb=meta.get("size_gb", 0),
-                    estimated_cost=monthly_cost,
-                    app_id=tags.get("ApplicationID", "NULL"),
-                    app=tags.get("Application", "NULL"),
-                    env=tags.get("Environment", "NULL"),
-                    flags=flags
-                )
-
-        finally:
-            if max_workers > 1:
-                executor.shutdown(wait=True)
-
-    except ClientError as e:
-        logging.error(f"[check_ebs_unattached_and_rightsize] AWS error: {e}")
-    except Exception as e:
-        logging.error(f"[check_ebs_unattached_and_rightsize] Unexpected error: {e}")
-
-#endregion
-
 #region WAFV2 SECTION
 
 @dataclass
@@ -4151,139 +3837,12 @@ def check_amis(writer, cached_templates, ec2, autoscaling, cfn):
 
 #endregion
 
-
-#region KINESIS SECTION
-
-@dataclass
-class KinesisStreamMetadata:
-    name: str
-    arn: str
-    shards: int
-    status: str
-    creation_date: str
-    hourly_price: float
-    monthly_cost: float
-    flags: Set[str] = field(default_factory=set)
-
-
-def estimate_kinesis_cost(shards: int) -> float:
-    price = get_price("KINESIS", "SHARD_HOUR") or 0.0
-    return round(shards * price * 24 * 30, 2)
-
-
-def build_kinesis_metadata(summary: Dict[str, Any]) -> KinesisStreamMetadata:
-    name = summary.get("StreamName", "")
-    arn = summary.get("StreamARN", "")
-    shards = summary.get("OpenShardCount", 0)
-    status = summary.get("StreamStatus", "")
-    created = summary.get("StreamCreationTimestamp")
-    created_str = created.isoformat() if hasattr(created, "isoformat") else str(created or "")
-
-    monthly_cost = estimate_kinesis_cost(shards)
-    hourly_price = get_price("KINESIS", "SHARD_HOUR") or 0.0
-
-    return KinesisStreamMetadata(
-        name=name,
-        arn=arn,
-        shards=shards,
-        status=status,
-        creation_date=created_str,
-        hourly_price=hourly_price,
-        monthly_cost=monthly_cost,
-    )
-
-
-def check_kinesis_idle(cw, stream: KinesisStreamMetadata, days: int = 30, threshold: int = 10) -> List[str]:
-    """Check if stream has negligible activity in last N days."""
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days)
-
-    def sum_metric(metric: str, stat="Sum") -> float:
-        resp = safe_aws_call(
-            lambda: cw.get_metric_statistics(
-                Namespace="AWS/Kinesis",
-                MetricName=metric,
-                Dimensions=[{"Name": "StreamName", "Value": stream.name}],
-                StartTime=start,
-                EndTime=end,
-                Period=86400,
-                Statistics=[stat],
-            ),
-            {"Datapoints": []},
-            context=f"Kinesis:{stream.name}:{metric}",
-        )
-        return float(sum(dp.get(stat, 0.0) for dp in resp.get("Datapoints", [])))
-
-    incoming = sum_metric("IncomingRecords")
-    outgoing = sum_metric("GetRecords.Records")
-    activity = incoming + outgoing
-
-    if activity < threshold:
-        return [f"Idle({days}d,activity≈{int(activity)})"]
-    return []
-
-
-# registry of checks
-KINESIS_CHECKS: List[Callable[..., List[str]]] = [
-    check_kinesis_idle,
-]
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_kinesis_streams(writer: csv.writer, kinesis, cw) -> None:
-    """
-    Identify potentially wasteful Kinesis Streams:
-      - Idle (no traffic in last N days)
-    Writes flagged streams with estimated shard-hour burn.
-    """
-    try:
-        paginator = kinesis.get_paginator("list_streams")
-        for page in paginator.paginate():
-            for name in page.get("StreamNames", []):
-                summary = safe_aws_call(
-                    lambda: kinesis.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"],
-                    {},
-                    context=f"Kinesis:{name}:DescribeSummary",
-                )
-                if not summary:
-                    continue
-
-                stream = build_kinesis_metadata(summary)
-
-                for check in KINESIS_CHECKS:
-                    stream.flags.update(check(cw, stream))
-
-                if any(f.startswith("Idle") for f in stream.flags):
-                    stream.flags.add(f"PotentialSaving≈{stream.monthly_cost}$")
-
-                if stream.flags:
-                    write_resource_to_csv(
-                        writer=writer,
-                        resource_id=stream.name,
-                        name="",
-                        owner_id=ACCOUNT_ID,
-                        resource_type="KinesisStream",
-                        state=stream.status,
-                        creation_date=stream.creation_date,
-                        estimated_cost=stream.monthly_cost,
-                        flags=list(stream.flags),
-                    )
-                    logging.info(f"[Kinesis:{stream.name}] flags={stream.flags} estCost≈${stream.monthly_cost}")
-
-    except ClientError as e:
-        logging.error(f"[check_kinesis_streams] AWS error: {e.response['Error'].get('Code')}")
-    except Exception as e:
-        logging.error(f"[check_kinesis_streams] Unexpected error: {e}")
-
-#endregion
-
-
 #region EC2 SECTION
 
 def _ec2_hourly_price(instance_type: str, region: str) -> float:
     """Best-effort on-demand hourly price for an EC2 instance type in a region."""
     try:
-        return float(get_price("EC2", instance_type, region=region, default=0.0))
+        return float(get_price("EC2", instance_type, region=region))
     except Exception:
         return 0.0
 
@@ -4724,19 +4283,27 @@ def main():
                           fn=check_ebs_fast_snapshot_restore, writer=writer, ec2=clients['ec2'])
 
                 run_check(profiler, check_name="check_eks_empty_clusters", region=region,
-                          fn=check_eks_empty_clusters, writer=writer, 
+                          fn=check_eks_empty_clusters, writer=writer,
                           eks=clients['eks'], ec2=clients['ec2'])
 
-                run_check(profiler, check_name="check_ebs_unattached_and_rightsize", region=region,
-                          fn=check_ebs_unattached_and_rightsize, writer=writer,
-                          ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
+                run_check(profiler, "check_unattached_ebs_volumes",
+                          region, ebs_checks.check_unattached_ebs_volumes, writer=writer,
+                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
+
+                run_check(profiler, "check_ebs_low_activity_volumes",
+                          region, ebs_checks.check_ebs_low_activity_volumes, writer=writer,
+                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
+
+                run_check(profiler, "check_ebs_gp2_to_gp3_migration",
+                          region, ebs_checks.check_ebs_gp2_to_gp3_migration, writer=writer,
+                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
+
+                run_check(profiler, "check_ebs_snapshots_old_or_orphaned", region,
+                          ebs_checks.check_ebs_snapshots_old_or_orphaned, writer=writer,
+                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
 
                 run_check(profiler, check_name="check_rds_snapshots", region=region,
                           fn=check_rds_snapshots, writer=writer, rds=clients['rds'])
-
-                run_check(profiler, check_name="check_kinesis_streams", region=region,
-                          fn=check_kinesis_streams, writer=writer,
-                          kinesis=clients['kinesis'], cw=clients['cloudwatch'])
 
                 run_check(profiler, check_name="check_wafv2_unassociated_acls", region=region,
                           fn=check_wafv2_unassociated_acls, writer=writer,
@@ -4778,6 +4345,16 @@ def main():
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"],
                     # lookback_days=30,  # optional override
                 )
+
+                run_check(profiler, "check_kinesis_data_streams", region,
+                          kinesis_checks.check_kinesis_data_streams,
+                          writer=writer, kinesis=clients["kinesis"],
+                          cloudwatch=clients["cloudwatch"])
+
+                run_check(profiler, "check_firehose_delivery_streams", 
+                          region, kinesis_checks.check_firehose_delivery_streams,
+                          writer=writer, firehose=clients["firehose"],
+                          cloudwatch=clients["cloudwatch"])
 
         profiler.dump_csv()
         profiler.log_summary(top_n=30)
