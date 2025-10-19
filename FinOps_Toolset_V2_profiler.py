@@ -188,9 +188,11 @@ from finops_toolset.config import (
 
 from finops_toolset.pricing import PRICING as PRICING, get_price as get_price
 import core.cloudwatch as cw
-import aws_checkers.eip as eip
-import aws_checkers.network_interfaces as eni
-import aws_checkers.ssm as ssm
+from aws_checkers.eip import check_unused_elastic_ips as eip
+from aws_checkers.network_interfaces import check_detached_network_interfaces as eni
+from aws_checkers.ssm import check_ssm_plaintext_parameters as check_ssm_plaintext_parameters
+from aws_checkers.ssm import check_ssm_stale_parameters as check_ssm_stale_parameters
+from aws_checkers.ssm import check_ssm_maintenance_windows_gaps as check_ssm_maintenance_windows_gaps
 from core.retry import retry_with_backoff
 
 #endregion
@@ -5989,7 +5991,7 @@ def main():
                 run_check(
                     profiler, check_name="check_ssm_plaintext_parameters", region=region,
                     fn=partial(
-                        ssm.check_ssm_plaintext_parameters,
+                        check_ssm_plaintext_parameters,
                         account_id=ACCOUNT_ID,
                         write_row=write_resource_to_csv,
                         get_price_fn=get_price,
@@ -6002,7 +6004,7 @@ def main():
                 run_check(
                     profiler, check_name="check_ssm_stale_parameters", region=region,
                     fn=partial(
-                        ssm.check_ssm_stale_parameters,
+                        check_ssm_stale_parameters,
                         account_id=ACCOUNT_ID,
                         write_row=write_resource_to_csv,
                         get_price_fn=get_price,
@@ -6016,7 +6018,7 @@ def main():
                 run_check(
                     profiler, check_name="check_ssm_maintenance_windows_gaps", region=region,
                     fn=partial(
-                        ssm.check_ssm_maintenance_windows_gaps,
+                        check_ssm_maintenance_windows_gaps,
                         account_id=ACCOUNT_ID,
                         write_row=write_resource_to_csv,
                         get_price_fn=get_price,
