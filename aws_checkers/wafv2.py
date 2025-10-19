@@ -105,22 +105,58 @@ def _get_web_acl(waf, scope: str, name: str, wid: str, log: logging.Logger) -> D
 def _list_associated_resources(
     waf, arn: str, scope: str, log: logging.Logger
 ) -> List[str]:
-    """Manual pagination. Note: API does not take 'Scope'."""
+    """
+    Robust wrapper for list_resources_for_web_acl.
+
+    - Some SDK models don't accept Limit, so we never send it.
+    - We always send ResourceType.
+    - We iterate all relevant resource types for REGIONAL scope.
+    """
     out: List[str] = []
-    marker: Optional[str] = None
-    while True:
-        try:
-            params = {"WebACLArn": arn, "Limit": 100}
+    scope_u = (scope or "").upper()
+
+    if scope_u == "CLOUDFRONT":
+        rtypes = ["CLOUDFRONT"]
+    else:
+        rtypes = [
+            "APPLICATION_LOAD_BALANCER",
+            "API_GATEWAY",
+            "APPSYNC",
+            "COGNITO_USER_POOL",
+        ]
+
+    for rtype in rtypes:
+        marker: Optional[str] = None
+        while True:
+            params = {"WebACLArn": arn, "ResourceType": rtype}
             if marker:
+                # NextMarker is supported on most recent models; if not, we'll fall back.
                 params["NextMarker"] = marker
-            r = waf.list_resources_for_web_acl(**params)
-            out.extend(r.get("ResourceArns", []) or [])
-            marker = r.get("NextMarker")
+            try:
+                resp = waf.list_resources_for_web_acl(**params)
+            except ClientError as exc:
+                log.debug(
+                    "[wafv2] list_resources_for_web_acl arn=%s type=%s failed: %s",
+                    arn,
+                    rtype,
+                    exc,
+                )
+                break
+            except Exception as exc:  # pylint: disable=broad-except
+                # Covers ParamValidationError on unknown parameter in very old models.
+                log.debug(
+                    "[wafv2] list_resources_for_web_acl arn=%s type=%s error: %s",
+                    arn,
+                    rtype,
+                    exc,
+                )
+                break
+
+            out.extend(resp.get("ResourceArns", []) or [])
+            marker = resp.get("NextMarker")
             if not marker:
                 break
-        except ClientError as exc:
-            log.debug("[wafv2] list_resources_for_web_acl %s failed: %s", arn, exc)
-            break
+
     return out
 
 
