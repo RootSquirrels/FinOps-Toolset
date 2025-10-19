@@ -160,7 +160,6 @@ import string
 import re
 from time import perf_counter
 import threading
-from functools import partial
 #from correlator import build_certificate_graph, summarize_cert_usage
 
 from finops_toolset.config import (
@@ -196,6 +195,7 @@ from aws_checkers import config as checkers_config
 from aws_checkers.private_ca import check_private_certificate_authorities
 from aws_checkers.kms import check_kms_customer_managed_keys
 from aws_checkers.efs import check_unused_efs_filesystems
+from aws_checkers import backup as backup_checks
 
 #endregion
 
@@ -520,7 +520,7 @@ def init_clients(region: str):
         "cloudfront": boto3.client("cloudfront", config=SDK_CONFIG),
         "cloudtrail": boto3.client("cloudtrail", config=SDK_CONFIG),
         "kms": boto3.client("kms", region_name=region, config=SDK_CONFIG),
-        "acmpca": boto3.client("acmpca", region_name=region, config=SDK_CONFIG),
+        "acm-pca": boto3.client("acm-pca", region_name=region, config=SDK_CONFIG),
     }
 
 
@@ -1776,106 +1776,6 @@ def check_idle_load_balancers(
     except Exception as e:
         logging.exception(f"[ELB] check_idle_load_balancers_refactored failed: {e}")
         return
-
-#endregion
-
-
-#region BACKUP SECTION
-
-@dataclass
-class BackupRuleMetadata:
-    plan_id: str
-    plan_name: str
-    rule_name: str
-    schedule: str
-    retention_days: Optional[int]
-    flags: Set[str] = field(default_factory=set)
-
-
-def build_backup_rule_metadata(plan: Dict[str, Any], rule: Dict[str, Any]) -> BackupRuleMetadata:
-    return BackupRuleMetadata(
-        plan_id=plan["BackupPlanId"],
-        plan_name=plan["BackupPlanName"],
-        rule_name=rule.get("RuleName", ""),
-        schedule=rule.get("ScheduleExpression", ""),
-        retention_days=rule.get("Lifecycle", {}).get("DeleteAfterDays"),
-    )
-
-
-def check_backup_retention(rule: BackupRuleMetadata) -> List[str]:
-    """
-    Flag daily backup rules with invalid retention (not in VALID_RETENTION_DAYS).
-    """
-    if "rate(1 day)" in rule.schedule and rule.retention_days not in VALID_RETENTION_DAYS:
-        return [f"MisconfiguredRetention({rule.retention_days})"]
-    return []
-
-
-def check_missing_retention(rule: BackupRuleMetadata) -> List[str]:
-    """
-    Flag backup rules that have no retention set (keeps backups forever).
-    """
-    if rule.retention_days is None:
-        return ["NoRetentionConfigured"]
-    return []
-
-
-BACKUP_RULE_CHECKS: List[Callable[[BackupRuleMetadata], List[str]]] = [
-    check_backup_retention,
-    check_missing_retention,
-]
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_backup_retention_misconfigurations(writer: csv.writer, backup) -> None:
-    """
-    Check AWS Backup plans for misconfigured rules:
-      - Daily schedule with invalid retention
-      - Missing retention (keeps backups forever)
-
-    Logs and writes issues to CSV.
-    """
-    try:
-        plans = safe_aws_call(
-            lambda: backup.list_backup_plans().get("BackupPlansList", []),
-            [],
-            context="Backup:ListPlans",
-        )
-
-        for plan in plans:
-            details = safe_aws_call(
-                lambda: backup.get_backup_plan(BackupPlanId=plan["BackupPlanId"]),
-                {},
-                context=f"Backup:GetPlan:{plan['BackupPlanName']}",
-            )
-            rules = details.get("BackupPlan", {}).get("Rules", [])
-
-            for raw_rule in rules:
-                rule = build_backup_rule_metadata(plan, raw_rule)
-
-                for check in BACKUP_RULE_CHECKS:
-                    rule.flags.update(check(rule))
-
-                if rule.flags:
-                    logging.info(
-                        f"[Backup:{rule.plan_name}] Rule '{rule.rule_name}' retention={rule.retention_days} flags={rule.flags}"
-                    )
-                    write_resource_to_csv(
-                        writer=writer,
-                        resource_id=rule.plan_id,
-                        name=rule.rule_name,
-                        owner_id=ACCOUNT_ID,
-                        resource_type="BackupRule",
-                        state="",  # no explicit state field in BackupRule
-                        creation_date="",  # Backup rules don’t have a creation timestamp
-                        estimated_cost=0,  # retention misconfig doesn’t affect cost directly
-                        flags=list(rule.flags),
-                    )
-
-    except ClientError as e:
-        logging.error(f"[check_backup_retention] AWS error: {e.response['Error'].get('Code')}")
-    except Exception as e:
-        logging.error(f"[check_backup_retention] Unexpected error: {e}")
 
 #endregion
 
@@ -5357,9 +5257,15 @@ def main():
                           fn=check_log_groups_with_infinite_retention,
                           writer=writer, logs=clients['logs'])
 
-                run_check(profiler, check_name="check_backup_retention_misconfigurations",
-                          region=region, fn=check_backup_retention_misconfigurations,
-                          writer=writer, backup=clients['backup'])
+                run_check(profiler, "check_backup_plans_without_selections", 
+                          region, backup_checks.check_backup_plans_without_selections, writer=writer, 
+                          backup=clients["backup"])
+                run_check(profiler, "check_backup_rules_no_lifecycle",      
+                          region, backup_checks.check_backup_rules_no_lifecycle, writer=writer, 
+                          backup=clients["backup"])
+                run_check(profiler, "check_backup_stale_recovery_points",   
+                          region, backup_checks.check_backup_stale_recovery_points, writer=writer, 
+                          backup=clients["backup"])
 
                 run_check(profiler, check_name="check_orphaned_fsx_backups", region=region,
                           fn=check_orphaned_fsx_backups, writer=writer, fsx=clients['fsx'])
@@ -5428,7 +5334,7 @@ def main():
 
                 run_check(profiler, check_name="check_private_certificate_authorities",
                 region=region,fn=check_private_certificate_authorities,
-                writer=writer, acmpca=clients["acmpca"])
+                writer=writer, acmpca=clients["acm-pca"])
 
                 run_check(profiler=profiler, check_name="check_kms_customer_managed_keys", 
                           region=region, fn=check_kms_customer_managed_keys, writer=writer, 

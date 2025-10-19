@@ -41,8 +41,8 @@ PRICING: PriceMap = {
     },
 
     "EFS": {
-        "STANDARD_GB_MONTH": 0.25,
-        "IA_GB_MONTH": 0.025,
+        "EFS_STANDARD_GB_MONTH": 0.25,
+        "EFS_IA_GB_MONTH": 0.025,
         "ARCHIVE_GB_MONTH": 0.008,
         "IO_GB": 0.05,
         "MOUNT_TARGET_HOUR": 0.015,
@@ -165,7 +165,26 @@ PRICING: PriceMap = {
     },
     "ENI": {
         "DETACHED_MONTH": 0.0
-    }
+    },
+    "ACMPCA": {
+        # Private CA monthly fee per CA (root or subordinate). Charged until deleted.
+        "ACTIVE_MONTH": 400.00,
+        "DISABLED_MONTH": 400.00,
+        "EXPIRED_MONTH": 400.00,
+        "FAILED_MONTH": 0.00,           # creation failed / unusable
+        "PENDING_CERT_MONTH": 400.00,   # created but waiting on cert still accrues
+        # optional future key if you ever count issuance: "CERT_ISSUANCE_EACH": 0.75,
+    },
+    "KMS": {
+        # Customer-managed key monthly fee
+        "CMK_MONTH": 1.00,
+        # optional: "MULTI_REGION_CMK_MONTH": 2.00,
+    },
+    "AWSBackup": {
+        # Warm/cold storage per GB-month (ballpark)
+        "BACKUP_WARM_GB_MONTH": 0.05,
+        "BACKUP_COLD_GB_MONTH": 0.01,
+    },
 }
 
 # --------------------------------------------------------------------------------------

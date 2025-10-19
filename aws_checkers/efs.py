@@ -340,7 +340,7 @@ def check_unused_efs_filesystems(  # pylint: disable=unused-argument
             )
 
         log.info(
-            "[check_unused_efs_filesystems] Processed EFS: %s (unused=%s io_sum=%s max_conn=%s mt=%s)",
+            "[EFS] Processed EFS: %s (unused=%s io_sum=%s max_conn=%s mt=%s)",
             fs_id,
             unused,
             int(total_io_sum),
