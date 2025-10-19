@@ -23,4 +23,4 @@ def setup(
     ACCOUNT_ID = account_id
     WRITE_ROW = write_row
     GET_PRICE = get_price
-    LOGGER = logger or logging.getLogger("finops_toolset.checkers")
+    LOGGER = logger or logging.getLogger("aws_checkers")

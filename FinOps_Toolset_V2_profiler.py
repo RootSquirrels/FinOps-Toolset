@@ -190,9 +190,7 @@ from finops_toolset.pricing import PRICING as PRICING, get_price as get_price
 import core.cloudwatch as cw
 from aws_checkers.eip import check_unused_elastic_ips as eip
 from aws_checkers.network_interfaces import check_detached_network_interfaces as eni
-from aws_checkers.ssm import check_ssm_plaintext_parameters as check_ssm_plaintext_parameters
-from aws_checkers.ssm import check_ssm_stale_parameters as check_ssm_stale_parameters
-from aws_checkers.ssm import check_ssm_maintenance_windows_gaps as check_ssm_maintenance_windows_gaps
+from aws_checkers import ssm as ssm_checks
 from core.retry import retry_with_backoff
 from aws_checkers import config as checkers_config
 
@@ -5893,34 +5891,17 @@ def main():
                 #cert_summary = summarize_cert_usage(graph)
 
                 run_check(
-                    profiler,
-                    check_name="check_unused_elastic_ips",
-                    region=region,
-                    fn=eip,  # <- function, not module
-                    writer=writer,
-                    ec2=clients["ec2"],
+                    profiler, check_name="check_unused_elastic_ips",
+                    region=region, fn=eip, writer=writer, ec2=clients["ec2"],
                 )
 
                 run_check(profiler, check_name="check_idle_load_balancers", region=region,
                           fn=check_idle_load_balancers, writer=writer,
                           elbv2=clients['elbv2'], cloudwatch=clients['cloudwatch'])
 
-
-                eni_fn = partial(
-                    eni,
-                    account_id=ACCOUNT_ID,
-                    write_row=write_resource_to_csv,
-                    get_price_fn=get_price,
-                    logger=LOGGER,
-                )
-
                 run_check(
-                    profiler,
-                    check_name="eni",
-                    region=region,
-                    fn=eni_fn,
-                    writer=writer,             
-                    ec2=clients["ec2"],
+                    profiler, check_name="eni",
+                    region=region, fn=eni, writer=writer, ec2=clients["ec2"],
                 )
 
                 run_check(profiler, check_name="check_unused_efs_filesystems", region=region,
@@ -6015,47 +5996,15 @@ def main():
                           region=region, fn=check_nat_replacement_opps, writer=writer, 
                           ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
 
-
-                # plaintext
-                run_check(
-                    profiler, check_name="check_ssm_plaintext_parameters", region=region,
-                    fn=partial(
-                        check_ssm_plaintext_parameters,
-                        account_id=ACCOUNT_ID,
-                        write_row=write_resource_to_csv,
-                        get_price_fn=get_price,
-                        logger=LOGGER,
-                    ),
-                    writer=writer, ssm=clients["ssm"],
-                )
-
-                # stale (365 days)
-                run_check(
-                    profiler, check_name="check_ssm_stale_parameters", region=region,
-                    fn=partial(
-                        check_ssm_stale_parameters,
-                        account_id=ACCOUNT_ID,
-                        write_row=write_resource_to_csv,
-                        get_price_fn=get_price,
-                        logger=LOGGER,
-                        stale_days=365,
-                    ),
-                    writer=writer, ssm=clients["ssm"],
-                )
-
-                # maintenance windows
-                run_check(
-                    profiler, check_name="check_ssm_maintenance_windows_gaps", region=region,
-                    fn=partial(
-                        check_ssm_maintenance_windows_gaps,
-                        account_id=ACCOUNT_ID,
-                        write_row=write_resource_to_csv,
-                        get_price_fn=get_price,
-                        logger=LOGGER,
-                        # consolidate_rows=False  #set True if you want one row/window
-                    ),
-                    writer=writer, ssm=clients["ssm"],
-                )
+                run_check(profiler, "check_ssm_plaintext_parameters", region,
+                          ssm_checks.check_ssm_plaintext_parameters,
+                          writer=writer, ssm=clients["ssm"])
+                run_check(profiler, "check_ssm_stale_parameters", region,
+                          ssm_checks.check_ssm_stale_parameters,
+                          writer=writer, ssm=clients["ssm"])
+                run_check(profiler, "check_ssm_maintenance_windows_gaps", region,
+                          ssm_checks.check_ssm_maintenance_windows_gaps,
+                          writer=writer, ssm=clients["ssm"])
 
 
         profiler.dump_csv()
@@ -6064,7 +6013,7 @@ def main():
         logging.info(f"Profile export complete: {PROFILE_FILE}")
 
     except Exception as e:
-        logging.error(f"[main] Fatal error: {e}")       
+        logging.error(f"[main] Fatal error: {e}")
 
 if __name__ == "__main__":
     main()

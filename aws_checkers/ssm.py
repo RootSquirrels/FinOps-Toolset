@@ -1,31 +1,54 @@
 """Checkers: AWS Systems Manager (SSM).
 
-This module provides:
+Provides three SSM checks:
   - check_ssm_plaintext_parameters: flags non-SecureString parameters.
   - check_ssm_stale_parameters: flags parameters not modified in N days.
   - check_ssm_maintenance_windows_gaps: flags Maintenance Windows with no targets
-    and/or no tasks (merged into one pass to avoid redundant API calls).
+    and/or no tasks (merged to avoid redundant enumeration).
+
+Design:
+  - Dependencies (account_id, write_row, get_price, logger) are injected once via
+    finops_toolset.checkers.config.setup(...).
+  - Each checker signature is (writer, ssm, logger=None, **_kwargs) so it can be
+    called directly by run_check(writer=..., ssm=...).
+  - No return values (legacy).
+  - Retries handled by @retry_with_backoff on ClientError.
+  - Logging uses lazy %s interpolation for pylint compliance.
+  - Time handling is timezone-aware (datetime.now(timezone.utc)).
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone as _tz, timedelta as _td
-from typing import Callable, List, Optional
-import csv
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional
 
 from botocore.exceptions import ClientError
+
 from core.retry import retry_with_backoff
+from aws_checkers import config
 
 
-WriteRow = Callable[..., None]
-GetPrice = Callable[[str, str], float]
+def _require_config() -> None:
+    """Ensure checkers.config.setup(...) has been called."""
+    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
+        raise RuntimeError(
+            "Checkers not configured. Call "
+            "finops_toolset.checkers.config.setup(account_id=..., write_row=..., "
+            "get_price=..., logger=...) first."
+        )
 
 
-def _safe_price(get_price_fn: GetPrice, service: str, key: str) -> float:
-    """Fetch a price; fall back to 0.0 if key is missing/invalid."""
+def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
+    """Return an appropriate logger."""
+    return fallback or config.LOGGER or logging.getLogger(__name__)
+
+
+def _safe_price(service: str, key: str) -> float:
+    """Best-effort price lookup; falls back to 0.0 if the key is absent/invalid."""
     try:
-        return float(get_price_fn(service, key))
+        # type: ignore[arg-type] because config.GET_PRICE is provided at runtime
+        return float(config.GET_PRICE(service, key))  # pylint: disable=not-callable
     except Exception:  # pylint: disable=broad-except
         return 0.0
 
@@ -33,41 +56,42 @@ def _safe_price(get_price_fn: GetPrice, service: str, key: str) -> float:
 def _to_utc(dt_obj: datetime) -> datetime:
     """Return a timezone-aware UTC datetime for comparison."""
     if dt_obj.tzinfo is None:
-        return dt_obj.replace(tzinfo=_tz.utc)
-    return dt_obj.astimezone(_tz.utc)
+        return dt_obj.replace(tzinfo=timezone.utc)
+    return dt_obj.astimezone(timezone.utc)
 
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_ssm_plaintext_parameters(
+def check_ssm_plaintext_parameters(  # pylint: disable=unused-argument
+    writer,
     ssm,
-    account_id: str,
-    write_row: WriteRow,
-    writer: csv.writer,
-    get_price_fn: GetPrice,
     logger: Optional[logging.Logger] = None,
+    **_kwargs,
 ) -> None:
     """
     Flag SSM parameters that are NOT SecureString (plaintext).
 
     Writes: one row per plaintext parameter with flag 'SSMParameterPlaintext'.
     """
-    log = logger or logging.getLogger(__name__)
+    _require_config()
+    log = _logger(logger)
+
     try:
         paginator = ssm.get_paginator("describe_parameters")
         for page in paginator.paginate():
             for param in page.get("Parameters", []):
-                name = param.get("Name")
+                name = param.get("Name") or ""
                 ptype = param.get("Type")
                 tier = param.get("Tier")
 
                 if ptype != "SecureString":
-                    write_row(
+                    # type: ignore[call-arg] because WRITE_ROW is injected at runtime
+                    config.WRITE_ROW(
                         writer=writer,
                         resource_id=name,
-                        name=name or "",
-                        owner_id=account_id,
+                        name=name,
+                        owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                         resource_type="SSMParameter",
-                        estimated_cost=_safe_price(get_price_fn, "SSMParameter", "PLAINTEXT_MONTH"),
+                        estimated_cost=_safe_price("SSMParameter", "PLAINTEXT_MONTH"),
                         flags=["SSMParameterPlaintext"],
                         confidence=100,
                     )
@@ -84,51 +108,51 @@ def check_ssm_plaintext_parameters(
 
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_ssm_stale_parameters(
+def check_ssm_stale_parameters(  # pylint: disable=unused-argument
+    writer,
     ssm,
-    account_id: str,
-    write_row: WriteRow,
-    writer: csv.writer,
-    get_price_fn: GetPrice,
     logger: Optional[logging.Logger] = None,
+    *,
     stale_days: int = 365,
+    **_kwargs,
 ) -> None:
     """
     Flag parameters not modified for `stale_days` (default 365).
 
     Writes: flag 'SSMParameterStaleXd' where X = stale_days.
     """
-    log = logger or logging.getLogger(__name__)
+    _require_config()
+    log = _logger(logger)
+
+    cutoff = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=stale_days)
 
     try:
-
-        cutoff_local = datetime.now(_tz.utc).replace(microsecond=0) - _td(days=stale_days)
-
         paginator = ssm.get_paginator("describe_parameters")
         for page in paginator.paginate():
             for param in page.get("Parameters", []):
-                name = param.get("Name")
+                name = param.get("Name") or ""
                 last_mod = param.get("LastModifiedDate")
-                is_stale = False
 
+                is_stale = False
                 if isinstance(last_mod, datetime):
                     last_mod_utc = _to_utc(last_mod).replace(microsecond=0)
-                    is_stale = last_mod_utc < cutoff_local
+                    is_stale = last_mod_utc < cutoff
 
                 if is_stale:
-                    write_row(
+                    # type: ignore[call-arg]
+                    config.WRITE_ROW(
                         writer=writer,
                         resource_id=name,
-                        name=name or "",
-                        owner_id=account_id,
+                        name=name,
+                        owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                         resource_type="SSMParameter",
-                        estimated_cost=_safe_price(get_price_fn, "SSMParameter", "STALE_MONTH"),
+                        estimated_cost=_safe_price("SSMParameter", "STALE_MONTH"),
                         flags=[f"SSMParameterStale{stale_days}d"],
                         confidence=100,
                     )
 
                 log.info(
-                    "[check_ssm_stale_parameters] Processed param : %s (last_modified=%s stale=%s)",
+                    "[check_ssm_stale_parameters] Processed parameter: %s (last_modified=%s stale=%s)",
                     name,
                     last_mod,
                     is_stale,
@@ -157,14 +181,13 @@ def _list_all_window_tasks(ssm, window_id: str) -> List[dict]:
 
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_ssm_maintenance_windows_gaps(
+def check_ssm_maintenance_windows_gaps(  # pylint: disable=unused-argument
+    writer,
     ssm,
-    account_id: str,
-    write_row: WriteRow,
-    writer: csv.writer,
-    get_price_fn: GetPrice,
     logger: Optional[logging.Logger] = None,
+    *,
     consolidate_rows: bool = False,
+    **_kwargs,
 ) -> None:
     """
     Flag enabled SSM Maintenance Windows that have no targets and/or no tasks.
@@ -172,7 +195,9 @@ def check_ssm_maintenance_windows_gaps(
     By default, writes one CSV row per missing aspect (targets, tasks) to preserve
     legacy output. Set `consolidate_rows=True` to emit a single row with both flags.
     """
-    log = logger or logging.getLogger(__name__)
+    _require_config()
+    log = _logger(logger)
+
     try:
         mw_paginator = ssm.get_paginator("describe_maintenance_windows")
         for page in mw_paginator.paginate():
@@ -208,20 +233,17 @@ def check_ssm_maintenance_windows_gaps(
                     est_cost = 0.0
                     if missing_targets:
                         flags.append("MaintenanceWindowNoTargets")
-                        est_cost += _safe_price(
-                            get_price_fn, "SSMMaintenanceWindow", "NO_TARGETS_MONTH"
-                        )
+                        est_cost += _safe_price("SSMMaintenanceWindow", "NO_TARGETS_MONTH")
                     if missing_tasks:
                         flags.append("MaintenanceWindowNoTasks")
-                        est_cost += _safe_price(
-                            get_price_fn, "SSMMaintenanceWindow", "NO_TASKS_MONTH"
-                        )
+                        est_cost += _safe_price("SSMMaintenanceWindow", "NO_TASKS_MONTH")
 
-                    write_row(
+                    # type: ignore[call-arg]
+                    config.WRITE_ROW(
                         writer=writer,
                         resource_id=window_id,
                         name=name,
-                        owner_id=account_id,
+                        owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                         resource_type="SSMMaintenanceWindow",
                         estimated_cost=est_cost,
                         flags=flags,
@@ -229,28 +251,26 @@ def check_ssm_maintenance_windows_gaps(
                     )
                 else:
                     if missing_targets:
-                        write_row(
+                        # type: ignore[call-arg]
+                        config.WRITE_ROW(
                             writer=writer,
                             resource_id=window_id,
                             name=name,
-                            owner_id=account_id,
+                            owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                             resource_type="SSMMaintenanceWindow",
-                            estimated_cost=_safe_price(
-                                get_price_fn, "SSMMaintenanceWindow", "NO_TARGETS_MONTH"
-                            ),
+                            estimated_cost=_safe_price("SSMMaintenanceWindow", "NO_TARGETS_MONTH"),
                             flags=["MaintenanceWindowNoTargets"],
                             confidence=100,
                         )
                     if missing_tasks:
-                        write_row(
+                        # type: ignore[call-arg]
+                        config.WRITE_ROW(
                             writer=writer,
                             resource_id=window_id,
                             name=name,
-                            owner_id=account_id,
+                            owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                             resource_type="SSMMaintenanceWindow",
-                            estimated_cost=_safe_price(
-                                get_price_fn, "SSMMaintenanceWindow", "NO_TASKS_MONTH"
-                            ),
+                            estimated_cost=_safe_price("SSMMaintenanceWindow", "NO_TASKS_MONTH"),
                             flags=["MaintenanceWindowNoTasks"],
                             confidence=100,
                         )

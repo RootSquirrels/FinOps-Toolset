@@ -32,11 +32,23 @@ def _require_config() -> None:
 def check_unused_elastic_ips(writer: csv.writer, ec2, 
     logger: Optional[logging.Logger] = None, **_kwargs) -> None:  # pylint: disable=unused-argument
     """
-    Write all unassociated Elastic IPs to CSV.
+    Scan EC2 Elastic IP addresses and write unassociated ones to CSV.
 
-    A public IP is 'unused' if it has neither InstanceId nor NetworkInterfaceId
-    in ec2.describe_addresses().
+    An Elastic IP is considered unused if it is not associated with either an
+    EC2 instance (``InstanceId``) or a network interface (``NetworkInterfaceId``).
+
+    Args:
+        ec2: boto3 EC2 client with ``describe_addresses()``.
+        account_id: AWS account ID used for the CSV's OwnerId field.
+        write_row: Callable that writes one normalized CSV row (your existing
+            ``write_resource_to_csv``).
+        get_price_fn: Pricing helper, e.g. ``get_price("EIP", "UNASSIGNED_MONTH")``.
+        logger: Optional logger; uses module logger if omitted.
+
+    Returns:
+        Number of unused Elastic IPs written to CSV.
     """
+
     _require_config()
     log = _logger(logger)
 

@@ -8,24 +8,33 @@ Attachment) and writes them to the CSV
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
-from botocore.exceptions import ClientError
 import csv
+from typing import Optional
+from botocore.exceptions import ClientError
+from aws_checkers import config
 
 from core.retry import retry_with_backoff
 
-WriteRow = Callable[..., None]
-GetPrice = Callable[[str, str], float]
+
+def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
+    return fallback or config.LOGGER or logging.getLogger(__name__)
+
+
+def _require_config() -> None:
+    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
+        raise RuntimeError(
+            "Checkers not configured. Call "
+            "aws_checkers.config.setup(account_id=..., " \
+            "write_row=..., get_price=..., logger=...) first."
+        )
 
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_detached_network_interfaces(
     ec2,
     account_id: str,
-    write_row: WriteRow,
     writer: csv.writer,
-    get_price_fn: GetPrice,
-    logger: Optional[logging.Logger] = None,
+    logger: Optional[logging.Logger] = None, **_kwargs # pylint: disable=unused-argument
 ) -> None:
     """
     Find detached (unassociated) Elastic Network Interfaces (ENIs) and write them to CSV.
@@ -51,7 +60,9 @@ def check_detached_network_interfaces(
     Raises:
         botocore.exceptions.ClientError: Re-raised after logging to enable retries.
     """
-    log = logger or logging.getLogger(__name__)
+
+    _require_config()
+    log = _logger(logger) or logging.getLogger(__name__)
     detached_count = 0
 
     try:
@@ -67,13 +78,13 @@ def check_detached_network_interfaces(
 
                     tags = {tag["Key"]: tag["Value"] for tag in eni.get("TagSet", [])}
 
-                    write_row(
+                    config.WRITE_ROW(
                         writer=writer,
                         resource_id=eni_id,
                         name=tags.get("Name", ""),
                         owner_id=account_id,
                         resource_type="NetworkInterface",
-                        estimated_cost=get_price_fn("ENI", "DETACHED_MONTH"),
+                        estimated_cost=config.GET_PRICE("ENI", "DETACHED_MONTH"),
                         flags=["DetachedNetworkInterface"],
                         confidence=100,
                     )
