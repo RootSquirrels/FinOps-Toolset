@@ -188,6 +188,9 @@ from aws_checkers import s3 as s3_checks
 from aws_checkers import ami as ami_checks
 from aws_checkers import lambda_svc as lambda_checks
 from aws_checkers import ec2 as ec2_checks
+from aws_checkers import loggroups as lg_checks
+from aws_checkers import fsx as fsx_checks
+from aws_checkers import rds_snapshots as rds_snaps
 #endregion
 
 # Configure logging
@@ -318,6 +321,7 @@ def init_clients(region: str):
         "cloudtrail": boto3.client("cloudtrail", config=SDK_CONFIG),
         "kms": boto3.client("kms", region_name=region, config=SDK_CONFIG),
         "acm-pca": boto3.client("acm-pca", region_name=region, config=SDK_CONFIG),
+        "firehose": boto3.client("firehose", region_name=region, config=SDK_CONFIG),
     }
 
 
@@ -910,182 +914,6 @@ def check_redundant_route53_records(writer: csv.writer, route53, elbv2, s3) -> N
 
 #endregion
 
-
-#region FSX SECTION
-
-@dataclass
-class FSxBackupMetadata:
-    id: str
-    fs_id: str
-    creation_date: str
-    lifecycle: str
-    size_gb: int
-    tags: Dict[str, str] = field(default_factory=dict)
-
-
-def estimate_fsx_backup_cost(size_gb: int) -> float:
-    """Compute monthly storage cost for FSx backups."""
-    price_per_gb = get_price("FSX", "BACKUP_GB_MONTH") or get_price("EBS", "SNAPSHOT_GB_MONTH")
-    return round(size_gb * price_per_gb, 2) if price_per_gb else 0.0
-
-
-def build_fsx_backup_metadata(backup: dict) -> FSxBackupMetadata:
-    """Extracts metadata for an FSx backup."""
-    backup_id = backup.get("BackupId", "")
-    fs_id = backup.get("FileSystemId", "")
-    creation_time = backup.get("CreationTime")
-    lifecycle = backup.get("Lifecycle", "")
-    size_gb = int(backup.get("VolumeCapacity", 0) or 0)
-    tags = {t.get("Key", ""): t.get("Value", "") for t in backup.get("Tags", [])}
-
-    return FSxBackupMetadata(
-        id=backup_id,
-        fs_id=fs_id,
-        creation_date=creation_time.isoformat() if hasattr(creation_time, "isoformat") else str(creation_time),
-        lifecycle=lifecycle,
-        size_gb=size_gb,
-        tags=tags,
-    )
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_orphaned_fsx_backups(writer: csv.writer, fsx):
-    """
-    Check for FSx backups that are not associated with any existing FSx file system.
-    Logs and writes orphaned backups to the CSV.
-    """
-    try:
-        # Collect existing FSx file systems (with pagination)
-        existing_fs_ids: set[str] = set()
-        paginator_fs = fsx.get_paginator("describe_file_systems")
-        for page in paginator_fs.paginate():
-            for fs in page.get("FileSystems", []):
-                existing_fs_ids.add(fs.get("FileSystemId", ""))
-
-        # Iterate through backups (with pagination)
-        paginator_bk = fsx.get_paginator("describe_backups")
-        for page in paginator_bk.paginate():
-            for raw_backup in page.get("Backups", []):
-                metadata = build_fsx_backup_metadata(raw_backup)
-
-                if metadata.fs_id not in existing_fs_ids:
-                    estimated_cost = estimate_fsx_backup_cost(metadata.size_gb)
-
-                    logging.info(
-                        f"[FSx] Orphaned backup: {metadata.id}, size={metadata.size_gb}GB, "
-                        f"lifecycle={metadata.lifecycle}, estCost≈{estimated_cost}$"
-                    )
-
-                    write_resource_to_csv(
-                        writer=writer,
-                        resource_id=metadata.id,
-                        name=metadata.tags.get("Name", ""),
-                        owner_id=ACCOUNT_ID,
-                        resource_type="FSxBackup",
-                        creation_date=metadata.creation_date,
-                        storage_gb=metadata.size_gb,
-                        estimated_cost=estimated_cost,
-                        app_id=metadata.tags.get("ApplicationID", "NULL"),
-                        app=metadata.tags.get("Application", "NULL"),
-                        env=metadata.tags.get("Environment", "NULL"),
-                        flags=[f"OrphanedFSxBackup(lifecycle={metadata.lifecycle})"],
-                        confidence=100
-                    )
-
-    except ClientError as e:
-        logging.error(f"[check_orphaned_fsx_backups] AWS API error: {e.response['Error'].get('Code')}")
-    except Exception as e:
-        logging.error(f"[check_orphaned_fsx_backups] fatal error: {e}")
-
-#endregion
-
-
-#region LogGroups SECTION
-
-@dataclass
-class LogGroupMetadata:
-    name: str
-    stored_bytes: int
-    size_gb: float
-    estimated_cost: float
-    flags: list[str] = field(default_factory=list)
-    creation_date: str = ""
-
-
-def build_log_group_metadata(log_group: dict) -> LogGroupMetadata:
-    """Construct metadata for a single CloudWatch log group."""
-    name = log_group.get("logGroupName", "")
-    stored_bytes = int(log_group.get("storedBytes", 0) or 0)
-    size_gb = round(stored_bytes / (1024 ** 3), 2)
-    estimated_cost = round(size_gb * get_price("CLOUDWATCH", "LOG_GB_MONTH"), 2)
-
-    creation_ms = log_group.get("creationTime")
-    creation_date_str = ""
-    if isinstance(creation_ms, int):
-        creation_date_str = datetime.fromtimestamp(creation_ms / 1000, tz=timezone.utc).isoformat()
-
-    flags = []
-    if log_group.get("retentionInDays") is None:
-        flags.append("InfiniteRetention")
-        # Heuristic: assume ~70% potential saving if retention reduced to 90 days
-        if estimated_cost > 0:
-            potential_saving = round(estimated_cost * 0.7, 2)
-            flags.append(f"PotentialSaving={potential_saving}$")
-
-    return LogGroupMetadata(
-        name=name,
-        stored_bytes=stored_bytes,
-        size_gb=size_gb,
-        estimated_cost=estimated_cost,
-        flags=flags,
-        creation_date=creation_date_str
-    )
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_log_groups_with_infinite_retention(writer: csv.writer, logs) -> None:
-    """
-    Identify CloudWatch Log Groups with infinite retention.
-
-    - Flags groups without a retention policy.
-    - Estimates monthly storage cost.
-    - Estimates potential savings (~70%) if retention were reduced to 90 days.
-    - Writes results to CSV.
-
-    Args:
-        writer (csv.writer): CSV writer instance.
-        logs: boto3 CloudWatch Logs client.
-
-    CloudWatch Logs Pricing:
-        $0.03 per GB-month for log storage (PRICING['CLOUDWATCH']['LOG_GB_MONTH'])
-    """
-    try:
-        paginator = logs.get_paginator("describe_log_groups")
-        for page in paginator.paginate():
-            for lg in page.get("logGroups", []):
-                metadata = build_log_group_metadata(lg)
-                if metadata.flags:
-                    write_resource_to_csv(
-                        writer=writer,
-                        resource_id="",
-                        name=metadata.name,
-                        owner_id=ACCOUNT_ID,
-                        resource_type="CloudWatchLogGroup",
-                        creation_date=metadata.creation_date,
-                        storage_gb=metadata.size_gb,
-                        estimated_cost=metadata.estimated_cost,
-                        flags=metadata.flags
-                    )
-                    logging.info(
-                        f"[check_log_groups_with_infinite_retention] "
-                        f"{metadata.name} size={metadata.size_gb}GB cost≈{metadata.estimated_cost}$ flags={metadata.flags}"
-                    )
-    except ClientError as e:
-        logging.error(f"[check_log_groups_with_infinite_retention] AWS error: {e}")
-    except Exception as e:
-        logging.error(f"[check_log_groups_with_infinite_retention] Unexpected error: {e}")
-
-#endregion
-
 #region VPC/TGW SECTION
 
 @retry_with_backoff(exceptions=(ClientError,))
@@ -1350,141 +1178,6 @@ def check_wafv2_unassociated_acls(writer: csv.writer, wafv2, region_name: str) -
 
 #endregion
 
-
-#region RDS SNAPSHOT SECTION
-
-@dataclass
-class RDSSnapshotMetadata:
-    snapshot_id: str
-    db_instance_id: str
-    snapshot_type: str
-    creation_date: str
-    allocated_gb: int
-    age_days: int
-    monthly_cost: float
-    flags: Set[str] = field(default_factory=set)
-
-
-def estimate_rds_snapshot_cost(allocated_gb: int) -> float:
-    """Estimate monthly storage cost of a snapshot based on GB allocated."""
-    price_per_gb = get_price("RDS", "BACKUP_GB_MONTH") or 0.0
-    return round(allocated_gb * price_per_gb, 2)
-
-
-def build_rds_snapshot_metadata(s: Dict[str, Any]) -> RDSSnapshotMetadata:
-    sid = s.get("DBSnapshotIdentifier", "")
-    dbid = s.get("DBInstanceIdentifier", "")
-    stype = s.get("SnapshotType", "unknown")
-    ctime = s.get("SnapshotCreateTime")
-    alloc_gb = int(s.get("AllocatedStorage", 0) or 0)
-
-    age_days = None
-    if isinstance(ctime, datetime):
-        age_days = (datetime.now(timezone.utc) - ctime).days
-    created_str = ctime.isoformat() if hasattr(ctime, "isoformat") else str(ctime or "")
-
-    monthly_cost = estimate_rds_snapshot_cost(alloc_gb)
-
-    return RDSSnapshotMetadata(
-        snapshot_id=sid,
-        db_instance_id=dbid,
-        snapshot_type=stype,
-        creation_date=created_str,
-        allocated_gb=alloc_gb,
-        age_days=age_days or 0,
-        monthly_cost=monthly_cost,
-    )
-
-
-# === Checks ===
-
-def check_rds_snapshot_old(snapshot: RDSSnapshotMetadata, cutoff_days: int = 90) -> List[str]:
-    if snapshot.snapshot_type == "manual" and snapshot.age_days > cutoff_days:
-        return [f"OldManualSnapshot>{snapshot.age_days}d"]
-    return []
-
-
-def check_rds_snapshot_orphaned(snapshot: RDSSnapshotMetadata, active_instances: Set[str]) -> List[str]:
-    if snapshot.db_instance_id and snapshot.db_instance_id not in active_instances:
-        return [f"Orphaned{snapshot.snapshot_type.capitalize()}Snapshot"]
-    return []
-
-
-def check_rds_snapshot_idle_auto(snapshot: RDSSnapshotMetadata, cutoff_days: int = 30) -> List[str]:
-    """
-    Automated snapshots:
-      - flag if instance gone (already caught by orphan check)
-      - OR if age > cutoff (unexpected accumulation).
-    """
-    if snapshot.snapshot_type == "automated" and snapshot.age_days > cutoff_days:
-        return [f"OldAutomatedSnapshot>{snapshot.age_days}d"]
-    return []
-
-
-# registry of checks (context-dependent ones handled in driver)
-RDS_SNAPSHOT_CHECKS: List[Callable[..., List[str]]] = [
-    check_rds_snapshot_old,
-    check_rds_snapshot_idle_auto,
-]
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_rds_snapshots(writer: csv.writer, rds) -> None:
-    """
-    Flags RDS snapshots that are:
-      - old manual (>90d)
-      - old automated (>30d, unusual accumulation)
-      - orphaned from any DB instance
-
-    Writes flagged snapshots with estimated storage cost.
-    """
-    try:
-        # collect all instance IDs for orphaned check
-        instances: Set[str] = set()
-        for page in rds.get_paginator("describe_db_instances").paginate():
-            for db in page.get("DBInstances", []):
-                instances.add(db.get("DBInstanceIdentifier", ""))
-
-        # fetch both manual & automated snapshots
-        snap_paginator = rds.get_paginator("describe_db_snapshots")
-        for page in snap_paginator.paginate():
-            for s in page.get("DBSnapshots", []):
-                snapshot = build_rds_snapshot_metadata(s)
-
-                # run checks from registry
-                for check in RDS_SNAPSHOT_CHECKS:
-                    snapshot.flags.update(check(snapshot))
-                # orphaned check (needs context)
-                snapshot.flags.update(check_rds_snapshot_orphaned(snapshot, instances))
-
-                if snapshot.flags:
-                    if snapshot.monthly_cost > 0:
-                        snapshot.flags.add(f"PotentialSaving≈{snapshot.monthly_cost}$")
-
-                    write_resource_to_csv(
-                        writer=writer,
-                        resource_id=snapshot.snapshot_id,
-                        name="",
-                        owner_id=ACCOUNT_ID,
-                        resource_type=f"RDSSnapshot({snapshot.snapshot_type})",
-                        state="",
-                        creation_date=snapshot.creation_date,
-                        storage_gb=snapshot.allocated_gb,
-                        estimated_cost=snapshot.monthly_cost,
-                        flags=list(snapshot.flags),
-                    )
-                    logging.info(
-                        f"[RDS:{snapshot.snapshot_id}] type={snapshot.snapshot_type} "
-                        f"flags={snapshot.flags} estCost≈${snapshot.monthly_cost}"
-                    )
-
-    except ClientError as e:
-        logging.error(f"[check_rds_snapshots] AWS error: {e.response['Error'].get('Code')}")
-    except Exception as e:
-        logging.error(f"[check_rds_snapshots] Unexpected error: {e}")
-
-#endregion
-
 #region EXTENDED SUPPORT
 
 @retry_with_backoff(exceptions=(ClientError,))
@@ -1542,191 +1235,6 @@ def check_rds_extended_support_mysql(writer: csv.writer, rds) -> None:
         logging.error(f"[check_rds_extended_support_mysql] AWS error: {e}")
     except Exception as e:
         logging.error(f"[check_rds_extended_support_mysql] Unexpected error: {e}")
-
-#endregion
-
-#region EC2 SECTION
-
-def _ec2_hourly_price(instance_type: str, region: str) -> float:
-    """Best-effort on-demand hourly price for an EC2 instance type in a region."""
-    try:
-        return float(get_price("EC2", instance_type, region=region))
-    except Exception:
-        return 0.0
-
-
-def check_idle_ec2_instances(writer, ec2, cloudwatch,) -> None:
-    """
-    Identify EC2 instances that appear **idle** and estimate potential monthly savings
-    if they are stopped/terminated.
-
-    Method:
-      • Enumerate running EC2 instances (DescribeInstances paginator).
-      • Build a single CloudWatch GetMetricData request per page to fetch:
-          - CPUUtilization (Average)
-          - NetworkIn, NetworkOut (Sum)
-          - DiskReadOps, DiskWriteOps (Sum)
-          - StatusCheckFailed (Maximum)
-        using 1-day periods over the last EC2_LOOKBACK_DAYS.
-      • Compute per-instance indicators:
-          - avg_cpu_pct
-          - total_net_gb over window
-          - total_disk_ops over window
-          - max_status_check_failed (0 means healthy)
-      • Flag as IdleInstance if:
-          avg_cpu_pct < EC2_IDLE_CPU_PCT AND
-          total_net_gb < EC2_IDLE_NET_GB AND
-          total_disk_ops < EC2_IDLE_DISK_OPS AND
-          max_status_check_failed == 0
-      • Estimate potential monthly saving as on-demand hourly price × 24 × 30.
-
-    Output (CSV):
-      - ResourceType="EC2Instance", State (instance state), PotentialSaving in flags
-        so your writer populates Potential_Saving_USD automatically.
-
-    Error handling:
-      • All AWS calls are wrapped with retry/backoff.
-      • Missing metrics default to safe values (treated as 0 traffic/CPU).
-      • Processing continues on per-page or per-instance errors, logged at INFO/ERROR.
-    """
-
-    try:
-        region = (
-            getattr(getattr(cloudwatch, "meta", None), "region_name", "")
-            or getattr(getattr(ec2, "meta", None), "region_name", "")
-            or ""
-        )
-
-        now = datetime.now(timezone.utc)
-        lookback_days = max(1, EC2_LOOKBACK_DAYS)
-        start = now - timedelta(days=lookback_days)
-        period = EC2_CW_PERIOD  # e.g., 86400
-
-        # 1) List instances in this region
-        instances = []
-        token = None
-        while True:
-            try:
-                resp = ec2.describe_instances(NextToken=token) if token else ec2.describe_instances()
-            except ClientError as e:
-                logging.error(f"[EC2] describe_instances failed in {region}: {e}")
-                break
-
-            for r in resp.get("Reservations", []):
-                instances.extend(r.get("Instances", []))
-            token = resp.get("NextToken")
-            if not token:
-                break
-
-        if not instances:
-            return
-
-        def tags_dict(aws_tags):
-            if not aws_tags:
-                return {}
-            return {t.get("Key", ""): t.get("Value", "") for t in aws_tags}
-
-        # 2) Batch CloudWatch metrics for all instances (passed CW client)
-        batch = cw.CloudWatchBatcher(region, client=cloudwatch)
-        for it in instances:
-            iid = it["InstanceId"]
-            dims = [{"Name": "InstanceId", "Value": iid}]
-            batch.add_q(id_hint=f"ec2_cpu__{iid}",  namespace="AWS/EC2", metric="CPUUtilization", dims=dims, stat="Average", period=period)
-            batch.add_q(id_hint=f"ec2_nin__{iid}",  namespace="AWS/EC2", metric="NetworkIn",      dims=dims, stat="Sum",     period=period)
-            batch.add_q(id_hint=f"ec2_nout__{iid}", namespace="AWS/EC2", metric="NetworkOut",     dims=dims, stat="Sum",     period=period)
-            batch.add_q(id_hint=f"ec2_drd__{iid}",  namespace="AWS/EC2", metric="DiskReadOps",    dims=dims, stat="Sum",     period=period)
-            batch.add_q(id_hint=f"ec2_dwr__{iid}",  namespace="AWS/EC2", metric="DiskWriteOps",   dims=dims, stat="Sum",     period=period)
-
-        try:
-            series = batch.execute(start, now, scan_by="TimestampDescending")
-        except Exception as e:
-            logging.exception(f"[EC2] CloudWatch batch execute failed in {region}: {e}")
-            series = {}
-
-        # 3) Emit rows
-        for it in instances:
-            try:
-                iid = it["InstanceId"]
-                itype = it.get("InstanceType", "")
-                state = (it.get("State", {}) or {}).get("Name", "")
-                launch_time = it.get("LaunchTime")
-                if isinstance(launch_time, datetime) and launch_time.tzinfo is None:
-                    launch_time = launch_time.replace(tzinfo=timezone.utc)
-                created_iso = (launch_time or now).astimezone(timezone.utc).isoformat()
-
-                tdict = tags_dict(it.get("Tags", []))
-                name = tdict.get("Name", iid)
-
-                # Extract metrics
-                cpu_vals = [v for _, v in series.get(f"ec2_cpu__{iid}", [])]
-                nin_sum  = sum(v for _, v in series.get(f"ec2_nin__{iid}", []))
-                nout_sum = sum(v for _, v in series.get(f"ec2_nout__{iid}", []))
-                drd_sum  = sum(v for _, v in series.get(f"ec2_drd__{iid}", []))
-                dwr_sum  = sum(v for _, v in series.get(f"ec2_dwr__{iid}", []))
-
-                avg_cpu  = (sum(cpu_vals) / len(cpu_vals)) if cpu_vals else 0.0
-                net_gb   = float(nin_sum + nout_sum) / (1024.0 ** 3)
-                disk_ops = float(drd_sum + dwr_sum)
-
-                # Thresholds from config
-                idle_cpu  = avg_cpu  <= EC2_IDLE_CPU_PCT
-                idle_net  = net_gb   <= EC2_IDLE_NET_GB
-                idle_disk = disk_ops <= EC2_IDLE_DISK_OPS
-                is_idle   = idle_cpu and idle_net and idle_disk and state == "running"
-
-                # Estimated monthly compute using your helper & math
-                try:
-                    hourly = _ec2_hourly_price(itype, region)
-                except Exception:
-                    hourly = 0.0
-                monthly_compute = round(hourly * 24 * 30, 2) if hourly > 0 else 0.0
-
-                # Flags, confidence, potential
-                flags = []
-                missing = [k for k in REQUIRED_TAG_KEYS if not tdict.get(k)]
-                if missing:
-                    flags.append(f"MissingRequiredTags={','.join(missing)}")
-                if is_idle:
-                    flags.append("idle_ec2_candidate")
-
-                confidence = 100 if is_idle else None
-                potential  = monthly_compute if is_idle else None
-
-                signals = {
-                    "Region": region,
-                    "InstanceType": itype,
-                    "State": state,
-                    "AvgCPUPercent": f"{avg_cpu:.2f}",
-                    f"NetGB{lookback_days}d": f"{net_gb:.3f}",
-                    f"DiskOps{lookback_days}d": str(int(disk_ops)),
-                    "LookbackDays": str(lookback_days),
-                }
-
-                write_resource_to_csv(
-                    writer=writer,
-                    resource_id=iid,
-                    name=name,
-                    resource_type="EC2Instance",
-                    owner_id=ACCOUNT_ID,
-                    state=str(state),
-                    creation_date=created_iso,
-                    estimated_cost=monthly_compute,  # <= your original monthly compute estimate
-                    app_id=tdict.get("ApplicationID", "NULL"),
-                    app=tdict.get("Application", "NULL"),
-                    env=tdict.get("Environment", "NULL"),
-                    referenced_in="",
-                    flags=flags,
-                    object_count="",
-                    potential_saving=potential,
-                    confidence=confidence,
-                    signals=signals,
-                )
-            except Exception as e:
-                logging.exception(f"[EC2] emit failed for {it.get('InstanceId','?')} in {region}: {e}")
-
-    except Exception as e:
-        logging.exception(f"[EC2] check_ec2_idle_instances_refactored failed: {e}")
-        return
 
 #endregion
 
@@ -1984,11 +1492,7 @@ def main():
                 run_check(profiler, check_name="check_unused_efs_filesystems", region=region,
                           fn=check_unused_efs_filesystems, writer=writer,
                           efs=clients['efs'], cloudwatch=clients['cloudwatch'])
-
-                run_check(profiler, check_name="check_log_groups_with_infinite_retention", region=region,
-                          fn=check_log_groups_with_infinite_retention,
-                          writer=writer, logs=clients['logs'])
-
+                
                 run_check(profiler, "check_backup_plans_without_selections", 
                           region, backup_checks.check_backup_plans_without_selections, writer=writer, 
                           backup=clients["backup"])
@@ -1999,8 +1503,39 @@ def main():
                           region, backup_checks.check_backup_stale_recovery_points, writer=writer, 
                           backup=clients["backup"])
 
-                run_check(profiler, check_name="check_orphaned_fsx_backups", region=region,
-                          fn=check_orphaned_fsx_backups, writer=writer, fsx=clients['fsx'])
+                run_check(
+                    profiler,
+                    "check_fsx_low_activity_filesystems",
+                    region,
+                    fsx_checks.check_fsx_low_activity_filesystems,
+                    writer=writer,
+                    fsx=clients["fsx"],
+                    cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, io_threshold_bytes=1_000_000_000
+                )
+
+                run_check(
+                    profiler,
+                    "check_fsx_high_free_capacity",
+                    region,
+                    fsx_checks.check_fsx_high_free_capacity,
+                    writer=writer,
+                    fsx=clients["fsx"],
+                    cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=3, free_pct_threshold=0.70
+                )
+
+                run_check(
+                    profiler,
+                    "check_fsx_old_backups",
+                    region,
+                    fsx_checks.check_fsx_old_backups,
+                    writer=writer,
+                    fsx=clients["fsx"],
+                    cloudwatch=clients["cloudwatch"],
+                    # knobs: stale_days=30
+                )
+
 
                 # Route 53 is global, ELB is regional; leave as-is but profile per region invocation
                 run_check(profiler, check_name="check_redundant_route53_records", region=region,
@@ -2084,16 +1619,53 @@ def main():
                           ebs_checks.check_ebs_snapshots_old_or_orphaned, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
 
-                run_check(profiler, check_name="check_rds_snapshots", region=region,
-                          fn=check_rds_snapshots, writer=writer, rds=clients['rds'])
-
                 run_check(profiler, check_name="check_wafv2_unassociated_acls", region=region,
                           fn=check_wafv2_unassociated_acls, writer=writer,
                           wafv2=clients['wafv2'], region_name=region)
 
-                run_check(profiler, check_name="check_idle_ec2_instances", region=region,
-                          fn=check_idle_ec2_instances, writer=writer,
-                          ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
+                #TODO: ignore slave instances (sap db)
+                run_check(
+                    profiler,
+                    "check_ec2_underutilized_instances",
+                    region,
+                    ec2_checks.check_ec2_underutilized_instances,
+                    writer=writer,
+                    ec2=clients["ec2"],
+                    cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, cpu_avg_threshold=5.0, cpu_max_threshold=10.0,
+                    #        net_avg_bps_threshold=100_000
+                )
+
+                run_check(
+                    profiler,
+                    "check_ec2_stopped_instances",
+                    region,
+                    ec2_checks.check_ec2_stopped_instances,
+                    writer=writer,
+                    ec2=clients["ec2"],
+                    cloudwatch=clients["cloudwatch"],
+                    # knobs: stale_days=14
+                )
+
+                run_check(
+                    profiler,
+                    "check_ec2_old_generation_instances",
+                    region,
+                    ec2_checks.check_ec2_old_generation_instances,
+                    writer=writer,
+                    ec2=clients["ec2"],
+                    cloudwatch=clients["cloudwatch"],
+                )
+
+                run_check(
+                    profiler,
+                    "check_ec2_unused_security_groups",
+                    region,
+                    ec2_checks.check_ec2_unused_security_groups,
+                    writer=writer,
+                    ec2=clients["ec2"],
+                    cloudwatch=clients["cloudwatch"],
+                )
 
                 # CloudFront is global; no impact to put it in the region loop
                 run_check(profiler, check_name="check_cloudfront_idle_distributions", region=region,
@@ -2197,6 +1769,32 @@ def main():
                 run_check(profiler, "check_ami_unencrypted_snapshots",
                           region, ami_checks.check_ami_unencrypted_snapshots,
                           writer=writer, ec2=clients["ec2"],)
+
+                run_check(
+                    profiler, "check_loggroups_no_retention", region,
+                    lg_checks.check_loggroups_no_retention, writer=writer,
+                    logs=clients["logs"], cloudwatch=clients["cloudwatch"],
+                )
+
+                run_check(
+                    profiler, "check_loggroups_stale", region,
+                    lg_checks.check_loggroups_stale, writer=writer,
+                    logs=clients["logs"], cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14
+                )
+
+                run_check(
+                    profiler, "check_loggroups_large_storage",
+                    region, lg_checks.check_loggroups_large_storage,
+                    writer=writer, logs=clients["logs"], cloudwatch=clients["cloudwatch"],
+                    # knobs: min_gb=50.0
+                )
+
+                run_check(
+                    profiler, "check_loggroups_unencrypted", region,
+                    lg_checks.check_loggroups_unencrypted, writer=writer,
+                    logs=clients["logs"], cloudwatch=clients["cloudwatch"],
+                )
 
 
         profiler.dump_csv()

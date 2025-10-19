@@ -77,8 +77,8 @@ PRICING: PriceMap = {
         "PITR_GB_MONTH": 0.20,
     },
 
-    "CLOUDWATCH": {
-        "LOG_GB_MONTH": 0.03,       # log storage per GB-month
+    "CWL": {
+        "STORAGE_GB_MONTH": 0.03,       # log storage per GB-month
         "LOG_INGEST_GB": 0.50,      # common ingest baseline (region varies a bit)
         # (Logs Insights per-GB-scanned exists but we omit)
     },
@@ -164,8 +164,13 @@ PRICING: PriceMap = {
     },
 
     "FSX": {
-        "BACKUP_GB_MONTH": 0.05
+        "LUSTRE_GB_MONTH": 0.21,
+        "WINDOWS_GB_MONTH": 0.13,
+        "ONTAP_GB_MONTH": 0.03,
+        "OPENZFS_GB_MONTH": 0.0,
+        "BACKUP_GB_MONTH": 0.05,
     },
+
     "ENI": {
         "DETACHED_MONTH": 0.0
     },
