@@ -148,28 +148,23 @@ Usage
 import csv
 import os
 import logging
-from typing import Dict, Optional, List, Union, Callable, Any, Set
+from typing import Dict, Optional, List, Union, Callable, Any
 from datetime import datetime, timezone, timedelta
 
-from dataclasses import dataclass, field
 import re
 
 from time import perf_counter
 import boto3 # type: ignore
-from botocore.exceptions import ClientError # type: ignore
 #from correlator import build_certificate_graph, summarize_cert_usage
 
 from finops_toolset.config import (
-    SDK_CONFIG,
-    REGIONS, OUTPUT_FILE, LOG_FILE,
-    VPC_LOOKBACK_DAYS, MIN_COST_THRESHOLD,
+    SDK_CONFIG, REGIONS, OUTPUT_FILE, LOG_FILE,
 )
 
 from finops_toolset.pricing import get_price
 from aws_checkers.eip import check_unused_elastic_ips as eip
 from aws_checkers.network_interfaces import check_detached_network_interfaces as eni
 from aws_checkers import ssm as ssm_checks
-from core.retry import retry_with_backoff
 from aws_checkers import config as checkers_config
 from aws_checkers.private_ca import check_private_certificate_authorities
 from aws_checkers.kms import check_kms_customer_managed_keys
@@ -191,6 +186,12 @@ from aws_checkers import rds_snapshots as rds_snaps
 from aws_checkers import lb as lb_checks
 from aws_checkers import wafv2 as waf_checks
 from aws_checkers import acm as acm_checks
+from aws_checkers import vpc_tgw as vpc_tgw_checks
+from aws_checkers import route53 as r53_checks
+from aws_checkers import extended_support as ext_checks
+from aws_checkers import eks as eks_checks
+from aws_checkers import fsr as fsr_checks
+
 #endregion
 
 # Configure logging
@@ -330,6 +331,7 @@ def init_clients(region: str):
 
 
 def get_account_id(sts_client=None) -> str:
+    """Retrieves account ID"""
     try:
         c = sts_client or boto3.client("sts", config=SDK_CONFIG)
         return c.get_caller_identity().get("Account", "")
@@ -337,44 +339,6 @@ def get_account_id(sts_client=None) -> str:
         return ""
     
 ACCOUNT_ID = get_account_id()
-
-
-def score_confidence(signal_weights: Dict[str, float], evidence_ok: bool = True) -> int:
-    """
-    Simple confidence score: weighted mean of signals [0..1], scaled to 0..100.
-    Example signal_weights: {'cpu_quiet':1.0, 'net_quiet':1.0, 'disk_quiet':0.5, 'health_ok':1.0}
-    """
-    if not signal_weights:
-        return 50
-    total_w = sum(max(0.0, w) for w in signal_weights.values())
-    if total_w <= 0.0:
-        return 50
-    weighted = 0.0
-    for k, w in signal_weights.items():
-        # each value should already be 0..1; clamp just in case
-        v = signal_weights.get(k, 0.0)
-        v = 0.0 if v < 0 else (1.0 if v > 1 else v)
-        weighted += v * w
-    base = int(round((weighted / total_w) * 100))
-    if not evidence_ok:
-        base = max(0, base - 20)
-    return max(0, min(100, base))
-
-
-def pct_to_signal(val_pct: float, threshold_pct: float) -> float:
-    """
-    Turn 'lower-is-better' metric into a 0..1 signal.
-    ≤ threshold => 1.0 (good/quiet); scales down linearly until 0 at 2x threshold.
-    """
-    if threshold_pct <= 0:
-        return 0.0
-    if val_pct <= threshold_pct:
-        return 1.0
-    if val_pct >= 2 * threshold_pct:
-        return 0.0
-    # linear between threshold and 2*threshold
-    return 1.0 - (val_pct - threshold_pct) / float(threshold_pct)
-
 
 # ===== Profiling helpers =====
 
@@ -504,351 +468,7 @@ def run_step(profiler: RunProfiler,
 
 #endregion
 
-#region Route53 SECTION
-
-@dataclass
-class Route53RecordMetadata:
-    zone_id: str
-    zone_name: str
-    record_name: str
-    record_type: str
-    targets: list[str]
-    flags: list[str] = field(default_factory=list)
-
-
-def resolve_elb_targets(elbv2) -> set[str]:
-    """Return set of all ELB DNS names (lowercased, no trailing dot)."""
-    lb_dnsnames = set()
-    try:
-        paginator = elbv2.get_paginator("describe_load_balancers")
-        for page in paginator.paginate():
-            for lb in page.get("LoadBalancers", []):
-                dns = lb.get("DNSName", "")
-                if dns:
-                    lb_dnsnames.add(dns.rstrip(".").lower())
-    except Exception as e:
-        logging.warning(f"[resolve_elb_targets] Could not fetch ELB DNS names: {e}")
-    return lb_dnsnames
-
-
-def flag_record(record: dict, lb_dnsnames: set[str], s3) -> list[str]:
-    """Return list of flags for a single Route53 record."""
-    flags: list[str] = []
-    record_type = record.get("Type")
-    if record_type not in ("A", "AAAA", "CNAME"):
-        return flags
-
-    is_alias = "AliasTarget" in record
-    if is_alias:
-        targets = [record["AliasTarget"]["DNSName"]]
-    else:
-        targets = [rr["Value"] for rr in record.get("ResourceRecords", [])]
-
-    targets = [t.rstrip(".").lower() for t in targets if t]
-
-    for target in targets:
-        if ".elb.amazonaws.com" in target:
-            if lb_dnsnames:
-                if target not in lb_dnsnames:
-                    flags.append("StaleELBTarget")
-            else:
-                flags.append("ELBTargetNeedsVerification")
-
-        elif ".s3" in target or "s3-website" in target:
-            bucket = target.split(".")[0]
-            try:
-                s3.head_bucket(Bucket=bucket)
-            except Exception:
-                flags.append("StaleS3Target")
-
-        elif record_type == "CNAME" and "ec2" in target:
-            flags.append("PotentialStaleEC2Target")
-
-    return flags
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_redundant_route53_records(writer: csv.writer, route53, elbv2, s3) -> None:
-    """
-    Flags potentially redundant or stale Route53 records:
-      - ELB targets no longer present
-      - S3 bucket targets that no longer exist
-      - EC2 private DNS targets in CNAMEs (cannot verify, marked potential)
-    
-    Writes a CSV row per flagged record.
-    """
-    try:
-        hosted_zones = route53.list_hosted_zones().get("HostedZones", [])
-        lb_dnsnames = resolve_elb_targets(elbv2)
-
-        for zone in hosted_zones:
-            zone_id = zone["Id"].split("/")[-1]
-            zone_name = zone["Name"]
-                        
-            records = []
-            req = {"HostedZoneId": zone_id}
-            while True:
-                resp = route53.list_resource_record_sets(**req)
-                records.extend(resp.get("ResourceRecordSets", []) or [])
-                if not resp.get("IsTruncated"):
-                    break
-                req.update({
-                    "StartRecordName": resp.get("NextRecordName"),
-                    "StartRecordType": resp.get("NextRecordType"),
-                    **({"StartRecordIdentifier": resp.get("NextRecordIdentifier")} 
-                        if resp.get("NextRecordIdentifier") else {})
-                })
-
-            for record in records:
-                rec_flags = flag_record(record, lb_dnsnames, s3)
-                if rec_flags:
-                    targets = record.get("ResourceRecords") or [record.get("AliasTarget", {}).get("DNSName", "")]
-                    for t in targets:
-                        t_val = t.get("Value") if isinstance(t, dict) else t
-                        write_resource_to_csv(
-                            writer=writer,
-                            resource_id=record.get("Name", ""),
-                            name=t_val or "",
-                            owner_id=ACCOUNT_ID,
-                            resource_type="Route53Record",
-                            flags=rec_flags
-                        )
-
-    except ClientError as e:
-        logging.error(f"[check_redundant_route53_records] AWS error: {e}")
-    except Exception as e:
-        logging.error(f"[check_redundant_route53_records] Unexpected error: {e}")
-
-#endregion
-
-#region VPC/TGW SECTION
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_inter_region_vpc_and_tgw_peerings(writer: csv.writer, ec2, cloudwatch) -> None:
-    """
-    Detect and cost-estimate inter-region VPC Peering and Transit Gateway (TGW) peering attachments.
-
-    For each active inter-region attachment, this function:
-      - Calculates monthly outbound transfer in GB using CloudWatch BytesOutToRegion.
-      - Estimates monthly transfer cost.
-      - Flags potential savings and provides high-level remediation advice.
-
-    Args:
-        writer (csv.writer): CSV writer instance.
-        ec2: boto3 EC2 client.
-        cloudwatch: boto3 CloudWatch client.
-
-    Pricing assumption:
-        $0.02 per GB for inter-region data transfer (update to match EDP/regional rates).
-    """
-    try:
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=VPC_LOOKBACK_DAYS)
-        period = 86400  # daily datapoints
-
-        def get_bytes_out(dimensions: list[dict]) -> float:
-            """Return total GB over LOOKBACK_DAYS for given CW metric dimensions."""
-            namespace = "AWS/TransitGateway" if any(d['Name'].startswith("TransitGateway") for d in dimensions) else "AWS/VPC"
-            try:
-                resp = cloudwatch.get_metric_statistics(
-                    Namespace=namespace,
-                    MetricName="BytesOutToRegion",
-                    Dimensions=dimensions,
-                    StartTime=start,
-                    EndTime=end,
-                    Period=period,
-                    Statistics=["Sum"]
-                )
-                total_bytes = sum(dp.get("Sum", 0.0) for dp in resp.get("Datapoints", []))
-                return total_bytes / (1024**3)  # GB
-            except ClientError as e:
-                logging.warning(f"[check_inter_region_vpc_and_tgw_peerings] CW metric failed: {e}")
-                return 0.0
-
-        # -------- Inter-region VPC Peering --------
-        peerings = ec2.describe_vpc_peering_connections().get("VpcPeeringConnections", [])
-        for pcx in peerings:
-            status = pcx.get("Status", {}).get("Code", "")
-            if status != "active":
-                continue
-
-            req_region = pcx.get("RequesterVpcInfo", {}).get("Region")
-            acc_region = pcx.get("AccepterVpcInfo", {}).get("Region")
-            if not req_region or not acc_region or req_region == acc_region:
-                continue
-
-            pcx_id = pcx.get("VpcPeeringConnectionId", "")
-            gb_out = get_bytes_out([{"Name": "VpcPeeringConnectionId", "Value": pcx_id}])
-            est_cost = round(gb_out * get_price("NETWORK", "INTER_REGION_GB"), 2)
-
-            flags = ["InterRegionPeering"]
-            if est_cost >= MIN_COST_THRESHOLD:
-                flags.append(f"PotentialSaving={est_cost}$")
-                flags.append("ReviewPeering:Co-locateWorkloadsOrUseSameRegion")
-
-            write_resource_to_csv(
-                writer=writer,
-                resource_id=pcx_id,
-                name="",
-                owner_id=ACCOUNT_ID,
-                resource_type="VPCPeeringConnection",
-                state=status,
-                estimated_cost=est_cost,
-                flags=flags
-            )
-
-        # -------- Inter-region TGW Peering --------
-        try:
-            tgw_peerings = ec2.describe_transit_gateway_peering_attachments().get("TransitGatewayPeeringAttachments", [])
-        except ClientError:
-            tgw_peerings = []
-
-        for tgw in tgw_peerings:
-            state = tgw.get("State", "")
-            if state != "available":
-                continue
-
-            req_region = tgw.get("RequesterTgwInfo", {}).get("Region")
-            acc_region = tgw.get("AccepterTgwInfo", {}).get("Region")
-            if not req_region or not acc_region or req_region == acc_region:
-                continue
-
-            tgw_id = tgw.get("TransitGatewayAttachmentId", "")
-            gb_out = get_bytes_out([{"Name": "TransitGatewayAttachmentId", "Value": tgw_id}])
-            est_cost = round(gb_out * get_price("NETWORK", "INTER_REGION_GB"), 2)
-
-            flags = ["InterRegionTGWPeering"]
-            if est_cost >= MIN_COST_THRESHOLD:
-                flags.append(f"PotentialSaving={est_cost}$")
-                flags.append("ReviewTGWPeering:ConsiderRegionalConsolidation")
-
-            write_resource_to_csv(
-                writer=writer,
-                resource_id=tgw_id,
-                name="",
-                owner_id=ACCOUNT_ID,
-                resource_type="TGWPeeringAttachment",
-                state=state,
-                estimated_cost=est_cost,
-                flags=flags
-            )
-
-    except ClientError as e:
-        logging.error(f"[check_inter_region_vpc_and_tgw_peerings] AWS error: {e}")
-    except Exception as e:
-        logging.error(f"[check_inter_region_vpc_and_tgw_peerings] Unexpected error: {e}")
-
-#endregion
-
-#region FSR SECTION
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_fast_snapshot_restore(writer: csv.writer, ec2):
-    try:
-        resp = ec2.describe_fast_snapshot_restores().get("FastSnapshotRestores", [])
-        for fsr in resp:
-            snap = fsr.get("SnapshotId","")
-            az = fsr.get("AvailabilityZone","")
-            state = fsr.get("State","")
-            if state != "enabled": 
-                continue
-            # Cost: per snapshot-AZ hour; emit monthly rough
-            monthly = round(get_price("EBS","FSR_PER_AZ_HOUR")*24*30, 2)
-            flags = [f"FSREnabled({az})", f"PotentialSaving={monthly}$"]
-            write_resource_to_csv(
-                writer, snap, "", "EBSFastSnapshotRestore", owner_id=get_account_id(),
-                state=state, estimated_cost=monthly, flags=flags
-            )
-    except ClientError as e:
-        logging.error(f"[check_ebs_fast_snapshot_restore] {e}")
-
-#endregion
-
-
-#region EKS SECTION
-@retry_with_backoff(exceptions=(ClientError,))
-def check_eks_empty_clusters(writer: csv.writer, eks, ec2) -> None:
-    """
-    Flag clusters with no nodegroups and no Fargate profiles; estimate control-plane burn.
-    """
-    try:
-        monthly = round(get_price("EKS","CONTROL_PLANE_HOUR")*24*30, 2)
-        for page in eks.get_paginator("list_clusters").paginate():
-            for name in page.get("clusters", []):
-                d = eks.describe_cluster(name=name).get("cluster", {})
-                if d.get("status") != "ACTIVE":
-                    continue
-                ng = eks.list_nodegroups(clusterName=name).get("nodegroups", [])
-                fg = eks.list_fargate_profiles(clusterName=name).get("fargateProfileNames", [])
-                if not ng and not fg:
-                    write_resource_to_csv(
-                        writer, d.get("arn", name), name, "EKSCluster", owner_id=ACCOUNT_ID,
-                        state=d.get("status",""), estimated_cost=monthly,
-                        flags=[f"EmptyEKSCluster", f"PotentialSaving={monthly}$"]
-                    )
-    except ClientError as e:
-        logging.error(f"[check_eks_empty_clusters] {e}")
-#endregion
-
-#region EXTENDED SUPPORT
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_rds_extended_support_mysql(writer: csv.writer, rds) -> None:
-    """
-    Detect RDS MySQL 5.7 and Aurora MySQL 2.x instances under extended support.
-    Flags them for upgrade and writes findings to CSV.
-    """
-    try:
-        paginator = rds.get_paginator("describe_db_instances")
-        for page in paginator.paginate():
-            for db in page.get("DBInstances", []):
-                engine = db.get("Engine", "")
-                version = db.get("EngineVersion", "")
-                db_id = db.get("DBInstanceIdentifier", "")
-                arn = db.get("DBInstanceArn", "")
-                state = db.get("DBInstanceStatus", "")
-                created = db.get("InstanceCreateTime")
-                created_str = created.isoformat() if hasattr(created, "isoformat") else ""
-                tags = {}
-                try:
-                    tag_resp = rds.list_tags_for_resource(ResourceName=arn)
-                    tags = {t["Key"]: t["Value"] for t in tag_resp.get("TagList", [])}
-                except Exception as e:
-                    logging.warning(f"[RDS] Tag fetch failed for {db_id}: {e}")
-
-                flags = []
-                if engine == "mysql" and version.startswith("5.7"):
-                    flags.append("ExtendedSupportMySQL57")
-                    flags.append("ConsiderUpgradeToMySQL80")
-                elif engine == "aurora-mysql" and version.startswith("5.7."):
-                    flags.append("ExtendedSupportAuroraMySQL2")
-                    flags.append("ConsiderUpgradeToAuroraMySQL3")
-                elif engine == "aurora-mysql" and version.startswith("2."):
-                    flags.append("ExtendedSupportAuroraMySQL2")
-                    flags.append("ConsiderUpgradeToAuroraMySQL3")
-
-                if flags:
-                    write_resource_to_csv(
-                        writer=writer,
-                        resource_id=db_id,
-                        name=db.get("DBName", ""),
-                        resource_type="RDSInstance",
-                        owner_id=ACCOUNT_ID,
-                        state=state,
-                        creation_date=created_str,
-                        estimated_cost="",
-                        app_id=tags.get("ApplicationID", "NULL"),
-                        app=tags.get("Application", "NULL"),
-                        env=tags.get("Environment", "NULL"),
-                        flags=flags
-                    )
-                    logging.info(f"[RDS] {db_id} flagged: {flags}")
-    except ClientError as e:
-        logging.error(f"[check_rds_extended_support_mysql] AWS error: {e}")
-    except Exception as e:
-        logging.error(f"[check_rds_extended_support_mysql] Unexpected error: {e}")
-
-#endregion
+#region MAIN SECTION
 
 def main():
     """
@@ -882,83 +502,57 @@ def main():
             try:
                 s3_global = boto3.client("s3", config=SDK_CONFIG)
                 cloudwatch_global = boto3.client("cloudwatch", config=SDK_CONFIG)
-                cloudfront_global = boto3.client("cloudfront", config=SDK_CONFIG)
                 region="GLOBAL"
             except Exception as e:
                 logging.error(f"[main] Failed to create global S3 client: {e}")
                 s3_global = boto3.client("s3")  # fallback
-                cloudfront_global = boto3.client("cloudfront")
                 cloudwatch_global = boto3.client("cloudwatch")
 
 
             run_check(
-                profiler,
-                "check_s3_public_buckets",
-                region,
+                profiler, "check_s3_public_buckets", region,
                 s3_checks.check_s3_public_buckets,
-                writer=writer,
-                s3=s3_global,
-                cloudwatch=cloudwatch_global,
+                writer=writer, s3=s3_global, cloudwatch=cloudwatch_global,
             )
 
             run_check(
-                profiler,
-                "check_s3_buckets_without_default_encryption",
-                region,
-                s3_checks.check_s3_buckets_without_default_encryption,
-                writer=writer,
-                s3=s3_global,
-                cloudwatch=cloudwatch_global,
+                profiler, "check_s3_buckets_without_default_encryption",
+                region, s3_checks.check_s3_buckets_without_default_encryption,
+                writer=writer, s3=s3_global, cloudwatch=cloudwatch_global,
             )
 
             run_check(
-                profiler,
-                "check_s3_versioned_without_lifecycle",
-                region,
-                s3_checks.check_s3_versioned_without_lifecycle,
-                writer=writer,
-                s3=s3_global,
-                cloudwatch=cloudwatch_global,
+                profiler, "check_s3_versioned_without_lifecycle",
+                region, s3_checks.check_s3_versioned_without_lifecycle,
+                writer=writer, s3=s3_global, cloudwatch=cloudwatch_global,
             )
 
             run_check(
-                profiler,
-                "check_s3_buckets_without_lifecycle",
-                region,
-                s3_checks.check_s3_buckets_without_lifecycle,
-                writer=writer,
-                s3=s3_global,
-                cloudwatch=cloudwatch_global,
+                profiler, "check_s3_buckets_without_lifecycle",
+                region, s3_checks.check_s3_buckets_without_lifecycle,
+                writer=writer, s3=s3_global, cloudwatch=cloudwatch_global,
             )
 
             run_check(
-                profiler,
-                "check_s3_empty_buckets",
-                region,
-                s3_checks.check_s3_empty_buckets,
-                writer=writer,
-                s3=s3_global,
+                profiler, "check_s3_empty_buckets",
+                region, s3_checks.check_s3_empty_buckets,
+                writer=writer, s3=s3_global,
                 cloudwatch=cloudwatch_global,
             )
 
             run_check(
                 profiler,
                 "check_s3_ia_tiering_candidates",
-                region,
-                s3_checks.check_s3_ia_tiering_candidates,
-                writer=writer,
-                s3=s3_global,
+                region, s3_checks.check_s3_ia_tiering_candidates,
+                writer=writer, s3=s3_global,
                 cloudwatch=cloudwatch_global,
                 # knobs: lookback_days=30, min_standard_gb=50, request_threshold=1000
             )
 
             run_check(
-                profiler,
-                "check_s3_stale_multipart_uploads",
-                region,
-                s3_checks.check_s3_stale_multipart_uploads,
-                writer=writer,
-                s3=s3_global,
+                profiler, "check_s3_stale_multipart_uploads",
+                region, s3_checks.check_s3_stale_multipart_uploads,
+                writer=writer, s3=s3_global,
                 cloudwatch=cloudwatch_global,
                 # knobs: stale_days=7
             )
@@ -1002,43 +596,26 @@ def main():
                           backup=clients["backup"])
 
                 run_check(
-                    profiler,
-                    "check_fsx_low_activity_filesystems",
-                    region,
-                    fsx_checks.check_fsx_low_activity_filesystems,
-                    writer=writer,
-                    fsx=clients["fsx"],
-                    cloudwatch=clients["cloudwatch"],
+                    profiler, "check_fsx_low_activity_filesystems",
+                    region, fsx_checks.check_fsx_low_activity_filesystems,
+                    writer=writer, fsx=clients["fsx"], cloudwatch=clients["cloudwatch"],
                     # knobs: lookback_days=14, io_threshold_bytes=1_000_000_000
                 )
 
                 run_check(
-                    profiler,
-                    "check_fsx_high_free_capacity",
-                    region,
-                    fsx_checks.check_fsx_high_free_capacity,
-                    writer=writer,
-                    fsx=clients["fsx"],
-                    cloudwatch=clients["cloudwatch"],
+                    profiler, "check_fsx_high_free_capacity",
+                    region, fsx_checks.check_fsx_high_free_capacity,
+                    writer=writer, fsx=clients["fsx"], cloudwatch=clients["cloudwatch"],
                     # knobs: lookback_days=3, free_pct_threshold=0.70
                 )
 
                 run_check(
-                    profiler,
-                    "check_fsx_old_backups",
-                    region,
-                    fsx_checks.check_fsx_old_backups,
-                    writer=writer,
-                    fsx=clients["fsx"],
+                    profiler, "check_fsx_old_backups",
+                    region, fsx_checks.check_fsx_old_backups,
+                    writer=writer, fsx=clients["fsx"],
                     cloudwatch=clients["cloudwatch"],
                     # knobs: stale_days=30
                 )
-
-
-                # Route 53 is global, ELB is regional; leave as-is but profile per region invocation
-                run_check(profiler, check_name="check_redundant_route53_records", region=region,
-                          fn=check_redundant_route53_records, writer=writer,
-                          route53=clients['route53'], elbv2=clients['elbv2'], s3=clients['s3'])
 
                 run_check(
                     profiler, "check_lambda_unused_functions",
@@ -1078,9 +655,33 @@ def main():
                     # knobs: age_days=180
                 )
 
-                run_check(profiler, check_name="check_inter_region_vpc_and_tgw_peerings",
-                          region=region, fn=check_inter_region_vpc_and_tgw_peerings,
-                          writer=writer, ec2=clients['ec2'], cloudwatch=clients['cloudwatch'])
+                # VPC hygiene
+                run_check(
+                    profiler, "check_vpc_no_flow_logs",
+                    region, vpc_tgw_checks.check_vpc_no_flow_logs,
+                    writer=writer, ec2=clients["ec2"],
+                )
+
+                run_check(
+                    profiler, "check_vpc_unused",
+                    region, vpc_tgw_checks.check_vpc_unused,
+                    writer=writer, ec2=clients["ec2"],
+                )
+
+                # TGW hygiene + cost
+                run_check(
+                    profiler, "check_tgw_no_attachments",
+                    region, vpc_tgw_checks.check_tgw_no_attachments,
+                    writer=writer, ec2=clients["ec2"],
+                )
+
+                run_check(
+                    profiler, "check_tgw_attachments_low_traffic",
+                    region, vpc_tgw_checks.check_tgw_attachments_low_traffic,
+                    writer=writer, ec2=clients["ec2"], cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, bytes_threshold=50_000_000
+                )
+
 
                 run_check(profiler, "check_ecr_repositories_without_lifecycle_policy", region,
                         ecr_checks.check_ecr_repositories_without_lifecycle_policy,
@@ -1093,13 +694,6 @@ def main():
                 run_check(profiler, "check_ecr_stale_or_untagged_images", region,
                         ecr_checks.check_ecr_stale_or_untagged_images,
                         writer=writer, ecr=clients["ecr"])
-
-                run_check(profiler, check_name="check_ebs_fast_snapshot_restore", region=region,
-                          fn=check_ebs_fast_snapshot_restore, writer=writer, ec2=clients['ec2'])
-
-                run_check(profiler, check_name="check_eks_empty_clusters", region=region,
-                          fn=check_eks_empty_clusters, writer=writer,
-                          eks=clients['eks'], ec2=clients['ec2'])
 
                 run_check(profiler, "check_unattached_ebs_volumes",
                           region, ebs_checks.check_unattached_ebs_volumes, writer=writer,
@@ -1119,83 +713,56 @@ def main():
 
 
                 run_check(
-                    profiler,
-                    "check_acm_expiring_certificates",
-                    region,
-                    acm_checks.check_acm_expiring_certificates,
-                    writer=writer,
-                    acm=clients["acm"],
+                    profiler, "check_acm_expiring_certificates",
+                    region, acm_checks.check_acm_expiring_certificates,
+                    writer=writer, acm=clients["acm"],
                     # knobs: days=30
                 )
 
                 run_check(
-                    profiler,
-                    "check_acm_unused_certificates",
-                    region,
-                    acm_checks.check_acm_unused_certificates,
-                    writer=writer,
-                    acm=clients["acm"],
+                    profiler, "check_acm_unused_certificates",
+                    region, acm_checks.check_acm_unused_certificates,
+                    writer=writer, acm=clients["acm"],
                 )
 
                 run_check(
-                    profiler,
-                    "check_acm_validation_issues",
-                    region,
-                    acm_checks.check_acm_validation_issues,
-                    writer=writer,
-                    acm=clients["acm"],
+                    profiler, "check_acm_validation_issues",
+                    region, acm_checks.check_acm_validation_issues,
+                    writer=writer, acm=clients["acm"],
                 )
 
                 run_check(
-                    profiler,
-                    "check_acm_renewal_problems",
-                    region,
-                    acm_checks.check_acm_renewal_problems,
+                    profiler, "check_acm_renewal_problems",
+                    region, acm_checks.check_acm_renewal_problems,
                     writer=writer,
                     acm=clients["acm"],
                 )
                 #TODO: ignore slave instances (sap db)
                 run_check(
-                    profiler,
-                    "check_ec2_underutilized_instances",
-                    region,
-                    ec2_checks.check_ec2_underutilized_instances,
-                    writer=writer,
-                    ec2=clients["ec2"],
-                    cloudwatch=clients["cloudwatch"],
+                    profiler, "check_ec2_underutilized_instances",
+                    region, ec2_checks.check_ec2_underutilized_instances,
+                    writer=writer, ec2=clients["ec2"], cloudwatch=clients["cloudwatch"],
                     # knobs: lookback_days=14, cpu_avg_threshold=5.0, cpu_max_threshold=10.0,
                     #        net_avg_bps_threshold=100_000
                 )
 
                 run_check(
-                    profiler,
-                    "check_ec2_stopped_instances",
-                    region,
-                    ec2_checks.check_ec2_stopped_instances,
-                    writer=writer,
-                    ec2=clients["ec2"],
-                    cloudwatch=clients["cloudwatch"],
+                    profiler, "check_ec2_stopped_instances", region,
+                    ec2_checks.check_ec2_stopped_instances, writer=writer,
+                    ec2=clients["ec2"], cloudwatch=clients["cloudwatch"],
                     # knobs: stale_days=14
                 )
 
                 run_check(
-                    profiler,
-                    "check_ec2_old_generation_instances",
-                    region,
-                    ec2_checks.check_ec2_old_generation_instances,
-                    writer=writer,
-                    ec2=clients["ec2"],
-                    cloudwatch=clients["cloudwatch"],
+                    profiler, "check_ec2_old_generation_instances", region,
+                    ec2_checks.check_ec2_old_generation_instances, writer=writer,
+                    ec2=clients["ec2"], cloudwatch=clients["cloudwatch"],
                 )
 
                 run_check(
-                    profiler,
-                    "check_ec2_unused_security_groups",
-                    region,
-                    ec2_checks.check_ec2_unused_security_groups,
-                    writer=writer,
-                    ec2=clients["ec2"],
-                    cloudwatch=clients["cloudwatch"],
+                    profiler, "check_ec2_unused_security_groups", region,
+                    ec2_checks.check_ec2_unused_security_groups, writer=writer,
+                    ec2=clients["ec2"], cloudwatch=clients["cloudwatch"],
                 )
 
                 # CloudFront is global; no impact to put it in the region loop
@@ -1203,8 +770,19 @@ def main():
                           fn=check_cloudfront_distributions, writer=writer,
                           cloudfront=clients['cloudfront'], cloudwatch=clients['cloudwatch'])
 
-                run_check(profiler, check_name="check_rds_extended_support_mysql", region=region,
-                          fn=check_rds_extended_support_mysql, writer=writer, rds=clients['rds'])
+                run_check(
+                    profiler, "check_rds_extended_support_candidates",
+                    region, ext_checks.check_rds_extended_support_candidates,
+                    writer=writer, rds=clients["rds"],
+                )
+
+                run_check(
+                    profiler, "check_eks_extended_support_clusters", region,
+                    ext_checks.check_eks_extended_support_clusters,
+                    writer=writer, eks=clients["eks"],
+                    # knobs: ext_versions=["1.23","1.24","1.25"]
+                )
+
 
                 run_check(profiler, check_name="check_private_certificate_authorities",
                 region=region,fn=check_private_certificate_authorities,
@@ -1374,12 +952,9 @@ def main():
                 )
 
                 run_check(
-                    profiler,
-                    "check_wafv2_unassociated_web_acls",
-                    region,
-                    waf_checks.check_wafv2_unassociated_web_acls,
-                    writer=writer,
-                    wafv2=clients["wafv2"],
+                    profiler, "check_wafv2_unassociated_web_acls",
+                    region, waf_checks.check_wafv2_unassociated_web_acls,
+                    writer=writer, wafv2=clients["wafv2"],
                     # knobs: include_cloudfront=False
                 )
 
@@ -1404,14 +979,101 @@ def main():
                 )
 
                 run_check(
-                    profiler,
-                    "check_wafv2_empty_acl_associated",
-                    region,
-                    waf_checks.check_wafv2_empty_acl_associated,
-                    writer=writer,
-                    wafv2=clients["wafv2"],
+                    profiler, "check_wafv2_empty_acl_associated",
+                    region, waf_checks.check_wafv2_empty_acl_associated,
+                    writer=writer, wafv2=clients["wafv2"],
                 )
 
+                run_check(
+                    profiler, "check_route53_empty_public_zones",
+                    region, r53_checks.check_route53_empty_public_zones,
+                    writer=writer, route53=clients["route53"],
+                )
+
+                run_check(
+                    profiler, "check_route53_private_zones_no_vpc_associations",
+                    region, r53_checks.check_route53_private_zones_no_vpc_associations,
+                    writer=writer, route53=clients["route53"],
+                )
+
+                run_check(
+                    profiler, "check_route53_unused_health_checks",
+                    region, r53_checks.check_route53_unused_health_checks,
+                    writer=writer, route53=clients["route53"],
+                )
+
+                run_check(
+                    profiler, "check_route53_public_zones_dnssec_disabled",
+                    region, r53_checks.check_route53_public_zones_dnssec_disabled,
+                    writer=writer, route53=clients["route53"],
+                )
+
+                run_check(
+                    profiler,
+                    "check_eks_empty_clusters",
+                    region,
+                    eks_checks.check_eks_empty_clusters,
+                    writer=writer,
+                    eks=clients["eks"],
+                )
+
+                run_check(
+                    profiler,
+                    "check_eks_logging_incomplete",
+                    region,
+                    eks_checks.check_eks_logging_incomplete,
+                    writer=writer,
+                    eks=clients["eks"],
+                    # knobs: required=["api","audit","authenticator","controllerManager","scheduler"]
+                )
+
+                run_check(
+                    profiler,
+                    "check_eks_public_endpoint_open",
+                    region,
+                    eks_checks.check_eks_public_endpoint_open,
+                    writer=writer,
+                    eks=clients["eks"],
+                )
+
+                run_check(
+                    profiler,
+                    "check_eks_nodegroups_scaled_to_zero",
+                    region,
+                    eks_checks.check_eks_nodegroups_scaled_to_zero,
+                    writer=writer,
+                    eks=clients["eks"],
+                    # knobs: stale_days=14
+                )
+
+                run_check(
+                    profiler,
+                    "check_eks_addons_degraded",
+                    region,
+                    eks_checks.check_eks_addons_degraded,
+                    writer=writer,
+                    eks=clients["eks"],
+                )
+
+                run_check(
+                    profiler,
+                    "check_eks_old_versions",
+                    region,
+                    eks_checks.check_eks_old_versions,
+                    writer=writer,
+                    eks=clients["eks"],
+                    # knobs: min_version_mm="1.27"
+                )
+
+                run_check(
+                    profiler,
+                    "check_ebs_fsr_enabled_snapshots",
+                    region,
+                    fsr_checks.check_ebs_fsr_enabled_snapshots,
+                    writer=writer,
+                    ec2=clients["ec2"],
+                    # knobs: lookback_days=30
+                )
 
         profiler.dump_csv()
         profiler.log_summary(top_n=30)
@@ -1423,3 +1085,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#endregion

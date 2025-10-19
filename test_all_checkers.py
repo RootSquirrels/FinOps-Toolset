@@ -7,7 +7,6 @@ the signatures of all ``check_*`` functions discovered in the target module.
 Test coverage highlights:
 - CSV invariants (delimiter, Signals cell, Potential_Saving_USD derivation).
 - ``get_price`` region/default resolution logic.
-- ``safe_aws_call`` happy path and exception behavior.
 - Smoke-run of every ``check_*`` with stubs to catch obvious regressions.
 - Determinism: repeated runs write the same number of rows.
 - Absence of error logs when checkers run on empty/no-op inputs.
@@ -47,7 +46,6 @@ __all__ = [
     "NullAWSClient",
     "_signals_ok",
     "Patcher",
-    "TestSafeAwsCall",
     "TestPricingLookup",
     "TestAllClientsCovered",
     "TestAllCheckersRun",
@@ -206,38 +204,6 @@ def _signals_ok(cell: str) -> bool:
     return " | " in cell or ("=" in cell and ";" in cell)
 
 
-class TestSafeAwsCall(unittest.TestCase):
-    """Unit tests for :func:`finops.safe_aws_call`."""
-
-    def test_returns_default_on_exception(self) -> None:
-        """When the function raises, the provided default is returned."""
-        def boom():
-            raise RuntimeError("kaboom")
-        out = finops.safe_aws_call(boom, default={"ok": False}, context="unit")
-        self.assertEqual(out, {"ok": False})
-
-    def test_prefers_explicit_default_over_fallback(self) -> None:
-        """Explicit ``default`` takes precedence over any ``fallback`` kwarg."""
-        def boom():
-            raise RuntimeError("kaboom")
-        # Some implementations support `fallback=` kw; tolerate absence by ignoring it.
-        try:
-            out = finops.safe_aws_call(  # type: ignore[call-arg]
-                boom, default=123, context="unit", fallback={"x": 1}
-            )
-        except TypeError:
-            # Older signature without fallback; still pass
-            out = finops.safe_aws_call(boom, default=123, context="unit")
-        self.assertEqual(out, 123)
-
-    def test_success_path_returns_function_value(self) -> None:
-        """If the function succeeds, its value is returned unchanged."""
-        def ok():
-            return {"answer": 42}
-        out = finops.safe_aws_call(ok, default=None, context="unit")
-        self.assertEqual(out, {"answer": 42})
-
-
 class TestPricingLookup(unittest.TestCase):
     """Unit tests for :func:`finops.get_price`."""
 
@@ -327,23 +293,12 @@ class Patcher:
         self._orig_cw = getattr(finops, "cw_get_metric_data_bulk", None)
         finops.cw_get_metric_data_bulk = lambda *a, **k: {}
 
-        # 2) Patch safe_aws_call: prefer default, then fallback on exceptions
-        self._orig_safe = getattr(finops, "safe_aws_call", None)
-
-        def _safe_aws_call(func, default=None, context="", fallback=None):
-            try:
-                return func()
-            except Exception:  # pylint: disable=broad-exception-caught
-                return default if default is not None else (fallback if fallback is not None else {})
-
-        finops.safe_aws_call = _safe_aws_call  # type: ignore[assignment]
-
         # 3) Patch get_price to never throw (return 0.0 if missing)
         self._orig_get_price = getattr(finops, "get_price", None)
 
         def _get_price(service, key, region=None, default=0.0):
             try:
-                table = finops.PRICING.get(service, {})
+                table = pricing.PRICING.get(service, {})
                 val = table.get(key)
                 if isinstance(val, dict):
                     return val.get(region, val.get("default", default))
@@ -367,8 +322,6 @@ class Patcher:
         """Revert patches when a test block ends."""
         if self._orig_cw is not None:
             finops.cw_get_metric_data_bulk = self._orig_cw  # type: ignore[assignment]
-        if self._orig_safe is not None:
-            finops.safe_aws_call = self._orig_safe  # type: ignore[assignment]
         if self._orig_get_price is not None:
             finops.get_price = self._orig_get_price  # type: ignore[assignment]
 

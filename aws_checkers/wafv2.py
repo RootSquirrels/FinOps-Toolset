@@ -1,29 +1,10 @@
 """Checkers: AWS WAFv2.
 
-Checks included:
-
+Checks:
   - check_wafv2_unassociated_web_acls
-      Web ACLs not associated with any resource. Estimates monthly ACL+rules cost.
-
   - check_wafv2_logging_disabled
-      Web ACLs without logging configuration (hygiene).
-
   - check_wafv2_rules_no_matches
-      Rules with no matches over a lookback window (Allowed+Blocked+Counted == 0).
-      Estimates monthly rule cost as potential saving.
-
   - check_wafv2_empty_acl_associated
-      Web ACLs associated to resources but with zero rules (likely ineffective).
-      Estimates monthly ACL base cost as potential saving.
-
-Design:
-  - Dependencies via finops_toolset.checkers.config.setup(...).
-  - CloudWatch via finops_toolset.cloudwatch.CloudWatchBatcher (for rule metrics).
-  - Tolerant signatures; no returns; graceful skips.
-  - REGIONAL scope by default. Optional CloudFront scope if you pass 'wafv2_cf'
-    (a WAFv2 client in us-east-1) or if region == 'us-east-1'.
-  - Pricing keys (safe defaults if absent):
-        "WAFV2": { "WEB_ACL_MONTH": 5.00, "RULE_MONTH": 1.00 }
 """
 
 from __future__ import annotations
@@ -37,6 +18,7 @@ from botocore.exceptions import ClientError
 from aws_checkers import config
 from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher
+
 
 # -------------------------------- helpers -------------------------------- #
 
@@ -67,7 +49,6 @@ def _extract_writer_wafv2(
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
 ) -> Tuple[Any, Any]:
-    """Accept writer/wafv2 (positional or keyword)."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
     wafv2 = kwargs.get("wafv2", args[1] if len(args) >= 2 else None)
     if writer is None or wafv2 is None:
@@ -82,7 +63,6 @@ def _extract_writer_wafv2_cw(
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
 ) -> Tuple[Any, Any, Any]:
-    """Accept writer/wafv2/cloudwatch (positional or keyword)."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
     wafv2 = kwargs.get("wafv2", args[1] if len(args) >= 2 else None)
     cloudwatch = kwargs.get("cloudwatch", args[2] if len(args) >= 3 else None)
@@ -95,13 +75,22 @@ def _extract_writer_wafv2_cw(
 
 
 def _list_web_acls(waf, scope: str, log: logging.Logger) -> List[Dict[str, Any]]:
+    """Manual pagination for list_web_acls (no paginator in some boto3 versions)."""
     out: List[Dict[str, Any]] = []
-    try:
-        p = waf.get_paginator("list_web_acls")
-        for page in p.paginate(Scope=scope):
-            out.extend(page.get("WebACLs", []) or [])
-    except ClientError as exc:
-        log.error("[wafv2] list_web_acls(%s) failed: %s", scope, exc)
+    marker: Optional[str] = None
+    while True:
+        try:
+            params = {"Scope": scope, "Limit": 100}
+            if marker:
+                params["NextMarker"] = marker
+            resp = waf.list_web_acls(**params)
+            out.extend(resp.get("WebACLs", []) or [])
+            marker = resp.get("NextMarker")
+            if not marker:
+                break
+        except ClientError as exc:
+            log.error("[wafv2] list_web_acls(%s) failed: %s", scope, exc)
+            break
     return out
 
 
@@ -113,13 +102,26 @@ def _get_web_acl(waf, scope: str, name: str, wid: str, log: logging.Logger) -> D
         return {}
 
 
-def _list_associated_resources(waf, arn: str, scope: str, log: logging.Logger) -> List[str]:
-    try:
-        r = waf.list_resources_for_web_acl(WebACLArn=arn, ResourceType=None, Scope=scope)
-        return r.get("ResourceArns", []) or []
-    except ClientError as exc:
-        log.debug("[wafv2] list_resources_for_web_acl %s (%s) failed: %s", arn, scope, exc)
-        return []
+def _list_associated_resources(
+    waf, arn: str, scope: str, log: logging.Logger
+) -> List[str]:
+    """Manual pagination. Note: API does not take 'Scope'."""
+    out: List[str] = []
+    marker: Optional[str] = None
+    while True:
+        try:
+            params = {"WebACLArn": arn, "Limit": 100}
+            if marker:
+                params["NextMarker"] = marker
+            r = waf.list_resources_for_web_acl(**params)
+            out.extend(r.get("ResourceArns", []) or [])
+            marker = r.get("NextMarker")
+            if not marker:
+                break
+        except ClientError as exc:
+            log.debug("[wafv2] list_resources_for_web_acl %s failed: %s", arn, exc)
+            break
+    return out
 
 
 def _acl_monthly_cost(rule_count: int) -> float:
@@ -160,12 +162,10 @@ def _scopes_and_clients(
     log: logging.Logger,
     include_cloudfront: bool,
 ) -> List[Tuple[str, Any]]:
-    """Return list of (scope, client) to scan."""
     scopes: List[Tuple[str, Any]] = [("REGIONAL", wafv2)]
     if include_cloudfront:
         cf_client = kwargs.get("wafv2_cf")
         if cf_client is None and region == "us-east-1":
-            # caller can reuse same client when already us-east-1
             cf_client = wafv2
         if cf_client is not None:
             scopes.append(("CLOUDFRONT", cf_client))
@@ -183,7 +183,6 @@ def check_wafv2_unassociated_web_acls(  # pylint: disable=unused-argument
     include_cloudfront: bool = False,
     **kwargs,
 ) -> None:
-    """Flag Web ACLs that are not associated with any resource."""
     log = _logger(kwargs.get("logger") or logger)
 
     try:
@@ -251,7 +250,6 @@ def check_wafv2_logging_disabled(  # pylint: disable=unused-argument
     include_cloudfront: bool = False,
     **kwargs,
 ) -> None:
-    """Flag Web ACLs without logging configuration."""
     log = _logger(kwargs.get("logger") or logger)
 
     try:
@@ -274,7 +272,6 @@ def check_wafv2_logging_disabled(  # pylint: disable=unused-argument
                 cfg = client.get_logging_configuration(ResourceArn=arn)
                 has_logging = bool(cfg.get("LoggingConfiguration"))
             except ClientError as exc:
-                # If not found, it's disabled; WAF returns NonexistentItem on missing logging cfg
                 log.debug("[wafv2] get_logging_configuration %s: %s", arn, exc)
                 has_logging = False
 
@@ -313,14 +310,6 @@ def check_wafv2_rules_no_matches(  # pylint: disable=unused-argument
     include_cloudfront: bool = False,
     **kwargs,
 ) -> None:
-    """
-    Flag rules where Allowed+Blocked+Counted == 0 over the lookback window.
-
-    Notes:
-      - Requires WAF visibility metrics enabled (VisibilityConfig.MetricName).
-      - Uses CloudWatch namespace AWS/WAFV2 with dims:
-          ("Region", <region|"Global">), ("WebACL", <acl_metric>), ("Rule", <rule_metric>)
-    """
     log = _logger(kwargs.get("logger") or logger)
 
     try:
@@ -336,16 +325,15 @@ def check_wafv2_rules_no_matches(  # pylint: disable=unused-argument
     now_utc = datetime.now(timezone.utc).replace(microsecond=0)
     start = now_utc - timedelta(days=int(lookback_days))
     period = 300
-    rule_cost = _rule_monthly_cost()
+    rule_cost = float(config.safe_price("WAFV2", "RULE_MONTH", 1.0))
 
     for scope, client in _scopes_and_clients(wafv2, kwargs, region, log, include_cloudfront):
         acls = _list_web_acls(client, scope, log)
         if not acls:
             continue
 
-        region_dim = _region_value_for_scope(region, scope)
+        region_dim = "Global" if scope.upper() == "CLOUDFRONT" else region
 
-        # Prepare CW batch queries
         id_map: Dict[Tuple[str, str], Dict[str, str]] = {}
         metrics_ok = True
         results: Dict[str, Any] = {}
@@ -366,7 +354,8 @@ def check_wafv2_rules_no_matches(  # pylint: disable=unused-argument
                     rule_metric = vis.get("MetricName")
                     if not rule_metric:
                         continue
-                    dims = [("Region", region_dim), ("WebACL", acl_metric), ("Rule", rule_metric)]
+                    dims = [("Region", region_dim), ("WebACL", acl_metric),
+                            ("Rule", rule_metric)]
 
                     id_a = f"a_{acl_metric}_{rule_metric}"
                     id_b = f"b_{acl_metric}_{rule_metric}"
@@ -401,10 +390,10 @@ def check_wafv2_rules_no_matches(  # pylint: disable=unused-argument
 
             results = cw.execute(start=start, end=now_utc)
         except ClientError as exc:
-            log.warning("[wafv2] CloudWatch metrics unavailable: %s", exc)
+            logging.warning("[wafv2] CloudWatch metrics unavailable: %s", exc)
             metrics_ok = False
         except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[wafv2] CloudWatch batch error: %s", exc)
+            logging.warning("[wafv2] CloudWatch batch error: %s", exc)
             metrics_ok = False
 
         if not metrics_ok:
@@ -418,7 +407,6 @@ def check_wafv2_rules_no_matches(  # pylint: disable=unused-argument
             if total > 0.0:
                 continue
 
-            # We need WebACL/rule human names; we can emit metric names and scope
             try:
                 # type: ignore[call-arg]
                 config.WRITE_ROW(
@@ -445,11 +433,19 @@ def check_wafv2_rules_no_matches(  # pylint: disable=unused-argument
                     ),
                 )
             except Exception as exc:  # pylint: disable=broad-except
-                log.warning("[wafv2] write_row rule no-matches %s/%s: %s",
-                           acl_metric, rule_metric, exc)
+                logging.warning(
+                    "[wafv2] write_row rule no-matches %s/%s: %s",
+                    acl_metric,
+                    rule_metric,
+                    exc,
+                )
 
-            log.info("[wafv2] Wrote rule with no matches: %s/%s (%s)",
-                     acl_metric, rule_metric, scope)
+            logging.info(
+                "[wafv2] Wrote rule with no matches: %s/%s (%s)",
+                acl_metric,
+                rule_metric,
+                scope,
+            )
 
 
 # --------- 4) ACL with zero rules but associated (ineffective, cost) ----- #
@@ -461,16 +457,17 @@ def check_wafv2_empty_acl_associated(  # pylint: disable=unused-argument
     include_cloudfront: bool = False,
     **kwargs,
 ) -> None:
-    """Flag Web ACLs attached to resources but with zero rules (likely ineffective)."""
     log = _logger(kwargs.get("logger") or logger)
 
     try:
         writer, wafv2 = _extract_writer_wafv2(args, kwargs)
     except TypeError as exc:
-        log.warning("[check_wafv2_empty_acl_associated] Skipping: %s", exc)
+        logging.warning("[check_wafv2_empty_acl_associated] Skipping: %s", exc)
         return
     if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        log.warning("[check_wafv2_empty_acl_associated] Skipping: checker config not provided.")
+        logging.warning(
+            "[check_wafv2_empty_acl_associated] Skipping: checker config not provided."
+        )
         return
 
     region = getattr(getattr(wafv2, "meta", None), "region_name", "") or ""
@@ -514,6 +511,6 @@ def check_wafv2_empty_acl_associated(  # pylint: disable=unused-argument
                     ),
                 )
             except Exception as exc:  # pylint: disable=broad-except
-                log.warning("[wafv2] write_row empty-associated %s: %s", arn, exc)
+                logging.warning("[wafv2] write_row empty-associated %s: %s", arn, exc)
 
-            log.info("[wafv2] Wrote empty but associated WebACL: %s (%s)", name, scope)
+            logging.info("[wafv2] Wrote empty but associated WebACL: %s (%s)", name, scope)

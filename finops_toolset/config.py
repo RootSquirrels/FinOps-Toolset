@@ -4,7 +4,7 @@ Contains constants and basic helpers for toolset
 """
 from __future__ import annotations
 import os
-from typing import Iterable, Set, Optional
+from typing import Iterable, Set
 from botocore.config import Config #type: ignore
 
 # ---- Env helpers
@@ -57,13 +57,6 @@ REQUIRED_TAG_KEYS = _env_list("FINOPS_REQUIRED_TAG_KEYS",
 ["ApplicationID", "Application", "Environment"])
 CSV_DELIMITER = _env_str("FINOPS_CSV_DELIMITER", ";")
 
-# S3 multipart
-_S3_MPU_BUCKET_WORKERS: int      = _env_int("FINOPS_S3_MPU_BUCKET_WORKERS", 16)
-_S3_MPU_PART_WORKERS: int        = _env_int("FINOPS_S3_MPU_PART_WORKERS", 8)
-_S3_MPU_PAGE_SIZE: int           = _env_int("FINOPS_S3_MPU_PAGE_SIZE", 1000)
-_S3_MPU_GLOBAL_FINDINGS_CAP: int = _env_int("FINOPS_S3_MPU_GLOBAL_FINDINGS_CAP", 5000)
-_S3_MPU_PARTS_MODE: str          = _env_str("FINOPS_S3_MPU_PARTS_MODE", "first_page")  # "first_page" | "full"
-
 # --- DynamoDB thresholds ---
 DDB_LOOKBACK_DAYS = _env_int("FINOPS_DDB_LOOKBACK_DAYS", 30)
 DDB_CW_PERIOD = _env_int("FINOPS_DDB_CW_PERIOD", 86400)  # 1 day
@@ -103,16 +96,6 @@ STALE_DAYS_THRESHOLD = _env_int("FINOPS_S3_STALE_DAYS_THRESHOLD", 180)
 S3_MULTIPART_STALE_DAYS = _env_int("FINOPS_S3_MULTIPART_STALE_DAYS", 7)
 S3_LOOKBACK_DAYS = _env_int("FINOPS_S3_LOOKBACK_DAYS", 90)
 MAX_KEYS_TO_SCAN = _env_int("FINOPS_S3_MAX_KEYS_TO_SCAN", 10000)
-
-# --- DynamoDB worker knobs (advanced) ---
-_DDB_TABLE_WORKERS: int = _env_int("FINOPS_DDB_TABLE_WORKERS", 6)
-_DDB_META_WORKERS: int  = _env_int("FINOPS_DDB_META_WORKERS", 4)
-_DDB_GSI_METRICS_LIMIT: Optional[int] = (
-    None if os.getenv("FINOPS_DDB_GSI_METRICS_LIMIT") in (None, "", "none")
-    else _env_int("FINOPS_DDB_GSI_METRICS_LIMIT", 0)
-)
-
-_DDB_CW_PERIOD: int = DDB_CW_PERIOD
 
 S3_STORAGE_TYPES = [
     "StandardStorage",

@@ -60,6 +60,10 @@ PRICING: PriceMap = {
         "PROV_TPUT_MIBPS_MONTH": 6.0,
         "IA_RETRIEVAL_GB": 0.01,
     },
+    
+    "EBS_FSR": {
+        "DSU_HR": 0.75
+    },
 
     "LAMBDA": {
         # Requests: $0.20 per 1M; compute: $0.0000166667 per GB-second
@@ -113,6 +117,7 @@ PRICING: PriceMap = {
         # Control plane cost depends on support window. Default here reflects "standard support".
         "CONTROL_PLANE_HOUR": 0.10,
         "CONTROL_PLANE_HOUR_EXTENDED": 0.60,  # when the cluster version is in extended support
+        "CLUSTER_HR": 0.10,
     },
 
     "KINESIS": {
@@ -176,6 +181,20 @@ PRICING: PriceMap = {
         "REQUESTS_1M": 0.65,
         "DATA_OUT_GB": 0.085,
 
+    },
+    "R53": {
+        "PUBLIC_ZONE_MONTH": 0.50,
+        "PRIVATE_ZONE_MONTH": 0.10,
+        "HEALTH_CHECK_MONTH": 0.50
+    },
+    "RDS_EXT": {
+        "MySQL57_INSTANCE_HR": 0.0,
+        "PostgreSQL11_INSTANCE_HR": 0.0,
+        "AuroraMySQL57_INSTANCE_HR": 0.0,
+        "AuroraPostgreSQL11_INSTANCE_HR": 0.0
+    },
+    "EKS_EXT": {
+        "CLUSTER_HR": 0.0
     },
 }
 
