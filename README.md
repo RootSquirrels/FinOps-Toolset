@@ -159,50 +159,6 @@ python auto_remediations_from_csv.py cleanup_estimates.csv --execute --do-ebs --
 
 > All checkers write rows through a **single CSV writer** to keep the schema consistent.
 
----
-
-
-## Configuration
-
-### 1) Initialize the checker config
-
-Call once before any `run_check()`:
-
-```python
-from finops_toolset.checkers import config
-from finops_toolset import pricing
-
-def write_row(**row):
-    # your CSV writer wrapper; must accept the named kwargs used by checkers
-    ...
-
-config.setup(
-    account_id=ACCOUNT_ID,
-    write_row=write_row,       # callable
-    get_price=pricing.get,     # callable or your wrapper
-    logger=LOGGER,             # optional
-)
-```
-
-> If `config.setup()` is not called, checkers **skip** gracefully and log the reason.
-
-### 2) Pricing map
-
-`config.safe_price(service, key, default)` reads from `pricing.py` first, else falls back.
-
-```python
-PRICES = {
-  "EBS": {"GP3_GB_MONTH": 0.08, "PIOPS": 0.005, "THROUGHPUT_MBPS": 0.040},
-  "ELBv2": {"ALB_HR": 0.0225, "NLB_HR": 0.0225, "GWLB_HR": 0.0225},
-  "WAFV2": {"WEB_ACL_MONTH": 5.0, "RULE_MONTH": 1.0},
-  "R53": {"PUBLIC_ZONE_MONTH": 0.50, "PRIVATE_ZONE_MONTH": 0.10,
-          "HEALTH_CHECK_MONTH": 0.50},
-  "EBS_FSR": {"DSU_HR": 0.75},
-  "TGW": {"ATTACHMENT_HR": 0.05, "DATA_GB": 0.02},
-  "EKS": {"CLUSTER_HR": 0.10},
-  # ...extend for your environment
-}
-```
 
 ---
 

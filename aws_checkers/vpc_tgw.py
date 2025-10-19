@@ -283,7 +283,9 @@ def check_vpc_unused(  # pylint: disable=unused-argument
             ec2, "describe_vpc_endpoints", Filters=[{"Name": "vpc-id", "Values": [vid]}]
         )
         nat = _count_desc(
-            ec2, "describe_nat_gateways", Filter={"Name": "vpc-id", "Values": [vid]}
+            ec2,
+            "describe_nat_gateways",
+            Filter=[{"Name": "vpc-id", "Values": [vid]}],
         )
         # IGW presence doesn't imply cost; fetch as signal only
         igw = _count_desc(
