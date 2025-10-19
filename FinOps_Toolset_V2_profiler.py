@@ -193,7 +193,7 @@ from finops_toolset.config import (
 
 from finops_toolset.pricing import PRICING as PRICING, get_price as get_price
 import core.cloudwatch as cw
-import checkers.EIP as EIP
+import checkers.eip as eip
 
 #endregion
 
@@ -6022,7 +6022,8 @@ def main():
                 #cert_summary = summarize_cert_usage(graph)
 
                 run_check(profiler, check_name="EIP", region=region,
-                          fn=EIP, writer=writer, ec2=clients['ec2'])
+                          fn=eip, ec2=clients['ec2'], account_id=ACCOUNT_ID, write_row=writer, 
+                          get_price_fn=get_price, logger=LOGGER)
 
                 run_check(profiler, check_name="check_idle_load_balancers", region=region,
                           fn=check_idle_load_balancers, writer=writer,

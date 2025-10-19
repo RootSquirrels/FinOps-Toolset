@@ -1,56 +1,59 @@
 """
 EIP module checker
 """
-from typing import List
-import csv
+
+# finops_toolset/checkers/eip.py
+from __future__ import annotations
+from typing import Callable, Optional
 import logging
 from botocore.exceptions import ClientError
 
+# Type for the CSV row writer you already have (write_resource_to_csv)
+WriteRow = Callable[..., None]
+GetPrice = Callable[[str, str], float]
 
-@retry_with_backoff()
-def check_unused_elastic_ips(writer: csv.writer, ec2) -> None:
+def check_unused_elastic_ips(
+    ec2,
+    account_id: str,
+    write_row: WriteRow,
+    get_price_fn: GetPrice,
+    logger: Optional[logging.Logger] = None,
+) -> int:
     """
-    Write all unassociated (unused) Elastic IPs in the account to a CSV.
+    Scan EC2 Elastic IP addresses and write unassociated ones to CSV.
 
     An Elastic IP is considered unused if it is not associated with either an
-    EC2 instance (``InstanceId``) or a network interface (``NetworkInterfaceId``)
-    in the response from ``describe_addresses``.
+    EC2 instance (``InstanceId``) or a network interface (``NetworkInterfaceId``).
 
     Args:
-        writer: A csv.writer-like object used by ``write_resource_to_csv``.
-        ec2: A boto3 EC2 *client* with a ``describe_addresses()`` method.
+        ec2: boto3 EC2 client with ``describe_addresses()``.
+        account_id: AWS account ID used for the CSV's OwnerId field.
+        write_row: Callable that writes one normalized CSV row (your existing
+            ``write_resource_to_csv``).
+        get_price_fn: Pricing helper, e.g. ``get_price("EIP", "UNASSIGNED_MONTH")``.
+        logger: Optional logger; uses module logger if omitted.
 
-    Side Effects:
-        Appends one CSV row per unused Elastic IP via ``write_resource_to_csv``.
-
-    Raises:
-        ClientError: Propagated if the EC2 ``describe_addresses`` call fails.
+    Returns:
+        Number of unused Elastic IPs written to CSV.
     """
+    log = logger or logging.getLogger(__name__)
+
     try:
         resp = ec2.describe_addresses()
         for addr in resp.get("Addresses", []):
             resource_id_or_ip = addr.get("AllocationId", addr.get("PublicIp"))
-            flags: List[str] = []
 
-            # Unassociated if neither an instance nor a network interface is present
             if "InstanceId" not in addr and "NetworkInterfaceId" not in addr:
-                flags.append("UnusedElasticIP")
-                write_resource_to_csv(
-                    writer=writer,
+                write_row(
                     resource_id=resource_id_or_ip,
                     name="",
-                    owner_id=ACCOUNT_ID,
+                    owner_id=account_id,
                     resource_type="ElasticIP",
-                    estimated_cost=get_price("EIP", "UNASSIGNED_MONTH"),
-                    flags=flags,
+                    estimated_cost=get_price_fn("EIP", "UNASSIGNED_MONTH"),
+                    flags=["UnusedElasticIP"],
                     confidence=100,
                 )
 
-            logging.info(
-                "[check_unused_elastic_ips] Processed IP: %s",
-                resource_id_or_ip,
-            )
+            log.info("[check_unused_elastic_ips] Processed IP: %s", resource_id_or_ip)
     except ClientError as exc:
-        logging.error("Error checking Elastic IPs: %s", exc)
-        # Optionally re-raise if you want callers to handle it:
-        # raise
+        log.error("Error checking Elastic IPs: %s", exc)
