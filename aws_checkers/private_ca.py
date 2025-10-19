@@ -9,40 +9,27 @@ Enumerates Private Certificate Authorities and writes findings to CSV including:
 """
 
 from __future__ import annotations
-
 import logging
+from typing import Optional, Callable, Any, List
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
 
 from botocore.exceptions import ClientError
-
 from core.retry import retry_with_backoff
 from aws_checkers import config
-
-
-def _require_config(log) -> None:
-    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        log.warning(
-            "[check_private_certificate_authorities] Skipping: checker config not provided "
-            "(call config.setup(...) or pass account_id/write_row/get_price)."
-        )
-        return
 
 
 def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
 
 
-def _safe_price(service: str, key: str) -> float:
+def _safe_price(get_price: Callable[[str, str], float], service: str, key: str) -> float:
     try:
-        # type: ignore[arg-type]
-        return float(config.GET_PRICE(service, key))  # pylint: disable=not-callable
+        return float(get_price(service, key))
     except Exception:  # pylint: disable=broad-except
         return 0.0
 
 
 def _to_utc_iso(dt_obj: Optional[datetime]) -> Optional[str]:
-    """Return ISO-8601 (UTC, no microseconds) or None."""
     if not isinstance(dt_obj, datetime):
         return None
     if dt_obj.tzinfo is None:
@@ -52,83 +39,38 @@ def _to_utc_iso(dt_obj: Optional[datetime]) -> Optional[str]:
     return dt_obj.replace(microsecond=0).isoformat()
 
 
-def _signals_str(pairs: Dict[str, object]) -> str:
-    """Build compact Signals cell from k=v pairs; skip Nones/empties."""
-    items: List[str] = []
-    for k, v in pairs.items():
-        if v is None or v == "":
-            continue
-        items.append(f"{k}={v}")
-    return "|".join(items)
-
-
-def _ca_display_and_signals(acmpca, arn: str, region: str,
-                            log: logging.Logger) -> (str, str): # type: ignore
-    """
-    Describe the CA to enrich name and build a Signals string.
-
-    Signals include: Status, Type, Region, CommonName, KeyAlgorithm, SigningAlgorithm,
-    CRL (bool), CreatedAt, NotBefore, NotAfter when available.
-    """
-    name = arn
-    signals = ""
-    try:
-        resp = acmpca.describe_certificate_authority(CertificateAuthorityArn=arn)
-        ca = resp.get("CertificateAuthority", {}) or {}
-
-        cfg = ca.get("CertificateAuthorityConfiguration", {}) or {}
-        subj = cfg.get("Subject", {}) or {}
-        common_name = subj.get("CommonName") or ""
-
-        name = common_name or arn
-
-        signals = _signals_str(
-            {
-                "Status": ca.get("Status"),
-                "Type": ca.get("Type"),
-                "Region": region,
-                "CommonName": common_name,
-                "KeyAlgorithm": cfg.get("KeyAlgorithm"),
-                "SigningAlgorithm": cfg.get("SigningAlgorithm"),
-                "CRL": bool(((ca.get("RevocationConfiguration") or {}).get("CrlConfiguration") or {}).get("Enabled")),
-                "CreatedAt": _to_utc_iso(ca.get("CreatedAt")),
-                "NotBefore": _to_utc_iso(ca.get("NotBefore")),
-                "NotAfter": _to_utc_iso(ca.get("NotAfter")),
-            }
-        )
-    except ClientError as exc:
-        log.debug("DescribeCertificateAuthority failed for %s: %s", arn, exc)
-        signals = _signals_str({"Status": "Unknown", "Region": region})
-
-    return name, signals
-
-
 @retry_with_backoff(exceptions=(ClientError,))
 def check_private_certificate_authorities(  # pylint: disable=unused-argument
     writer,
     acmpca,
     logger: Optional[logging.Logger] = None,
-    **_kwargs,
+    **kwargs: Any,
 ) -> None:
     """
     Enumerate Private CAs and write CSV rows with Flags, Estimated_Cost_USD,
-    Potential_Saving_USD and Signals.
-
-    Flag mapping (simple, status-driven):
-      ACTIVE               -> 'PrivateCAActive'         (monthly cost applies)
-      DISABLED             -> 'PrivateCADisabled'
-      EXPIRED              -> 'PrivateCAExpired'
-      FAILED               -> 'PrivateCAFailed'
-      PENDING_CERTIFICATE  -> 'PrivateCAPendingCertificate'
-
-    Potential_Saving_USD heuristic:
-      - For statuses other than ACTIVE, potential_saving = estimated_cost
-        (i.e., eliminate the current bill for that CA).
-      - For ACTIVE, set potential_saving = 0.0 by default (cannot infer usage here).
+    Potential_Saving_USD and Signals. If checker config or the acmpca client
+    is missing, skip gracefully (log a warning) instead of raising.
     """
-    log = _logger(logger)
-    _require_config(log)
-    
+    # ---- Resolve deps from per-call overrides OR global config ----
+    account_id: Optional[str] = kwargs.get("account_id") or config.ACCOUNT_ID
+    write_row: Optional[Callable[..., None]] = kwargs.get("write_row") or config.WRITE_ROW
+    get_price: Optional[Callable[[str, str], float]] = kwargs.get("get_price") or config.GET_PRICE
+    log = _logger(kwargs.get("logger") or logger)
+
+    # ---- Graceful skips for tests or misconfiguration ----
+    if writer is None:
+        log.warning("[check_private_certificate_authorities] Skipping: 'writer' is None.")
+        return
+    if acmpca is None:
+        log.warning("[check_private_certificate_authorities] Skipping: 'acmpca' client not provided.")
+        return
+    if not (account_id and write_row and get_price):
+        log.warning(
+            "[check_private_certificate_authorities] Skipping: checker config not provided "
+            "(call config.setup(...) or pass account_id/write_row/get_price)."
+        )
+        return
+
     region = getattr(getattr(acmpca, "meta", None), "region_name", "") or ""
 
     try:
@@ -138,64 +80,68 @@ def check_private_certificate_authorities(  # pylint: disable=unused-argument
                 arn = ca.get("Arn")
                 status = ca.get("Status")
                 ca_type = ca.get("Type")
-                created_at = _to_utc_iso(ca.get("CreatedAt"))
-                not_before = _to_utc_iso(ca.get("NotBefore"))
-                not_after = _to_utc_iso(ca.get("NotAfter"))
-
                 if not arn:
                     continue
 
-                # Choose flags and estimated monthly cost based on status
+                # Friendly name + extra signals (best effort)
+                try:
+                    d = acmpca.describe_certificate_authority(CertificateAuthorityArn=arn)
+                    cfg = (d.get("CertificateAuthority", {})
+                             .get("CertificateAuthorityConfiguration", {}) or {})
+                    subj = cfg.get("Subject", {}) or {}
+                    name = subj.get("CommonName") or arn
+                    created = _to_utc_iso(d.get("CertificateAuthority", {}).get("CreatedAt"))
+                    not_before = _to_utc_iso(d.get("CertificateAuthority", {}).get("NotBefore"))
+                    not_after = _to_utc_iso(d.get("CertificateAuthority", {}).get("NotAfter"))
+                except ClientError as exc:
+                    log.debug("DescribeCertificateAuthority failed for %s: %s", arn, exc)
+                    name, created, not_before, not_after = arn, None, None, None
+
+                # Flags + estimated cost
                 flags: List[str] = []
                 est_cost = 0.0
-
                 if status == "ACTIVE":
                     flags.append("PrivateCAActive")
-                    est_cost = _safe_price("ACMPCA", "ACTIVE_MONTH")
+                    est_cost = _safe_price(get_price, "ACMPCA", "ACTIVE_MONTH")
                 elif status == "DISABLED":
                     flags.append("PrivateCADisabled")
-                    est_cost = _safe_price("ACMPCA", "DISABLED_MONTH")
+                    est_cost = _safe_price(get_price, "ACMPCA", "DISABLED_MONTH")
                 elif status == "EXPIRED":
                     flags.append("PrivateCAExpired")
-                    est_cost = _safe_price("ACMPCA", "EXPIRED_MONTH")  # 0.0 if key absent
+                    est_cost = _safe_price(get_price, "ACMPCA", "EXPIRED_MONTH")
                 elif status == "FAILED":
                     flags.append("PrivateCAFailed")
-                    est_cost = _safe_price("ACMPCA", "FAILED_MONTH")   # 0.0 if key absent
+                    est_cost = _safe_price(get_price, "ACMPCA", "FAILED_MONTH")
                 elif status == "PENDING_CERTIFICATE":
                     flags.append("PrivateCAPendingCertificate")
-                    est_cost = _safe_price("ACMPCA", "PENDING_CERT_MONTH")  # 0.0 if key absent
+                    est_cost = _safe_price(get_price, "ACMPCA", "PENDING_CERT_MONTH")
                 else:
                     log.info(
                         "[check_private_certificate_authorities] Skipping CA: %s (status=%s)",
-                        arn,
-                        status,
+                        arn, status,
                     )
                     continue
 
-                name, signals_desc = _ca_display_and_signals(acmpca, arn, region, log)
-
-                # Enrich Signals with fields already available from List*
-                extra_signals = _signals_str(
-                    {
-                        "Status": status,
-                        "Type": ca_type,
-                        "Region": region,
-                        "CreatedAt": created_at,
-                        "NotBefore": not_before,
-                        "NotAfter": not_after,
-                    }
+                signals = "|".join(
+                    s for s in [
+                        f"Status={status}",
+                        f"Type={ca_type}",
+                        f"Region={region}",
+                        f"Name={name}",
+                        f"CreatedAt={created}" if created else "",
+                        f"NotBefore={not_before}" if not_before else "",
+                        f"NotAfter={not_after}" if not_after else "",
+                    ] if s
                 )
-                signals = "|".join([s for s in [signals_desc, extra_signals] if s])
 
-                # Potential savings heuristic (ACTIVE assumed in-use)
                 potential_saving = 0.0 if status == "ACTIVE" else est_cost
 
-                # type: ignore[call-arg]
-                config.WRITE_ROW(
+                # type: ignore[call-arg]  (write_row provided at runtime)
+                write_row(
                     writer=writer,
                     resource_id=arn,
                     name=name,
-                    owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
+                    owner_id=account_id,
                     resource_type="ACMPrivateCA",
                     estimated_cost=est_cost,
                     potential_saving=potential_saving,
@@ -206,11 +152,7 @@ def check_private_certificate_authorities(  # pylint: disable=unused-argument
 
                 log.info(
                     "[check_private_certificate_authorities] Wrote CA: %s (status=%s flags=%s est=%.2f save=%.2f)",
-                    arn,
-                    status,
-                    flags,
-                    est_cost,
-                    potential_saving,
+                    arn, status, flags, est_cost, potential_saving,
                 )
 
     except ClientError as exc:
