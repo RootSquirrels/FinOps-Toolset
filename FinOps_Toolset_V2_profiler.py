@@ -193,6 +193,7 @@ from finops_toolset.config import (
 
 from finops_toolset.pricing import PRICING as PRICING, get_price as get_price
 import core.cloudwatch as cw
+import checkers.EIP as EIP
 
 #endregion
 
@@ -1512,35 +1513,6 @@ class AMIFlagger(ResourceFlagger):
     def check_shared(self):
         if self.shared == "Yes":
             self.flags.append("SharedExternally")
-
-#endregion
-
-
-#region EIP SECTION
-
-@retry_with_backoff()
-def check_unused_elastic_ips(writer: csv.writer, ec2):
-    try:
-        resp = ec2.describe_addresses()
-        for addr in resp.get("Addresses", []):
-            resource_id_ip = addr.get("AllocationId", addr.get("PublicIp"))
-            flags: List[str] = []
-            if "InstanceId" not in addr and "NetworkInterfaceId" not in addr:
-                flags.append("UnusedElasticIP")
-                write_resource_to_csv(
-                    writer=writer,
-                    resource_id=resource_id_ip,
-                    name="",
-                    owner_id=ACCOUNT_ID,
-                    resource_type="ElasticIP",
-                    estimated_cost=get_price("EIP", "UNASSIGNED_MONTH"),
-                    flags=flags,
-                    confidence=100
-                )
-
-            logging.info(f"[check_unused_elastic_ips] Processed IP : {resource_id_ip}")
-    except ClientError as e:
-        logging.error(f"Error checking Elastic IPs: {e}")
 
 #endregion
 
@@ -6049,8 +6021,8 @@ def main():
                 #graph = build_certificate_graph(regions=regions, account_id=ACCOUNT_ID)
                 #cert_summary = summarize_cert_usage(graph)
 
-                run_check(profiler, check_name="check_unused_elastic_ips", region=region,
-                          fn=check_unused_elastic_ips, writer=writer, ec2=clients['ec2'])
+                run_check(profiler, check_name="EIP", region=region,
+                          fn=EIP, writer=writer, ec2=clients['ec2'])
 
                 run_check(profiler, check_name="check_idle_load_balancers", region=region,
                           fn=check_idle_load_balancers, writer=writer,
