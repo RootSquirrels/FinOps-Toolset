@@ -29,7 +29,7 @@ def _require_config() -> None:
 
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_unused_elastic_ips(writer: csv.writer, ec2, 
+def check_unused_elastic_ips(writer: csv.writer, ec2,
     logger: Optional[logging.Logger] = None, **_kwargs) -> None:  # pylint: disable=unused-argument
     """
     Scan EC2 Elastic IP addresses and write unassociated ones to CSV.

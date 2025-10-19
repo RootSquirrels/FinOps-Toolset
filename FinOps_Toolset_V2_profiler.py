@@ -186,7 +186,7 @@ from finops_toolset.config import (
     LOAD_BALANCER_LOOKBACK_DAYS,
 )
 
-from finops_toolset.pricing import PRICING as PRICING, get_price as get_price
+from finops_toolset.pricing import PRICING, get_price
 import core.cloudwatch as cw
 from aws_checkers.eip import check_unused_elastic_ips as eip
 from aws_checkers.network_interfaces import check_detached_network_interfaces as eni
