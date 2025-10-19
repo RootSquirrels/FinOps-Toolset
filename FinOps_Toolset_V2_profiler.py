@@ -5882,20 +5882,22 @@ def main():
                 #graph = build_certificate_graph(regions=regions, account_id=ACCOUNT_ID)
                 #cert_summary = summarize_cert_usage(graph)
 
-                eip_fn = partial(
-                    eip,
-                    account_id=ACCOUNT_ID,
-                    write_row=write_resource_to_csv,
-                    get_price_fn=get_price,
-                    logger=LOGGER,
-                )
+                def _eip_adapter(*, writer, ec2):
+                    return eip(
+                        writer=writer,
+                        ec2=ec2,
+                        account_id=ACCOUNT_ID,
+                        write_row=write_resource_to_csv,
+                        get_price_fn=get_price,
+                        logger=LOGGER,
+                    )
 
                 run_check(
                     profiler,
                     check_name="check_unused_elastic_ips",
                     region=region,
-                    fn=eip_fn,
-                    writer=writer,             
+                    fn=_eip_adapter,
+                    writer=writer,
                     ec2=clients["ec2"],
                 )
 
