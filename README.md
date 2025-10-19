@@ -7,29 +7,74 @@ This toolkit scans your AWS estate, writes a **normalized CSV** of findings, shi
 
 ## ⭐ Highlights
 
-- **Broad coverage**: EC2 / EBS / ECR / EKS / Lambda / S3 / DynamoDB / RDS / ALB / NLB / CloudFront / KMS / WAFv2 / SSM / VPC & NAT …
-- **Fast & scalable**: batched CloudWatch `GetMetricData` with internal ID sanitization; fewer calls, fewer throttles.
-- **No-regression refactors**: S3 & Lambda keep original CSV fields (e.g., S3 bucket creation date, Lambda helper usage).
-- **Clean CSV**: consistent schema with compact `Signals` and actionable `Flags` + optional `Confidence`.
-- **Auto-remediation (CSV-driven)**: delete orphan ENIs/EIPs/EBS, set CW Logs retention, and remove empty S3 buckets — **from CSV only**, with dry-run by default.
+- **Modular checkers** per service under `finops_toolset/checkers/*`.
+- **Consistent CSV schema** with compact `Flags` and `Signals`.
+- **Resilient calls**: `retry_with_backoff`, lazy `%s` logging, UTC datetimes.
+- **CloudWatch batching** via a shared `CloudWatchBatcher(add_q/execute)`.
+- **Config-driven pricing** with `config.safe_price()` (no hard-coded $).
+- **Auto-remediation** with a guarded, idempotent workflow.
 
 ---
 
-## Repo layout
+
+## Repository layout
 
 ```
-FinOps-Toolset/
-├─ FinOps_Toolset_V2_profiler.py      # Orchestrator & profiler (scanner entrypoint)
-├─ finops_dashboard.py                # Generates a single self-contained HTML report
-├─ auto_remediations_from_csv.py      # CSV-driven auto-remediation (dry-run by default)
-├─ test_all_checkers.py               # Unit harness for checkers + CSV invariants
-├─ finops_toolset/
-│  ├─ config.py                       # Regions, thresholds, feature toggles
-│  ├─ pricing.py                      # Centralized price book (region-aware helpers)
-│  └─ aws/
-│     └─ cloudwatch.py                # CloudWatchBatcher (add_q, internal ID sanitization, helpers)
-└─ requirements.txt
+finops_toolset/
+  checkers/
+    acm.py
+    ami.py
+    aws_s3.py
+    cloudfront.py
+    dynamodb.py
+    ebs.py
+    ecr.py
+    ec2.py
+    efs.py
+    eks.py
+    extended_support.py
+    fsr.py
+    kms.py
+    kinesis.py
+    lambda_fn.py
+    lb.py
+    nat_gateway.py
+    private_ca.py
+    rds.py
+    rds_snapshots.py
+    route53.py
+    ssm.py
+    vpc_tgw.py
+    wafv2.py
+  cloudwatch.py              # CloudWatchBatcher(add_q/execute)
+  core/retry.py              # retry_with_backoff
+  checkers/config.py         # setup(), WRITE_ROW, safe_price(), logger, account_id, etc.
+  pricing.py                 # price map (override-friendly)
+FinOps_Toolset_V2_profiler.py  # orchestrator using run_check()
+finops_dashboard.py             # HTML view
+auto_remediations_from_csv.py   # guarded, dry-run by default
+tests/
+  test_all_checkers.py
+README.md
+requirements.txt
 ```
+
+---
+
+
+## What’s new in this version
+
+- **Modules for all checkers** (no more “all-in-one script”). Each checker:
+  - Accepts tolerant signatures (positional/keyword), e.g. `writer`, `ec2`, `cloudwatch`.
+  - Uses `retry_with_backoff(exceptions=(ClientError,))`.
+  - Writes via the configured `WRITE_ROW` callable from `checkers.config`.
+  - Uses `config.safe_price("<SERVICE>", "<KEY>", default)` for cost modeling.
+- **WAFv2**: manual pagination for `list_web_acls` and `list_resources_for_web_acl`.
+- **KMS**: fewer `describe_key` calls (list → chunked describe), big speed-ups.
+- **SSM**: Windows “no tasks” + “no targets” merged; “stale” + “plaintext” kept.
+- **EFS**: CloudWatch batcher via `add_q` to minimize API calls.
+- **FSR**: EBS Fast Snapshot Restore check with DSU-hour costs and usage tracking.
+- Many services refactored for UTC datetimes, lazy logging, and precise signals.
 
 ---
 
@@ -113,6 +158,51 @@ python auto_remediations_from_csv.py cleanup_estimates.csv --execute --do-ebs --
 - **KMS**: rotation status, enabled/disabled/pending deletion, last seen via CloudTrail (bounded), ~$1/key/mo cost; `RotationOff` & `NoRecentUseXd`.
 
 > All checkers write rows through a **single CSV writer** to keep the schema consistent.
+
+---
+
+
+## Configuration
+
+### 1) Initialize the checker config
+
+Call once before any `run_check()`:
+
+```python
+from finops_toolset.checkers import config
+from finops_toolset import pricing
+
+def write_row(**row):
+    # your CSV writer wrapper; must accept the named kwargs used by checkers
+    ...
+
+config.setup(
+    account_id=ACCOUNT_ID,
+    write_row=write_row,       # callable
+    get_price=pricing.get,     # callable or your wrapper
+    logger=LOGGER,             # optional
+)
+```
+
+> If `config.setup()` is not called, checkers **skip** gracefully and log the reason.
+
+### 2) Pricing map
+
+`config.safe_price(service, key, default)` reads from `pricing.py` first, else falls back.
+
+```python
+PRICES = {
+  "EBS": {"GP3_GB_MONTH": 0.08, "PIOPS": 0.005, "THROUGHPUT_MBPS": 0.040},
+  "ELBv2": {"ALB_HR": 0.0225, "NLB_HR": 0.0225, "GWLB_HR": 0.0225},
+  "WAFV2": {"WEB_ACL_MONTH": 5.0, "RULE_MONTH": 1.0},
+  "R53": {"PUBLIC_ZONE_MONTH": 0.50, "PRIVATE_ZONE_MONTH": 0.10,
+          "HEALTH_CHECK_MONTH": 0.50},
+  "EBS_FSR": {"DSU_HR": 0.75},
+  "TGW": {"ATTACHMENT_HR": 0.05, "DATA_GB": 0.02},
+  "EKS": {"CLUSTER_HR": 0.10},
+  # ...extend for your environment
+}
+```
 
 ---
 
@@ -241,10 +331,80 @@ Scope to regions/accounts; consider tag guards like `DoNotDelete=true`.
 
 ---
 
+
+## Adding a new checker (template)
+
+Create `finops_toolset/checkers/your_service.py`:
+
+```python
+"""Checkers: Your Service."""
+
+from __future__ import annotations
+import logging
+from typing import Any, Dict, Optional, Tuple
+from botocore.exceptions import ClientError
+
+from finops_toolset.checkers import config
+from finops_toolset.core.retry import retry_with_backoff
+
+def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
+    return fallback or config.LOGGER or logging.getLogger(__name__)
+
+def _extract_writer_client(args: Tuple[Any, ...], kwargs: Dict[str, Any]):
+    writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
+    client = kwargs.get("client", args[1] if len(args) >= 2 else None)
+    if writer is None or client is None:
+        raise TypeError("Expected 'writer' and 'client'")
+    return writer, client
+
+@retry_with_backoff(exceptions=(ClientError,))
+def check_something(*args, logger=None, **kwargs) -> None:
+    log = _logger(kwargs.get("logger") or logger)
+    try:
+        writer, client = _extract_writer_client(args, kwargs)
+    except TypeError as exc:
+        log.warning("[check_something] Skipping: %s", exc)
+        return
+    if not (config.ACCOUNT_ID and config.WRITE_ROW):
+        log.warning("[check_something] Skipping: checker config not provided.")
+        return
+
+    # ...call AWS, compute flags/cost...
+    try:
+        # type: ignore[call-arg]
+        config.WRITE_ROW(
+            writer=writer,
+            resource_id="...",
+            name="...",
+            owner_id=config.ACCOUNT_ID,     # type: ignore[arg-type]
+            resource_type="YourType",
+            estimated_cost=0.0,
+            potential_saving=0.0,
+            flags=["YourFlag"],
+            confidence=100,
+            signals="Key=Value|Key2=Value2",
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning("[your_service] write_row failed: %s", exc)
+```
+
+Wire it in the orchestrator with the existing `run_check(...)` helper.
+
+---
+
+## Service-specific notes
+
+- **WAFv2**: `list_web_acls` and `list_resources_for_web_acl` use `NextMarker` pagination.
+- **CloudFront**: metrics are in `us-east-1` and use `Region="Global"` in CW dims.
+- **EBS FSR**: cost is per **snapshot+AZ DSU hour** while enabled; we aggregate per snapshot.
+- **KMS**: batch `describe_key` to avoid long runtimes on large fleets.
+- **SSM**: Windows checks merged for duplication; “stale” and “plaintext” retained.
+- **Time**: all modules use timezone-aware UTC (no `datetime.utcnow()`).
+
+---
+
 ## Roadmap (next wins)
 
-- CloudFront conservative pricing (requests + egress) behind a feature flag; add potential saving for Dedicated-IP SSL when idle.  
-- DynamoDB on-demand (OD) compute estimation using OD RRU/WRU where volumes justify it.  
 - “Golden CSV” tests per checker (stable fixtures, schema/assertions).  
 - Additional auto-remediations (opt-in): idle ALBs/NLBs delete, KMS rotation enable where safe, EFS lifecycle set.
 

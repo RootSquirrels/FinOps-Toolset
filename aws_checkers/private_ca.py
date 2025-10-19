@@ -22,13 +22,6 @@ def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
 
 
-def _safe_price(get_price: Callable[[str, str], float], service: str, key: str) -> float:
-    try:
-        return float(get_price(service, key))
-    except Exception:  # pylint: disable=broad-except
-        return 0.0
-
-
 def _to_utc_iso(dt_obj: Optional[datetime]) -> Optional[str]:
     if not isinstance(dt_obj, datetime):
         return None
@@ -102,19 +95,19 @@ def check_private_certificate_authorities(  # pylint: disable=unused-argument
                 est_cost = 0.0
                 if status == "ACTIVE":
                     flags.append("PrivateCAActive")
-                    est_cost = _safe_price(get_price, "ACMPCA", "ACTIVE_MONTH")
+                    est_cost = config.safe_price(get_price, "ACMPCA", "ACTIVE_MONTH")
                 elif status == "DISABLED":
                     flags.append("PrivateCADisabled")
-                    est_cost = _safe_price(get_price, "ACMPCA", "DISABLED_MONTH")
+                    est_cost = config.safe_price(get_price, "ACMPCA", "DISABLED_MONTH")
                 elif status == "EXPIRED":
                     flags.append("PrivateCAExpired")
-                    est_cost = _safe_price(get_price, "ACMPCA", "EXPIRED_MONTH")
+                    est_cost = config.safe_price(get_price, "ACMPCA", "EXPIRED_MONTH")
                 elif status == "FAILED":
                     flags.append("PrivateCAFailed")
-                    est_cost = _safe_price(get_price, "ACMPCA", "FAILED_MONTH")
+                    est_cost = config.safe_price(get_price, "ACMPCA", "FAILED_MONTH")
                 elif status == "PENDING_CERTIFICATE":
                     flags.append("PrivateCAPendingCertificate")
-                    est_cost = _safe_price(get_price, "ACMPCA", "PENDING_CERT_MONTH")
+                    est_cost = config.safe_price(get_price, "ACMPCA", "PENDING_CERT_MONTH")
                 else:
                     log.info(
                         "[check_private_certificate_authorities] Skipping CA: %s (status=%s)",
