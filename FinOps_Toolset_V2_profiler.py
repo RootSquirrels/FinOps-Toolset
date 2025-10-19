@@ -193,6 +193,8 @@ from aws_checkers.network_interfaces import check_detached_network_interfaces as
 from aws_checkers import ssm as ssm_checks
 from core.retry import retry_with_backoff
 from aws_checkers import config as checkers_config
+from aws_checkers.private_ca import check_private_certificate_authorities
+from aws_checkers.kms import check_kms_customer_managed_keys
 
 #endregion
 
@@ -517,6 +519,7 @@ def init_clients(region: str):
         "cloudfront": boto3.client("cloudfront", config=SDK_CONFIG),
         "cloudtrail": boto3.client("cloudtrail", config=SDK_CONFIG),
         "kms": boto3.client("kms", region_name=region, config=SDK_CONFIG),
+        "acmpca": boto3.client("acmpca", region_name=region, config=SDK_CONFIG),
     }
 
 
@@ -5201,7 +5204,7 @@ def check_idle_ec2_instances(writer, ec2, cloudwatch,) -> None:
 
 #endregion
 
-#region ACM & KMS SECTION
+#region ACM SECTION
 @retry_with_backoff(exceptions=(ClientError,))
 def check_acm_private_certificates(writer: csv.writer, cloudfront) -> None:
     """
@@ -5300,161 +5303,6 @@ def check_acm_private_certificates(writer: csv.writer, cloudfront) -> None:
     except Exception as e:
         logging.error(f"[check_acm_private_certificates] Unexpected error: {e}")
 
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_kms_customer_managed_keys(writer: csv.writer, 
-    cloudtrail, kms, lookback_days: int = 90) -> None:
-    """
-    Analyze KMS Customer Managed Keys (CMKs):
-    - Estimate monthly storage cost (~$1/key/month; +$1 for first/second rotation; prorated).
-    - Use CloudTrail LookupEvents to infer 'last seen' usage within lookback_days.
-    - Flag keys with no recent usage, keys disabled, and rotation hygiene.
-
-    Pricing reference: AWS KMS pricing—$1 per KMS key per month (prorated). Rotations add $1/mo for the first two rotations.
-    Also, KMS API requests have per-10K fees (first 20K free/month) which we do not estimate here.  # noqa
-    CloudTrail contains KMS usage logs (Encrypt/Decrypt/GenerateDataKey/etc.).  # noqa
-    """
-    try:
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=lookback_days)
-
-        region = _region_of(kms)
-
-        # List keys (paged)
-        keys = []
-        paginator = None
-        try:
-            paginator = kms.get_paginator("list_keys")
-        except Exception:
-            # old SDKs may not have paginator in unit contexts; fallback single call
-            pass
-
-        if paginator:
-            for page in safe_aws_call(
-                lambda: paginator.paginate(),
-                fallback=[], context=f"KMS:{region}:ListKeysPages",
-            ):
-                keys.extend(page.get("Keys", []) or [])
-        else:
-            lst = safe_aws_call(lambda: kms.list_keys(), fallback={}, context=f"KMS:{region}:ListKeys")
-            keys.extend(lst.get("Keys", []) or [])
-
-        # Iterate keys
-        for k in keys:
-            kid = k.get("KeyId", "")
-            if not kid:
-                continue
-
-            meta = safe_aws_call(lambda: kms.describe_key(KeyId=kid).get("KeyMetadata", {}), fallback={}, context=f"KMS:{region}:DescribeKey")
-            if not meta:
-                continue
-
-            # Only CUSTOMER managed keys (exclude AWS managed / AWS owned)
-            if meta.get("KeyManager") != "CUSTOMER":
-                continue
-
-            arn     = meta.get("Arn", "")
-            state   = meta.get("KeyState", "")
-            created = meta.get("CreationDate")
-            created_str = created.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if hasattr(created, "astimezone") else ""
-
-            # Rotation
-            rotation_enabled = bool(safe_aws_call(lambda: kms.get_key_rotation_status(KeyId=kid).get("KeyRotationEnabled", False),
-                                                    fallback=False, context=f"KMS:{region}:GetKeyRotationStatus"))
-
-            # Tag enrichment (optional)
-            tags = {}
-            try:
-                # list_resource_tags is regional; limit not huge
-                t = kms.list_resource_tags(KeyId=kid).get("Tags", [])
-                tags = {kv.get("TagKey", ""): kv.get("TagValue", "") for kv in t if kv.get("TagKey")}
-            except Exception:
-                pass
-
-            # === Cost estimation (rough, monthly) ===
-            # Base key storage: $1 / month (prorated). Add $1/month for first two rotations; we can't know history,
-            # so we conservatively assume +$1 only when rotation_enabled is True (still an approximation).
-            base_month = get_price("KMS", "KEY_MONTH")
-            extra_rotation = get_price("KMS", "KEY_ROTATION_MONTH") if rotation_enabled else 0.0
-            est_monthly = 0.0 if state == "PendingDeletion" else round(float(base_month) + float(extra_rotation), 2)
-
-            # === Usage via CloudTrail ===
-            # CloudTrail LookupEvents (management events up to 90 days in the console; use trails for longer retention).
-            # We scan for kms.amazonaws.com events involving the KeyId (now populated in Resources / responseElements in newer logs).
-            last_seen = ""
-            try:
-                ct = cloudtrail  # NullAWSClient in tests; real client at runtime
-                # not all environments provide LookupEvents; guard the call
-                def _lookup():
-                    # limit events returned per call; if not supported, the stub returns {}
-                    return ct.lookup_events(
-                        LookupAttributes=[{"AttributeKey": "EventSource", "AttributeValue": "kms.amazonaws.com"}],
-                        StartTime=start, EndTime=end, MaxResults=50
-                    )
-
-                events_resp = safe_aws_call(_lookup, fallback={}, context=f"CloudTrail:{region}:LookupEvents")
-                events = events_resp.get("Events", []) or []
-                # Find any event mentioning our key id/arn
-                latest = None
-                for ev in events:
-                    # Quick check in 'Resources' or stringified payloads
-                    if kid in json.dumps(ev, default=str) or arn in json.dumps(ev, default=str):
-                        et = ev.get("EventTime")
-                        if et and (latest is None or et > latest):
-                            latest = et
-                if latest:
-                    last_seen = latest.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            except Exception:
-                pass
-
-            # === Flags & potential saving ===
-            flags: List[str] = []
-            if state == "Enabled":
-                if not last_seen:
-                    flags.append(f"NoRecentUse{lookback_days}d")
-                    if est_monthly > 0:
-                        flags.append(f"PotentialSaving={est_monthly}$")
-            elif state in ("Disabled", "PendingDeletion"):
-                flags.append(state)
-
-            if not rotation_enabled:
-                flags.append("RotationOff")
-            if not all(tags.get(k) for k in REQUIRED_TAG_KEYS):
-                flags.append("MissingRequiredTags")
-
-            conf = score_confidence({"seen": 1.0 if last_seen else 0.3, "no_recent": 1.0 if f"NoRecentUse{lookback_days}d" in flags else 0.0}, evidence_ok=True)
-
-            signals = {
-                "Region": region,
-                "State": state,
-                "Rotation": "On" if rotation_enabled else "Off",
-                "Created": created_str,
-                "LastSeen": last_seen,
-                "LookbackDays": lookback_days,
-                "MonthlyKeyRate": float(base_month),
-                "MonthlyRotationRate": float(extra_rotation),
-            }
-
-            if flags or est_monthly > 0:
-                write_resource_to_csv(
-                    writer=writer,
-                    resource_id=arn or kid,
-                    name=meta.get("Description", "") or meta.get("KeyId", ""),
-                    resource_type="KMSKey",
-                    owner_id=ACCOUNT_ID,
-                    state=state,
-                    creation_date=created_str,
-                    estimated_cost=est_monthly,
-                    app_id=tags.get("ApplicationID", "NULL"),
-                    app=tags.get("Application", "NULL"),
-                    env=tags.get("Environment", "NULL"),
-                    flags=flags,
-                    confidence=conf,
-                    signals=signals,
-                )
-        logging.info("[KMS] Completed CMK analysis")
-    except Exception as e:
-        logging.error(f"[check_kms_customer_managed_keys] Unexpected error: {e}")
 #endregion
 
 #region CloudFront SECTION
@@ -5650,162 +5498,6 @@ def check_cloudfront_idle_distributions(
 #endregion
 
 
-#region PRIVATE CA SECTION
-@retry_with_backoff(exceptions=(ClientError,))
-def check_private_certificate_authorities(writer: csv.writer) -> None:
-    """
-    Flag potentially idle or misconfigured AWS Private CAs and estimate monthly cost.
-
-    What we do per region:
-      1) Build a CA->in-use count map from ACM private certificates (Type=PRIVATE) where InUseBy is non-empty.
-         If ACM's describe_certificate exposes CertificateAuthorityArn, we attribute explicitly.
-      2) Enumerate ACMPCA Certificate Authorities and compute:
-         - UsageMode: GENERAL_PURPOSE (~$400/mo) vs SHORT_LIVED_CERTIFICATE (~$50/mo)
-         - Status: ACTIVE/DISABLED/...
-         - Flags: IdlePrivateCA (no private certs in use mapped to this CA), DisabledCA(StillBilled), Status=<...>
-         - PotentialSaving: monthly CA rate when idle.
-      3) Emit one CSV row per CA with Signals and Confidence.
-
-    Pricing refs (prorated): $400/mo per CA in general-purpose; $50/mo in short-lived mode.  # noqa
-    Disabled CAs still accrue charges until deleted.                                      # noqa
-    """
-    try:
-        # Iterate configured regions (same constant used elsewhere in your toolset)
-        for region in REGIONS:
-            # --- Init clients lazily, guarded ---
-            try:
-                acmpca = boto3.client("acmpca", region_name=region, config=SDK_CONFIG)  # type: ignore
-            except Exception as e:
-                logging.warning(f"[PrivateCA] Init PCA client failed for {region}: {e}")
-                continue
-
-            acm = None
-            try:
-                acm = boto3.client("acm", region_name=region, config=SDK_CONFIG)  # type: ignore
-            except Exception as e:
-                logging.warning(f"[PrivateCA] Init ACM client failed for {region}: {e}")
-
-            # --- 1) Build 'CA ARN -> count of in-use private certs' map from ACM ---
-            ca_inuse: Dict[str, int] = {}
-            if acm:
-                summaries = safe_aws_call(
-                    lambda: acm.list_certificates().get("CertificateSummaryList", []),
-                    fallback=[], context=f"ACM:{region}:ListCertificates",
-                )
-                for s in summaries:
-                    c_arn = s.get("CertificateArn", "")
-                    if not c_arn:
-                        continue
-                    desc = safe_aws_call(
-                        lambda: acm.describe_certificate(CertificateArn=c_arn).get("Certificate", {}),
-                        fallback={}, context=f"ACM:{region}:DescribeCertificate",
-                    )
-                    if not desc:
-                        continue
-                    # Only private certificates
-                    if str(desc.get("Type", "")).upper() != "PRIVATE":
-                        continue
-                    # Only those actually in use
-                    in_use_by = desc.get("InUseBy", []) or []
-                    if not in_use_by:
-                        continue
-                    # Try to attribute to the issuing Private CA, when present
-                    ca_arn = desc.get("CertificateAuthorityArn")
-                    if ca_arn:
-                        ca_inuse[ca_arn] = ca_inuse.get(ca_arn, 0) + 1
-
-            # --- 2) Enumerate Private CAs (ACMPCA) ---
-            # Paginated listing if available
-            pages: List[Dict[str, Any]] = []
-            try:
-                paginator = acmpca.get_paginator("list_certificate_authorities")
-                for pg in safe_aws_call(lambda: paginator.paginate(), fallback=[], context=f"ACMPCA:{region}:ListCAsPages"):
-                    pages.append(pg)
-            except Exception:
-                single = safe_aws_call(lambda: acmpca.list_certificate_authorities(), fallback={}, context=f"ACMPCA:{region}:ListCAs")
-                if single:
-                    pages.append(single)
-
-            for page in pages:
-                for ca in page.get("CertificateAuthorities", []) or []:
-                    ca_arn = ca.get("Arn", "")
-                    status = ca.get("Status", "")
-                    usage_mode = ca.get("UsageMode", "GENERAL_PURPOSE")  # GENERAL_PURPOSE | SHORT_LIVED_CERTIFICATE
-                    ca_type = ca.get("Type", "SUBORDINATE")              # ROOT | SUBORDINATE
-                    created_at = ca.get("CreatedAt")
-                    created_str = (
-                        created_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        if hasattr(created_at, "astimezone") else ""
-                    )
-
-                    # Tags (optional)
-                    tags: Dict[str, str] = {}
-                    try:
-                        tag_list = safe_aws_call(
-                            lambda: acmpca.list_tags(CertificateAuthorityArn=ca_arn).get("Tags", []),
-                            fallback=[], context=f"ACMPCA:{region}:ListTags"
-                        )
-                        tags = {t.get("Key", ""): t.get("Value", "") for t in tag_list if t.get("Key")}
-                    except Exception:
-                        pass
-
-                    # --- Monthly cost estimate (region-independent public list prices) ---
-                    # Keep robust via get_price defaulting.
-                    if str(usage_mode).upper() == "SHORT_LIVED_CERTIFICATE":
-                        rate = get_price("PRIVATE_CA", "SHORT_LIVED_MONTH", default=50.0)
-                    else:
-                        rate = get_price("PRIVATE_CA", "GENERAL_PURPOSE_MONTH", default=400.0)
-                    est_monthly = round(float(rate), 2)
-
-                    # --- Flags ---
-                    inuse_count = int(ca_inuse.get(ca_arn, 0))
-                    flags: List[str] = []
-                    if status == "ACTIVE" and inuse_count == 0:
-                        flags.append("IdlePrivateCA")
-                        flags.append(f"PotentialSaving={est_monthly}$")
-                    if status == "DISABLED":
-                        flags.append("DisabledCA(StillBilled)")
-                    if status not in ("ACTIVE", "DISABLED"):
-                        flags.append(f"Status={status}")
-
-                    # --- Signals & Confidence ---
-                    signals = {
-                        "Region": region,
-                        "UsageMode": usage_mode,
-                        "Type": ca_type,
-                        "InUsePrivateCerts": inuse_count,
-                        "Created": created_str,
-                        "MonthRate": float(rate),
-                    }
-                    # Confidence is high when we could attribute in-use certs to a CA arn.
-                    # If no explicit CA mapping present, still emit but with lower confidence.
-                    confidence = score_confidence(
-                        {"attributed": 1.0 if ca_arn in ca_inuse else 0.5},
-                        evidence_ok=True
-                    )
-
-                    write_resource_to_csv(
-                        writer=writer,
-                        resource_id=ca_arn or "",
-                        name=tags.get("Name", ""),
-                        resource_type="PrivateCA",
-                        owner_id=ACCOUNT_ID,
-                        state=status,
-                        creation_date=created_str,
-                        estimated_cost=est_monthly,
-                        app_id=tags.get("ApplicationID", "NULL"),
-                        app=tags.get("Application", "NULL"),
-                        env=tags.get("Environment", "NULL"),
-                        flags=flags,
-                        confidence=confidence,
-                        signals=signals,
-                    )
-            logging.info("[PrivateCA] Region %s processed", region)
-    except Exception as e:
-        logging.warning(f"[check_private_certificate_authorities] non-fatal: {e}")
-#endregion
-
-
 def main():
     """
     Orchestrate the analysis, write findings to cleanup_estimates.csv,
@@ -5985,12 +5677,14 @@ def main():
                 run_check(profiler, check_name="check_rds_extended_support_mysql", region=region,
                           fn=check_rds_extended_support_mysql, writer=writer, rds=clients['rds'])
 
-                run_check(profiler, "check_private_certificate_authorities", region, 
-                check_private_certificate_authorities, writer)
+                run_check(profiler, check_name="check_private_certificate_authorities",
+                region=region,fn=check_private_certificate_authorities,
+                writer=writer, acmpca=clients["acmpca"])
 
                 run_check(profiler=profiler, check_name="check_kms_customer_managed_keys", 
                           region=region, fn=check_kms_customer_managed_keys, writer=writer, 
                           cloudtrail=clients['cloudtrail'], kms=clients['kms'])
+                          # lookback_days=90,  # optional override
 
                 run_check(profiler=profiler, check_name="check_nat_replacement_opps", 
                           region=region, fn=check_nat_replacement_opps, writer=writer, 
