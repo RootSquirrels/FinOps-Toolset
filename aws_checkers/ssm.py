@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone as _tz, timedelta as _td
 from typing import Callable, List, Optional
+import csv
 
 from botocore.exceptions import ClientError
 from core.retry import retry_with_backoff
@@ -38,10 +39,10 @@ def _to_utc(dt_obj: datetime) -> datetime:
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ssm_plaintext_parameters(
-    writer,
     ssm,
     account_id: str,
     write_row: WriteRow,
+    writer: csv.writer,
     get_price_fn: GetPrice,
     logger: Optional[logging.Logger] = None,
 ) -> None:
@@ -84,10 +85,10 @@ def check_ssm_plaintext_parameters(
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ssm_stale_parameters(
-    writer,
     ssm,
     account_id: str,
     write_row: WriteRow,
+    writer: csv.writer,
     get_price_fn: GetPrice,
     logger: Optional[logging.Logger] = None,
     stale_days: int = 365,
@@ -157,10 +158,10 @@ def _list_all_window_tasks(ssm, window_id: str) -> List[dict]:
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ssm_maintenance_windows_gaps(
-    writer,
     ssm,
     account_id: str,
     write_row: WriteRow,
+    writer: csv.writer,
     get_price_fn: GetPrice,
     logger: Optional[logging.Logger] = None,
     consolidate_rows: bool = False,

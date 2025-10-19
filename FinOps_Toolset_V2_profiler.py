@@ -5882,7 +5882,7 @@ def main():
 
                 run_check(profiler, check_name="EIP", region=region,
                           fn=eip, ec2=clients['ec2'], account_id=ACCOUNT_ID, write_row=writer,
-                          get_price_fn=get_price, logger=LOGGER)
+                          get_price_fn=get_price, logger=LOGGER, writer=writer)
 
                 run_check(profiler, check_name="check_idle_load_balancers", region=region,
                           fn=check_idle_load_balancers, writer=writer,
@@ -5890,7 +5890,7 @@ def main():
 
                 run_check(profiler, check_name="ENI", ec2=clients['ec2'], fn=eni,
                           account_id=ACCOUNT_ID, write_row=writer,
-                          get_price_fn=get_price, logger=LOGGER)
+                          get_price_fn=get_price, logger=LOGGER, writer=writer)
 
                 run_check(profiler, check_name="check_unused_efs_filesystems", region=region,
                           fn=check_unused_efs_filesystems, writer=writer,

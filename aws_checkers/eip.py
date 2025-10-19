@@ -6,6 +6,7 @@ EIP module checker
 from __future__ import annotations
 from typing import Callable, Optional
 import logging
+import csv
 from botocore.exceptions import ClientError
 from core.retry import retry_with_backoff
 
@@ -17,6 +18,7 @@ def check_unused_elastic_ips(
     ec2,
     account_id: str,
     write_row: WriteRow,
+    writer: csv.writer,
     get_price_fn: GetPrice,
     logger: Optional[logging.Logger] = None,
 ) -> int:
@@ -46,6 +48,7 @@ def check_unused_elastic_ips(
 
             if "InstanceId" not in addr and "NetworkInterfaceId" not in addr:
                 write_row(
+                    writer=writer,
                     resource_id=resource_id_or_ip,
                     name="",
                     owner_id=account_id,

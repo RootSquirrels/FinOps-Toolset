@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Callable, Optional
 from botocore.exceptions import ClientError
+import csv
 
 from core.retry import retry_with_backoff
 
@@ -22,6 +23,7 @@ def check_detached_network_interfaces(
     ec2,
     account_id: str,
     write_row: WriteRow,
+    writer: csv.writer,
     get_price_fn: GetPrice,
     logger: Optional[logging.Logger] = None,
 ) -> None:
@@ -66,6 +68,7 @@ def check_detached_network_interfaces(
                     tags = {tag["Key"]: tag["Value"] for tag in eni.get("TagSet", [])}
 
                     write_row(
+                        writer=writer,
                         resource_id=eni_id,
                         name=tags.get("Name", ""),
                         owner_id=account_id,
