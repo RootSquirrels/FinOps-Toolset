@@ -510,32 +510,27 @@ def main():
 
 
             run_check(
-                profiler, "check_s3_public_buckets", region,
-                s3_checks.check_s3_public_buckets,
+                profiler, "check_s3_public_access_block_off", region,
+                s3_checks.check_s3_public_access_block_off,
                 writer=writer, s3=s3_global, cloudwatch=cloudwatch_global,
             )
 
             run_check(
-                profiler, "check_s3_buckets_without_default_encryption",
-                region, s3_checks.check_s3_buckets_without_default_encryption,
-                writer=writer, s3=s3_global, cloudwatch=cloudwatch_global,
-            )
-
-            run_check(
-                profiler, "check_s3_versioned_without_lifecycle",
-                region, s3_checks.check_s3_versioned_without_lifecycle,
-                writer=writer, s3=s3_global, cloudwatch=cloudwatch_global,
-            )
-
-            run_check(
-                profiler, "check_s3_buckets_without_lifecycle",
-                region, s3_checks.check_s3_buckets_without_lifecycle,
+                profiler, "check_s3_no_default_encryption",
+                region, s3_checks.check_s3_no_default_encryption,
                 writer=writer, s3=s3_global, cloudwatch=cloudwatch_global,
             )
 
             run_check(
                 profiler, "check_s3_empty_buckets",
                 region, s3_checks.check_s3_empty_buckets,
+                writer=writer, s3=s3_global,
+                cloudwatch=cloudwatch_global,
+            )
+
+            run_check(
+                profiler, "check_s3_lifecycle_hygiene",
+                region, s3_checks.check_s3_lifecycle_hygiene,
                 writer=writer, s3=s3_global,
                 cloudwatch=cloudwatch_global,
             )

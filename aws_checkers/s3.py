@@ -1,33 +1,22 @@
-"""Checkers: Amazon S3.
+"""Checkers: Amazon S3 – lifecycle/encryption/PAB/IA tiering/multipart/emptiness.
 
-Checks included:
+New:
+- CloudWatchBatcher enrichment for BucketSizeBytes & NumberOfObjects (per bucket region).
+- Estimated monthly storage cost from size breakdown (per storage class).
+- Potential saving heuristics for lifecycle/tiering checks.
 
-  Security & Hygiene
-  - check_s3_public_buckets
-  - check_s3_buckets_without_default_encryption
-  - check_s3_versioned_without_lifecycle
-  - check_s3_buckets_without_lifecycle
-
-  Storage & Cost
-  - check_s3_empty_buckets
-  - check_s3_ia_tiering_candidates
-  - check_s3_stale_multipart_uploads
-
-Design:
-  - Dependencies (account_id, write_row, get_price, logger) via
-    finops_toolset.checkers.config.setup(...).
-  - CloudWatch via finops_toolset.cloudwatch.CloudWatchBatcher.
-  - Tolerant signatures; graceful skips when deps/clients are missing.
-  - Emits Flags, Signals (compact k=v), Estimated_Cost_USD, Potential_Saving_USD.
-  - Timezone-aware datetimes (datetime.now(timezone.utc)).
-  - Pylint-friendly lazy %s logging and ≤ 100-char lines.
+Design
+- Single per-client S3 inventory cache (no redundant S3 calls).
+- Regional CloudWatch queries only for buckets whose region == cloudwatch.meta.region_name.
+- Tag enrichment always present (TagAppId/TagApp/TagEnv), "NULL" when missing.
+- Lines ≤ 100, f-strings (no lazy %% formatting), pylint-friendly.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
 
@@ -35,36 +24,43 @@ from aws_checkers import config
 from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher
 
+# ------------------------------ module caches ----------------------------- #
+
+_INV_CACHE: Dict[int, Dict[str, Dict[str, Any]]] = {}
+
+# ------------------------------ pricing helpers --------------------------- #
+
+# StorageType -> (config price key, default $/GB-month)
+_S3_PRICE_KEYS: Dict[str, Tuple[str, float]] = {
+    "StandardStorage": ("STANDARD_GB_MONTH", 0.023),
+    "StandardIAStorage": ("STANDARD_IA_GB_MONTH", 0.0125),
+    "OneZoneIAStorage": ("ONEZONE_IA_GB_MONTH", 0.01),
+    "IntelligentTieringFAStorage": ("INTELLIGENT_TIERING_FA_GB_MONTH", 0.023),
+    "IntelligentTieringIAStorage": ("INTELLIGENT_TIERING_IA_GB_MONTH", 0.0125),
+    "GlacierInstantRetrievalStorage": ("GLACIER_IR_GB_MONTH", 0.004),
+    "GlacierStorage": ("GLACIER_GB_MONTH", 0.004),
+    "DeepArchiveStorage": ("DEEP_ARCHIVE_GB_MONTH", 0.00099),
+    # Add any others you need; RRS omitted by design
+}
+
+def _p_s3(key: str, default: float) -> float:
+    return float(config.safe_price("S3", key, default))
+
+def _gb(bytes_val: float) -> float:
+    return float(bytes_val) / (1024.0 ** 3)
+
+# Heuristics (tunable via pricing map if you want)
+# Fraction of StandardStorage we assume could move to IA under lifecycle policies.
+def _tiering_pct_default() -> float:
+    return float(config.safe_price("S3", "TIERING_PCT", 0.20))
+
+def _tiering_pct_no_lifecycle_default() -> float:
+    return float(config.safe_price("S3", "NO_LIFECYCLE_TIERING_PCT", 0.15))
 
 # -------------------------------- helpers -------------------------------- #
 
-def _get_bucket_tags_dict(s3_client, bucket_name: str) -> tuple[dict, str]:
-    """
-    Returns (tags_kv, tags_string). Handles buckets without tags gracefully.
-    """
-    try:
-        resp = s3_client.get_bucket_tagging(Bucket=bucket_name)
-        tagset = resp.get("TagSet", [])
-        tags_kv = {t.get("Key", ""): t.get("Value", "") for t in tagset}
-        tag_string = ";".join(f"{t.get('Key','')}={t.get('Value','')}" for t in tagset)
-        return tags_kv, tag_string
-    except ClientError as e:
-        # No tags on the bucket — this is common and not an error.
-        code = e.response.get("Error", {}).get("Code")
-        if code in ("NoSuchTagSet", "NoSuchTagSetError"):
-            return {}, ""
-        # Some regions/bucket types can raise InvalidRequest for unsupported features.
-        if code in ("InvalidRequest",):
-            return {}, ""
-        # Anything else should be visible in logs but shouldn't break the scan.
-        # You likely already have a logger in the toolset; adjust as needed.
-        # logger.warning("get_bucket_tagging failed for %s: %s", bucket_name, e)
-        return {}, ""
-
-
 def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
-
 
 def _signals_str(pairs: Dict[str, object]) -> str:
     items: List[str] = []
@@ -74,690 +70,669 @@ def _signals_str(pairs: Dict[str, object]) -> str:
         items.append(f"{k}={v}")
     return "|".join(items)
 
+def _nonnull_tag(val: Optional[str]) -> str:
+    return "NULL" if not val else val
 
-def _to_utc_iso(dt_obj: Optional[datetime]) -> Optional[str]:
-    if not isinstance(dt_obj, datetime):
-        return None
-    if dt_obj.tzinfo is None:
-        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
-    else:
-        dt_obj = dt_obj.astimezone(timezone.utc)
-    return dt_obj.replace(microsecond=0).isoformat()
-
+def _extract_writer_s3(
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Tuple[Any, Any]:
+    writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
+    s3 = kwargs.get("s3", args[1] if len(args) >= 2 else None)
+    if writer is None or s3 is None:
+        raise TypeError(f"Expected 'writer' and 's3' (got writer={writer!r}, s3={s3!r})")
+    return writer, s3
 
 def _extract_writer_s3_cw(
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
-) -> Tuple[Any, Any, Any]:
-    """Accept writer/s3/cloudwatch passed positionally or by keyword."""
+) -> Tuple[Any, Any, Optional[Any]]:
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
     s3 = kwargs.get("s3", args[1] if len(args) >= 2 else None)
     cloudwatch = kwargs.get("cloudwatch", args[2] if len(args) >= 3 else None)
-    if writer is None or s3 is None or cloudwatch is None:
-        raise TypeError(
-            "Expected 'writer', 's3', and 'cloudwatch' "
-            f"(got writer={writer!r}, s3={s3!r}, cloudwatch={cloudwatch!r})"
-        )
+    if writer is None or s3 is None:
+        raise TypeError(f"Expected 'writer' and 's3' (got writer={writer!r}, s3={s3!r})")
     return writer, s3, cloudwatch
 
+def _pick_tag(tags: Dict[str, str], keys: List[str]) -> Optional[str]:
+    low = {k.lower(): v for k, v in tags.items()}
+    for k in keys:
+        v = low.get(k.lower())
+        if v:
+            return v
+    return None
 
-def _bytes_to_gb(bval: float) -> float:
-    return max(0.0, float(bval) / (1024.0 ** 3))
-
-
-def _last_from_result(res: Any) -> float:
-    """Return last datapoint value from CloudWatchBatcher series."""
-    if res is None:
-        return 0.0
-    if isinstance(res, list) and res:
-        try:
-            # Expect list[(ts, val), ...]
-            return float(res[-1][1])
-        except Exception:  # pylint: disable=broad-except
-            return 0.0
-    if isinstance(res, dict):
-        vals = res.get("Values") or res.get("values") or []
-        try:
-            return float(vals[-1]) if vals else 0.0
-        except Exception:  # pylint: disable=broad-except
-            return 0.0
-    return 0.0
-
-
-def _s3_bucket_region(s3, name: str, log: logging.Logger) -> Optional[str]:
-    """Resolve bucket region; None on error."""
+def _bucket_region(s3, name: str, log: logging.Logger) -> str:
     try:
-        resp = s3.get_bucket_location(Bucket=name)
-        loc = resp.get("LocationConstraint")
-        if not loc:
-            return "us-east-1"  # legacy None => us-east-1
-        # Some APIs return "EU" for eu-west-1
-        return "eu-west-1" if loc == "EU" else str(loc)
+        r = s3.get_bucket_location(Bucket=name) or {}
+        loc = r.get("LocationConstraint")
+        return "us-east-1" if not loc else str(loc)
     except ClientError as exc:
-        log.debug("[s3] get_bucket_location failed for %s: %s", name, exc)
-        return None
+        log.debug(f"[s3] get_bucket_location {name} failed: {exc}")
+        return getattr(getattr(s3, "meta", None), "region_name", "") or ""
 
-
-def _list_buckets_in_region(
-    s3,
-    desired_region: str,
-    log: logging.Logger,
-) -> List[Tuple[str, datetime]]:
-    """List (bucket_name, creation_date) filtered to desired_region."""
-    out: List[Tuple[str, datetime]] = []
+def _bucket_versioning_enabled(s3, name: str, log: logging.Logger) -> bool:
     try:
-        resp = s3.list_buckets()
+        v = s3.get_bucket_versioning(Bucket=name) or {}
+        return str(v.get("Status", "")).upper() == "ENABLED"
     except ClientError as exc:
-        log.error("[s3] list_buckets failed: %s", exc)
+        log.debug(f"[s3] get_bucket_versioning {name} failed: {exc}")
+        return False
+
+def _bucket_lifecycle_info(s3, name: str, log: logging.Logger) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "count": 0,
+        "has_ia_transition": False,
+        "has_glacier_transition": False,
+        "abort_incomplete_days": None,
+    }
+    try:
+        r = s3.get_bucket_lifecycle_configuration(Bucket=name) or {}
+        rules = r.get("Rules", []) or []
+        out["count"] = len(rules)
+
+        def _class_is_ia(sc: str) -> bool:
+            s = sc.upper()
+            return "STANDARD_IA" in s or "ONEZONE_IA" in s or "INTELLIGENT_TIERING" in s
+
+        def _class_is_glacier(sc: str) -> bool:
+            s = sc.upper()
+            return "GLACIER" in s or "DEEP_ARCHIVE" in s
+
+        for rule in rules:
+            for tr in rule.get("Transitions", []) or []:
+                sc = str(tr.get("StorageClass", "")).upper()
+                if _class_is_ia(sc):
+                    out["has_ia_transition"] = True
+                if _class_is_glacier(sc):
+                    out["has_glacier_transition"] = True
+            abort_cfg = (rule.get("AbortIncompleteMultipartUpload") or {})
+            days = abort_cfg.get("DaysAfterInitiation")
+            if isinstance(days, int):
+                prev = out["abort_incomplete_days"]
+                out["abort_incomplete_days"] = min(days, prev) if isinstance(prev, int) else days
+        return out
+    except ClientError as exc:
+        err = (exc.response or {}).get("Error", {}) if hasattr(exc, "response") else {}
+        code = str(err.get("Code", ""))
+        if code in ("NoSuchLifecycleConfiguration", "NoSuchLifecycleConfigurationFault"):
+            return out
+        log.debug(f"[s3] get_bucket_lifecycle_configuration {name} failed: {exc}")
         return out
 
-    for b in resp.get("Buckets", []) or []:
+def _bucket_tags(s3, name: str, log: logging.Logger) -> Dict[str, str]:
+    try:
+        r = s3.get_bucket_tagging(Bucket=name) or {}
+        tagset = r.get("TagSet", []) or []
+        out: Dict[str, str] = {}
+        for t in tagset:
+            k, v = t.get("Key"), t.get("Value")
+            if k:
+                out[str(k)] = "" if v is None else str(v)
+        return out
+    except ClientError as exc:
+        log.debug(f"[s3] get_bucket_tagging {name} failed: {exc}")
+        return {}
+
+def _bucket_encryption_enabled(s3, name: str, log: logging.Logger) -> bool:
+    try:
+        r = s3.get_bucket_encryption(Bucket=name) or {}
+        rules = (r.get("ServerSideEncryptionConfiguration") or {}).get("Rules", []) or []
+        for rule in rules:
+            sse = (rule.get("ApplyServerSideEncryptionByDefault") or {}).get("SSEAlgorithm")
+            if sse:
+                return True
+        return False
+    except ClientError as exc:
+        err = (exc.response or {}).get("Error", {}) if hasattr(exc, "response") else {}
+        code = str(err.get("Code", ""))
+        if code in ("ServerSideEncryptionConfigurationNotFoundError",):
+            return False
+        log.debug(f"[s3] get_bucket_encryption {name} failed: {exc}")
+        return False
+
+def _bucket_pab_config(s3, name: str, log: logging.Logger) -> Dict[str, bool]:
+    try:
+        r = s3.get_public_access_block(Bucket=name) or {}
+        return (r.get("PublicAccessBlockConfiguration") or {}) if r else {}
+    except ClientError as exc:
+        log.debug(f"[s3] get_public_access_block {name} failed: {exc}")
+        return {}
+
+def _bucket_logging_enabled(s3, name: str, log: logging.Logger) -> bool:
+    try:
+        r = s3.get_bucket_logging(Bucket=name) or {}
+        return bool((r.get("LoggingEnabled") or {}).get("TargetBucket"))
+    except ClientError as exc:
+        log.debug(f"[s3] get_bucket_logging {name} failed: {exc}")
+        return False
+
+def _build_inventory(s3, log: logging.Logger) -> Dict[str, Dict[str, Any]]:
+    key = id(s3)
+    if key in _INV_CACHE:
+        return _INV_CACHE[key]
+
+    inv: Dict[str, Dict[str, Any]] = {}
+    try:
+        resp = s3.list_buckets() or {}
+        buckets = resp.get("Buckets", []) or []
+    except ClientError as exc:
+        log.error(f"[s3] list_buckets failed: {exc}")
+        buckets = []
+
+    for b in buckets:
         name = b.get("Name")
         if not name:
             continue
-        region = _s3_bucket_region(s3, name, log)
-        if region and region == desired_region:
-            created = b.get("CreationDate")
-            if isinstance(created, datetime):
-                out.append((name, created))
-            else:
-                out.append((name, datetime.now(timezone.utc)))
-    return out
+        region = _bucket_region(s3, name, log)
+        versioning = _bucket_versioning_enabled(s3, name, log)
+        lc = _bucket_lifecycle_info(s3, name, log)
+        tags = _bucket_tags(s3, name, log)
+        enc = _bucket_encryption_enabled(s3, name, log)
+        pab_cfg = _bucket_pab_config(s3, name, log)
+        logging_on = _bucket_logging_enabled(s3, name, log)
 
+        inv[name] = {
+            "region": region,
+            "versioning": versioning,
+            "lifecycle": lc,
+            "tags": tags,
+            "encryption": enc,
+            "pab": pab_cfg,
+            "logging": logging_on,
+        }
 
-def _storage_price_key(storage_type: str) -> Optional[str]:
-    """Map S3 CloudWatch storage type to pricebook key (heuristic)."""
-    st = (storage_type or "").lower()
-    if st == "standardstorage":
-        return "STANDARD_GB_MONTH"
-    if st == "standardiastorage":
-        return "STANDARD_IA_GB_MONTH"
-    if st == "onezoneiastorage":
-        return "ONEZONE_IA_GB_MONTH"
-    if st == "glacierinstantretrievalstorage":
-        return "GLACIER_IR_GB_MONTH"
-    if st == "glacierstorage":
-        return "GLACIER_GB_MONTH"
-    if st == "deeparchivestorage":
-        return "GLACIER_DEEP_GB_MONTH"
-    if st == "noncurrentversionstorage":
-        # noncurrent defaults to Standard unless lifecycle moves it
-        return "STANDARD_GB_MONTH"
+    _INV_CACHE[key] = inv
+    return inv
+
+def _tag_triplet(tags: Dict[str, str]) -> Tuple[str, str, str]:
+    app_id = _pick_tag(tags, ["app_id", "application_id", "app-id"])
+    app = _pick_tag(tags, ["app", "application", "service"])
+    env = _pick_tag(tags, ["environment", "env", "stage"])
+    return _nonnull_tag(app_id), _nonnull_tag(app), _nonnull_tag(env)
+
+def _write_row_bucket(
+    writer,
+    bucket: str,
+    region: str,
+    flags: List[str],
+    signals_extra: Optional[Dict[str, object]] = None,
+    logger: Optional[logging.Logger] = None,
+    estimated_cost: Optional[float] = None,
+    potential_saving: Optional[float] = None,
+) -> None:
+    log = _logger(logger)
+    try:
+        # type: ignore[call-arg]
+        config.WRITE_ROW(
+            writer=writer,
+            resource_id=bucket,
+            name=bucket,
+            owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
+            resource_type="S3Bucket",
+            estimated_cost=float(estimated_cost or 0.0),
+            potential_saving=float(potential_saving or 0.0),
+            flags=flags,
+            confidence=100,
+            signals=_signals_str(signals_extra or {}),
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(f"[s3] write_row bucket {bucket}: {exc}")
+
+# ------------------------- CloudWatch enrichment -------------------------- #
+
+def _latest_from_result(res: Any) -> Optional[float]:
+    # Accepts list[(ts, val)] or dict with 'Values'
+    if res is None:
+        return None
+    if isinstance(res, list) and res:
+        try:
+            return float(res[-1][1])
+        except Exception:  # pylint: disable=broad-except
+            return None
+    if isinstance(res, dict):
+        vals = res.get("Values") or res.get("values") or []
+        if vals:
+            try:
+                return float(vals[-1])
+            except Exception:  # pylint: disable=broad-except
+                return None
     return None
 
+def _cw_sizes_for_region(
+    cloudwatch,
+    region: str,
+    buckets: List[str],
+    now_utc: datetime,
+    log: logging.Logger,
+) -> Dict[str, Dict[str, Any]]:
+    """Query S3 metrics (BucketSizeBytes & NumberOfObjects) for given region buckets."""
+    out: Dict[str, Dict[str, Any]] = {b: {"bytes": {}, "objects": None} for b in buckets}
+    if not cloudwatch:
+        return out
 
-def _estimate_storage_cost_gb_by_type(gb_by_type: Dict[str, float]) -> float:
+    cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or ""
+    if cw_region != region:
+        # We only query metrics when CW client matches bucket region to avoid cross-region calls.
+        return out
+
+    # S3 metrics are daily; grab last 3 days to reduce nulls.
+    start = (now_utc - timedelta(days=3)).replace(microsecond=0)
+    end = now_utc.replace(microsecond=0)
+    period = 86400
+    try:
+        cw = CloudWatchBatcher(region=region, client=cloudwatch)
+        # NumberOfObjects (StorageType=AllStorageTypes)
+        for b in buckets:
+            dims = [("BucketName", b), ("StorageType", "AllStorageTypes")]
+            cw.add_q(
+                id_hint=f"obj_{b}",
+                namespace="AWS/S3",
+                metric="NumberOfObjects",
+                dims=dims,
+                stat="Average",
+                period=period,
+            )
+        # BucketSizeBytes per StorageType we care about
+        for b in buckets:
+            for st in _S3_PRICE_KEYS.keys():
+                dims = [("BucketName", b), ("StorageType", st)]
+                cw.add_q(
+                    id_hint=f"size_{b}_{st}",
+                    namespace="AWS/S3",
+                    metric="BucketSizeBytes",
+                    dims=dims,
+                    stat="Average",
+                    period=period,
+                )
+        results = cw.execute(start=start, end=end)
+    except ClientError as exc:
+        log.debug(f"[s3] CloudWatch metrics unavailable in {region}: {exc}")
+        return out
+    except Exception as exc:  # pylint: disable=broad-except
+        log.debug(f"[s3] CloudWatch batch error {region}: {exc}")
+        return out
+
+    # Parse results
+    for b in buckets:
+        # objects
+        val = _latest_from_result(results.get(f"obj_{b}"))
+        if val is not None:
+            out[b]["objects"] = int(val)
+        # sizes by class
+        for st in _S3_PRICE_KEYS.keys():
+            v = _latest_from_result(results.get(f"size_{b}_{st}"))
+            if v is not None and v >= 0.0:
+                out[b]["bytes"][st] = float(v)
+
+    return out
+
+def _storage_monthly_cost(bytes_by_class: Dict[str, float]) -> float:
     total = 0.0
-    for stype, gbs in gb_by_type.items():
-        pkey = _storage_price_key(stype)
-        price = config.safe_price("S3", pkey, 0.0) if pkey else 0.0
-        total += gbs * price
+    for st, (price_key, default_price) in _S3_PRICE_KEYS.items():
+        b = float(bytes_by_class.get(st, 0.0))
+        if b <= 0.0:
+            continue
+        gb_val = _gb(b)
+        total += gb_val * _p_s3(price_key, default_price)
     return total
 
+def _potential_tiering_saving(
+    bytes_by_class: Dict[str, float],
+    pct: float,
+) -> float:
+    std_b = float(bytes_by_class.get("StandardStorage", 0.0))
+    if std_b <= 0.0 or pct <= 0.0:
+        return 0.0
+    std_gb = _gb(std_b)
+    # Move 'pct' of Standard to Standard-IA as a heuristic
+    price_std = _p_s3("STANDARD_GB_MONTH", 0.023)
+    price_ia = _p_s3("STANDARD_IA_GB_MONTH", 0.0125)
+    diff = max(0.0, price_std - price_ia)
+    return std_gb * pct * diff
 
-def _cw_add_storage_queries(
-    cw: CloudWatchBatcher,
-    bucket: str,
-    types: Iterable[str],
-) -> Dict[str, str]:
-    """Queue S3 storage metrics for a bucket; return id map."""
-    ids: Dict[str, str] = {}
-    for stype in types:
-        qid = f"s3_{bucket}_{stype}"
-        dims = [("BucketName", bucket), ("StorageType", stype)]
-        cw.add_q(
-            id_hint=qid,
-            namespace="AWS/S3",
-            metric="BucketSizeBytes",
-            dims=dims,
-            stat="Average",
-            period=86400,
-        )
-        ids[stype] = qid
-    # Also number of objects (daily)
-    qid_cnt = f"s3_{bucket}_obj_count"
-    dims_cnt = [("BucketName", bucket), ("StorageType", "AllStorageTypes")]
-    cw.add_q(
-        id_hint=qid_cnt,
-        namespace="AWS/S3",
-        metric="NumberOfObjects",
-        dims=dims_cnt,
-        stat="Average",
-        period=86400,
-    )
-    ids["__NumberOfObjects__"] = qid_cnt
-    return ids
-
-
-# ------------------------- 1) Public buckets check ----------------------- #
+# ------------------------------- checkers -------------------------------- #
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_s3_public_buckets(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    **kwargs,
-) -> None:
-    """Flag buckets that are publicly accessible (policy or ACL)."""
-    log = _logger(kwargs.get("logger") or logger)
-
-    try:
-        writer, s3, cloudwatch = _extract_writer_s3_cw(args, kwargs)  # cloudwatch unused
-    except TypeError as exc:
-        log.warning("[check_s3_public_buckets] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_s3_public_buckets] Skipping: checker config not provided.")
-        return
-
-    cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or ""
-    buckets = _list_buckets_in_region(s3, cw_region, log)
-    if not buckets:
-        log.info("[check_s3_public_buckets] No buckets in %s", cw_region)
-        return
-
-    for bname, created in buckets:
-        is_public = False
-        pab = {}
-        try:
-            pab = (s3.get_public_access_block(Bucket=bname) or {}).get("PublicAccessBlockConfiguration", {})  # noqa: E501
-        except ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code")
-            if code != "NoSuchPublicAccessBlockConfiguration":
-                log.debug("[s3] get_public_access_block %s: %s", bname, exc)
-
-        try:
-            pol = s3.get_bucket_policy_status(Bucket=bname)
-            is_public = bool(pol.get("PolicyStatus", {}).get("IsPublic"))
-        except ClientError as exc:
-            # No policy or permission → fall back to ACL
-            log.debug("[s3] get_bucket_policy_status %s: %s", bname, exc)
-
-        if not is_public:
-            try:
-                acl = s3.get_bucket_acl(Bucket=bname)
-                grants = acl.get("Grants", []) or []
-                for g in grants:
-                    gr = g.get("Grantee", {}) or {}
-                    uri = (gr.get("URI") or "").lower()
-                    if "allusers" in uri or "authenticatedusers" in uri:
-                        is_public = True
-                        break
-            except ClientError as exc:
-                log.debug("[s3] get_bucket_acl %s: %s", bname, exc)
-
-        if not is_public:
-            continue
-
-        flags = ["S3BucketPublic"]
-        signals = _signals_str(
-            {
-                "Region": cw_region,
-                "Bucket": bname,
-                "CreatedAt": _to_utc_iso(created),
-                "PAB_BlockPublicAcls": pab.get("BlockPublicAcls"),
-                "PAB_BlockPublicPolicy": pab.get("BlockPublicPolicy"),
-                "PAB_IgnorePublicAcls": pab.get("IgnorePublicAcls"),
-                "PAB_RestrictPublicBuckets": pab.get("RestrictPublicBuckets"),
-            }
-        )
-
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=bname,
-                name=bname,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="S3Bucket",
-                estimated_cost=0.0,
-                potential_saving=0.0,
-                flags=flags,
-                confidence=100,
-                signals=signals,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_s3_public_buckets] write_row failed for %s: %s", bname, exc)
-
-        log.info("[check_s3_public_buckets] Wrote: %s", bname)
-
-
-# --------------- 2) Default encryption missing (SSE) --------------------- #
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_s3_buckets_without_default_encryption(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    **kwargs,
-) -> None:
-    """Flag buckets that do not have default encryption configured."""
-    log = _logger(kwargs.get("logger") or logger)
-
-    try:
-        writer, s3, cloudwatch = _extract_writer_s3_cw(args, kwargs)  # cloudwatch unused
-    except TypeError as exc:
-        log.warning("[check_s3_buckets_without_default_encryption] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_s3_buckets_without_default_encryption] Skipping: checker config.")
-        return
-
-    cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or ""
-    buckets = _list_buckets_in_region(s3, cw_region, log)
-    if not buckets:
-        return
-
-    for bname, created in buckets:
-        has_enc = True
-        enc_algo = None
-        try:
-            enc = s3.get_bucket_encryption(Bucket=bname)
-            rules = enc.get("ServerSideEncryptionConfiguration", {}).get("Rules", [])  # noqa: E501
-            if rules:
-                algo = rules[0].get("ApplyServerSideEncryptionByDefault", {}).get("SSEAlgorithm")  # noqa: E501
-                enc_algo = algo
-                has_enc = bool(algo)
-            else:
-                has_enc = False
-        except ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code")
-            if code == "ServerSideEncryptionConfigurationNotFoundError":
-                has_enc = False
-            else:
-                log.debug("[s3] get_bucket_encryption %s: %s", bname, exc)
-                has_enc = True  # unknown → don't flag
-
-        if has_enc:
-            continue
-
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=bname,
-                name=bname,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="S3Bucket",
-                estimated_cost=0.0,
-                potential_saving=0.0,
-                flags=["S3BucketNoDefaultEncryption"],
-                confidence=100,
-                signals=_signals_str(
-                    {
-                        "Region": cw_region,
-                        "Bucket": bname,
-                        "CreatedAt": _to_utc_iso(created),
-                        "SSEAlgorithm": enc_algo or "",
-                    }
-                ),
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_s3_buckets_without_default_encryption] write_row %s: %s", bname, exc)
-
-        log.info("[check_s3_buckets_without_default_encryption] Wrote: %s", bname)
-
-
-# -------- 3) Versioning enabled but no lifecycle (cost growth risk) ----- #
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_s3_versioned_without_lifecycle(  # pylint: disable=unused-argument
+def check_s3_lifecycle_hygiene(  # pylint: disable=unused-argument
     *args,
     logger: Optional[logging.Logger] = None,
     **kwargs,
 ) -> None:
     """
-    Flag buckets with versioning enabled but without lifecycle config.
+    Emit a single lifecycle hygiene row per bucket.
+
+    Flags:
+      - S3VersioningNoLifecycle  (versioning=Enabled & lifecycle.count == 0)
+      - S3NoLifecycle            (versioning!=Enabled & lifecycle.count == 0)
+
+    Uses CloudWatch (if provided) to include size/object counts and cost estimates.
     """
     log = _logger(kwargs.get("logger") or logger)
-
-    try:
-        writer, s3, cloudwatch = _extract_writer_s3_cw(args, kwargs)  # cloudwatch unused
-    except TypeError as exc:
-        log.warning("[check_s3_versioned_without_lifecycle] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_s3_versioned_without_lifecycle] Skipping: checker config.")
-        return
-
-    cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or ""
-    buckets = _list_buckets_in_region(s3, cw_region, log)
-    if not buckets:
-        return
-
-    for bname, created in buckets:
-        ver = {}
-        try:
-            ver = s3.get_bucket_versioning(Bucket=bname) or {}
-        except ClientError as exc:
-            log.debug("[s3] get_bucket_versioning %s: %s", bname, exc)
-            continue
-
-        if (ver.get("Status") or "").upper() != "ENABLED":
-            continue
-
-        has_lc = True
-        try:
-            lc = s3.get_bucket_lifecycle_configuration(Bucket=bname)
-            rules = lc.get("Rules", []) or []
-            has_lc = bool(rules)
-        except ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code")
-            if code == "NoSuchLifecycleConfiguration":
-                has_lc = False
-            else:
-                log.debug("[s3] get_bucket_lifecycle_configuration %s: %s", bname, exc)
-                has_lc = True
-
-        if has_lc:
-            continue
-
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=bname,
-                name=bname,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="S3Bucket",
-                estimated_cost=0.0,
-                potential_saving=0.0,
-                flags=["S3BucketVersionedNoLifecycle"],
-                confidence=100,
-                signals=_signals_str(
-                    {"Region": cw_region, "Bucket": bname, "CreatedAt": _to_utc_iso(created), "Versioned": "False"}
-                ),
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_s3_versioned_without_lifecycle] write_row %s: %s", bname, exc)
-
-        log.info("[check_s3_versioned_without_lifecycle] Wrote: %s", bname)
-
-
-# --------------- 4) Any bucket without lifecycle configuration ---------- #
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_s3_buckets_without_lifecycle(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    **kwargs,
-) -> None:
-    """Flag buckets that have no lifecycle configuration at all."""
-    log = _logger(kwargs.get("logger") or logger)
-
-    try:
-        writer, s3, cloudwatch = _extract_writer_s3_cw(args, kwargs)  # cloudwatch unused
-    except TypeError as exc:
-        log.warning("[check_s3_buckets_without_lifecycle] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_s3_buckets_without_lifecycle] Skipping: checker config.")
-        return
-
-    cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or ""
-    buckets = _list_buckets_in_region(s3, cw_region, log)
-    if not buckets:
-        return
-
-    for bname, created in buckets:
-        has_lc = True
-        try:
-            lc = s3.get_bucket_lifecycle_configuration(Bucket=bname)
-            has_lc = bool(lc.get("Rules", []) or [])
-        except ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code")
-            if code == "NoSuchLifecycleConfiguration":
-                has_lc = False
-            else:
-                log.debug("[s3] get_bucket_lifecycle_configuration %s: %s", bname, exc)
-                has_lc = True
-
-        if has_lc:
-            continue
-
-        tags_kv, tags_str = _get_bucket_tags_dict(s3, bname)
-
-        # Map common owner taxonomy into normalized columns (keep your keys as you use them)
-        application_id = tags_kv.get("ApplicationID") or tags_kv.get("app_id") or ""
-        application    = tags_kv.get("Application")   or tags_kv.get("app")    or ""
-        environment    = tags_kv.get("Environment")   or tags_kv.get("env")    or ""
-
-
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=bname,
-                name=bname,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="S3Bucket",
-                estimated_cost=0.0,
-                potential_saving=0.0,
-                app_id=application_id,
-                env=environment,
-                app=application,
-                flags=["S3BucketNoLifecycle"],
-                confidence=100,
-                signals=_signals_str(
-                    {"Region": cw_region, "Bucket": bname, "CreatedAt": _to_utc_iso(created)}
-                ),
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_s3_buckets_without_lifecycle] write_row %s: %s", bname, exc)
-
-        log.info("[check_s3_buckets_without_lifecycle] Wrote: %s", bname)
-
-
-# ------------------- 5) Empty buckets (0 bytes / 0 objects) ------------- #
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_s3_empty_buckets(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    **kwargs,
-) -> None:
-    """
-    Flag buckets with 0 objects and 0 storage, based on CloudWatch daily storage
-    metrics (BucketSizeBytes, NumberOfObjects). No direct saving, but cleanup
-    is recommended.
-    """
-    log = _logger(kwargs.get("logger") or logger)
-
     try:
         writer, s3, cloudwatch = _extract_writer_s3_cw(args, kwargs)
     except TypeError as exc:
-        log.warning("[check_s3_empty_buckets] Skipping: %s", exc)
+        log.warning(f"[check_s3_lifecycle_hygiene] Skipping: {exc}")
         return
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_s3_empty_buckets] Skipping: checker config.")
+        log.warning("[check_s3_lifecycle_hygiene] Skipping: checker config not provided.")
         return
 
-    cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or ""
-    buckets = _list_buckets_in_region(s3, cw_region, log)
-    if not buckets:
-        return
+    inv = _build_inventory(s3, log)
+    # Group buckets by region for CW queries
+    region_buckets: Dict[str, List[str]] = {}
+    for b, info in inv.items():
+        if int((info.get("lifecycle") or {}).get("count") or 0) == 0:
+            region_buckets.setdefault(str(info.get("region") or ""), []).append(b)
 
-    types = ["StandardStorage"]
-    id_map: Dict[str, Dict[str, str]] = {}
-    results: Dict[str, Any] = {}
-    metrics_ok = True
+    now_utc = datetime.now(timezone.utc)
+    cw_data: Dict[str, Dict[str, Any]] = {}
+    for region, buckets in region_buckets.items():
+        cw_data.update(_cw_sizes_for_region(cloudwatch, region, buckets, now_utc, log))
 
+    pct = _tiering_pct_no_lifecycle_default()
+    for bucket, info in inv.items():
+        lc = info.get("lifecycle") or {}
+        count = int(lc.get("count") or 0)
+        if count > 0:
+            continue
+
+        region = str(info.get("region") or "")
+        versioning = bool(info.get("versioning"))
+        tags = info.get("tags") or {}
+        app_id, app, env = _tag_triplet(tags)
+
+        sizes = cw_data.get(bucket, {})
+        by_class = sizes.get("bytes", {}) if isinstance(sizes, dict) else {}
+        objects = sizes.get("objects") if isinstance(sizes, dict) else None
+
+        est = _storage_monthly_cost(by_class) if by_class else 0.0
+        pot = _potential_tiering_saving(by_class, pct) if by_class else 0.0
+
+        flags = ["S3VersioningNoLifecycle" if versioning else "S3NoLifecycle"]
+        signals = {
+            "Region": region,
+            "Bucket": bucket,
+            "LifecycleRules": count,
+            "VersioningEnabled": versioning,
+            "Objects": objects if objects is not None else "NULL",
+            "SizeGB": round(sum(_gb(v) for v in by_class.values()), 3) if by_class else "NULL",
+            "TieringPctHeuristic": pct,
+            "TagAppId": app_id,
+            "TagApp": app,
+            "TagEnv": env,
+        }
+        _write_row_bucket(
+            writer,
+            bucket,
+            region,
+            flags,
+            signals,
+            log,
+            estimated_cost=est,
+            potential_saving=pot,
+        )
+        log.info(f"[s3] Wrote lifecycle hygiene for bucket: {bucket}")
+
+@retry_with_backoff(exceptions=(ClientError,))
+def check_s3_no_default_encryption(  # pylint: disable=unused-argument
+    *args,
+    logger: Optional[logging.Logger] = None,
+    **kwargs,
+) -> None:
+    """Flag buckets without default SSE (KMS or S3-managed)."""
+    log = _logger(kwargs.get("logger") or logger)
     try:
-        cw = CloudWatchBatcher(region=cw_region, client=cloudwatch)
-        for bname, _created in buckets:
-            id_map[bname] = _cw_add_storage_queries(cw, bname, types)
-        # S3 storage metrics are daily. Look back ~3 days for a stable point.
-        end = datetime.now(timezone.utc).replace(microsecond=0)
-        start = end - timedelta(days=3)
-        results = cw.execute(start=start, end=end)
-    except ClientError as exc:
-        log.warning("[check_s3_empty_buckets] CloudWatch metrics unavailable: %s", exc)
-        metrics_ok = False
-    except Exception as exc:  # pylint: disable=broad-except
-        log.warning("[check_s3_empty_buckets] CloudWatch batch error: %s", exc)
-        metrics_ok = False
-
-    if not metrics_ok:
+        writer, s3, cloudwatch = _extract_writer_s3_cw(args, kwargs)
+    except TypeError as exc:
+        log.warning(f"[check_s3_no_default_encryption] Skipping: {exc}")
+        return
+    if not (config.ACCOUNT_ID and config.WRITE_ROW):
+        log.warning("[check_s3_no_default_encryption] Skipping: checker config not provided.")
         return
 
-    for bname, created in buckets:
-        ids = id_map.get(bname, {})
-        size_last = _last_from_result(results.get(ids.get("StandardStorage")))
-        obj_last = _last_from_result(results.get(ids.get("__NumberOfObjects__")))
-        if float(size_last) <= 0.0 and float(obj_last) <= 0.0:
-            try:
-                # type: ignore[call-arg]
-                config.WRITE_ROW(
-                    writer=writer,
-                    resource_id=bname,
-                    name=bname,
-                    owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                    resource_type="S3Bucket",
-                    estimated_cost=0.0,
-                    potential_saving=0.0,
-                    flags=["S3BucketEmpty"],
-                    confidence=100,
-                    signals=_signals_str(
-                        {
-                            "Region": cw_region,
-                            "Bucket": bname,
-                            "CreatedAt": _to_utc_iso(created),
-                            "Objects": int(obj_last),
-                            "Bytes": int(size_last),
-                        }
-                    ),
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                log.warning("[check_s3_empty_buckets] write_row %s: %s", bname, exc)
+    inv = _build_inventory(s3, log)
+    # Optional cost context
+    region_buckets: Dict[str, List[str]] = {}
+    for b, info in inv.items():
+        if not bool(info.get("encryption")):
+            region_buckets.setdefault(str(info.get("region") or ""), []).append(b)
 
-            log.info("[check_s3_empty_buckets] Wrote: %s", bname)
+    now_utc = datetime.now(timezone.utc)
+    cw_data: Dict[str, Dict[str, Any]] = {}
+    for region, buckets in region_buckets.items():
+        cw_data.update(_cw_sizes_for_region(cloudwatch, region, buckets, now_utc, log))
 
+    for bucket, info in inv.items():
+        if bool(info.get("encryption")):
+            continue
 
-# --------- 6) IA / Archive tiering candidates (low requests) ------------ #
+        region = str(info.get("region") or "")
+        tags = info.get("tags") or {}
+        app_id, app, env = _tag_triplet(tags)
+
+        sizes = cw_data.get(bucket, {})
+        by_class = sizes.get("bytes", {}) if isinstance(sizes, dict) else {}
+        objects = sizes.get("objects") if isinstance(sizes, dict) else None
+        est = _storage_monthly_cost(by_class) if by_class else 0.0
+
+        signals = {
+            "Region": region,
+            "Bucket": bucket,
+            "DefaultEncryption": False,
+            "Objects": objects if objects is not None else "NULL",
+            "SizeGB": round(sum(_gb(v) for v in by_class.values()), 3) if by_class else "NULL",
+            "TagAppId": app_id,
+            "TagApp": app,
+            "TagEnv": env,
+        }
+
+        _write_row_bucket(
+            writer,
+            bucket,
+            region,
+            flags=["S3NoDefaultEncryption"],
+            signals_extra=signals,
+            logger=log,
+            estimated_cost=est,
+            potential_saving=0.0,
+        )
+        log.info(f"[s3] Wrote no-default-encryption: {bucket}")
+
+@retry_with_backoff(exceptions=(ClientError,))
+def check_s3_public_access_block_off(  # pylint: disable=unused-argument
+    *args,
+    logger: Optional[logging.Logger] = None,
+    **kwargs,
+) -> None:
+    """Flag buckets with missing or partially disabled Public Access Block settings."""
+    log = _logger(kwargs.get("logger") or logger)
+    try:
+        writer, s3 = _extract_writer_s3(args, kwargs)
+    except TypeError as exc:
+        log.warning(f"[check_s3_public_access_block_off] Skipping: {exc}")
+        return
+    if not (config.ACCOUNT_ID and config.WRITE_ROW):
+        log.warning("[check_s3_public_access_block_off] Skipping: checker config not provided.")
+        return
+
+    inv = _build_inventory(s3, log)
+    needed = {
+        "BlockPublicAcls": True,
+        "IgnorePublicAcls": True,
+        "BlockPublicPolicy": True,
+        "RestrictPublicBuckets": True,
+    }
+
+    for bucket, info in inv.items():
+        cfg = info.get("pab") or {}
+        region = str(info.get("region") or "")
+        tags = info.get("tags") or {}
+        app_id, app, env = _tag_triplet(tags)
+
+        if not cfg:
+            signals = {
+                "Region": region,
+                "Bucket": bucket,
+                "PAB": "Missing",
+                "TagAppId": app_id,
+                "TagApp": app,
+                "TagEnv": env,
+            }
+            _write_row_bucket(
+                writer,
+                bucket,
+                region,
+                flags=["S3PublicAccessBlockMissing"],
+                signals_extra=signals,
+                logger=log,
+            )
+            log.info(f"[s3] Wrote PAB missing: {bucket}")
+            continue
+
+        partial = any(bool(cfg.get(k)) is not v for k, v in needed.items())
+        if not partial:
+            continue
+
+        signals = {
+            "Region": region,
+            "Bucket": bucket,
+            "PAB": "|".join(f"{k}={bool(cfg.get(k))}" for k in needed.keys()),
+            "TagAppId": app_id,
+            "TagApp": app,
+            "TagEnv": env,
+        }
+        _write_row_bucket(
+            writer,
+            bucket,
+            region,
+            flags=["S3PublicAccessBlockPartial"],
+            signals_extra=signals,
+            logger=log,
+        )
+        log.info(f"[s3] Wrote PAB partial: {bucket}")
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_s3_ia_tiering_candidates(  # pylint: disable=unused-argument
     *args,
     logger: Optional[logging.Logger] = None,
-    lookback_days: int = 30,
-    min_standard_gb: float = 50.0,
-    request_threshold: int = 1000,
-    conservative_ratio: float = 0.5,
     **kwargs,
 ) -> None:
     """
-    Suggest moving cold data to cheaper tiers when StandardStorage is large but
-    requests are low.
-
-    Heuristic saving:
-      potential_saving = StandardGB * (STANDARD - STANDARD_IA) * conservative_ratio
+    Flag buckets with lifecycle rules but NO transitions to IA/Intelligent/Glacier.
+    Uses CW (if provided) to estimate cost and a potential saving heuristic.
     """
     log = _logger(kwargs.get("logger") or logger)
-
     try:
         writer, s3, cloudwatch = _extract_writer_s3_cw(args, kwargs)
     except TypeError as exc:
-        log.warning("[check_s3_ia_tiering_candidates] Skipping: %s", exc)
+        log.warning(f"[check_s3_ia_tiering_candidates] Skipping: {exc}")
         return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        log.warning("[check_s3_ia_tiering_candidates] Skipping: checker config.")
-        return
-
-    cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or ""
-    buckets = _list_buckets_in_region(s3, cw_region, log)
-    if not buckets:
+    if not (config.ACCOUNT_ID and config.WRITE_ROW):
+        log.warning("[check_s3_ia_tiering_candidates] Skipping: checker config not provided.")
         return
 
-    types = ["StandardStorage", "StandardIAStorage", "GlacierInstantRetrievalStorage"]
-    id_map: Dict[str, Dict[str, str]] = {}
-    results: Dict[str, Any] = {}
-    metrics_ok = True
+    inv = _build_inventory(s3, log)
+    region_buckets: Dict[str, List[str]] = {}
+    for b, info in inv.items():
+        lc = info.get("lifecycle") or {}
+        if int(lc.get("count") or 0) > 0 and not (lc.get("has_ia_transition") or
+                                                  lc.get("has_glacier_transition")):
+            region_buckets.setdefault(str(info.get("region") or ""), []).append(b)
 
-    try:
-        cw = CloudWatchBatcher(region=cw_region, client=cloudwatch)
-        for bname, _created in buckets:
-            ids = _cw_add_storage_queries(cw, bname, types)
-            # Request metrics (if enabled) per bucket
-            qid_req = f"s3_req_{bname}"
-            dims_req = [("BucketName", bname), ("FilterId", "EntireBucket")]
-            cw.add_q(
-                id_hint=qid_req,
-                namespace="AWS/S3",
-                metric="AllRequests",
-                dims=dims_req,
-                stat="Sum",
-                period=3600,
-            )
-            ids["__AllRequests__"] = qid_req
-            id_map[bname] = ids
+    now_utc = datetime.now(timezone.utc)
+    cw_data: Dict[str, Dict[str, Any]] = {}
+    for region, buckets in region_buckets.items():
+        cw_data.update(_cw_sizes_for_region(cloudwatch, region, buckets, now_utc, log))
 
-        end = datetime.now(timezone.utc).replace(microsecond=0)
-        start = end - timedelta(days=lookback_days)
-        results = cw.execute(start=start, end=end)
-    except ClientError as exc:
-        log.warning("[check_s3_ia_tiering_candidates] CloudWatch metrics unavailable: %s", exc)
-        metrics_ok = False
-    except Exception as exc:  # pylint: disable=broad-except
-        log.warning("[check_s3_ia_tiering_candidates] CloudWatch batch error: %s", exc)
-        metrics_ok = False
-
-    if not metrics_ok:
-        return
-
-    price_std = config.safe_price("S3", "STANDARD_GB_MONTH", 0.023)
-    price_ia = config.safe_price("S3", "STANDARD_IA_GB_MONTH", 0.0125)
-
-    for bname, created in buckets:
-        ids = id_map.get(bname, {})
-        std_bytes = _last_from_result(results.get(ids.get("StandardStorage")))
-        req_sum = 0.0
-        # Request metrics might be missing (not enabled). Treat as high to avoid FPs.
-        if ids.get("__AllRequests__") in results:
-            req_series = results.get(ids.get("__AllRequests__"))
-            if isinstance(req_series, list):
-                req_sum = sum(float(v) for _, v in req_series)
-            elif isinstance(req_series, dict):
-                vals = req_series.get("Values") or req_series.get("values") or []
-                req_sum = float(sum(vals))
-
-        std_gb = _bytes_to_gb(std_bytes)
-        if std_gb < float(min_standard_gb) or req_sum > float(request_threshold):
+    pct = _tiering_pct_default()
+    for bucket, info in inv.items():
+        lc = info.get("lifecycle") or {}
+        count = int(lc.get("count") or 0)
+        to_ia = bool(lc.get("has_ia_transition"))
+        to_gl = bool(lc.get("has_glacier_transition"))
+        if count <= 0 or to_ia or to_gl:
             continue
 
-        est_cost = std_gb * price_std
-        potential = std_gb * max(0.0, price_std - price_ia) * float(conservative_ratio)
+        region = str(info.get("region") or "")
+        tags = info.get("tags") or {}
+        app_id, app, env = _tag_triplet(tags)
 
-        signals = _signals_str(
-            {
-                "Region": cw_region,
-                "Bucket": bname,
-                "CreatedAt": _to_utc_iso(created),
-                "StandardGB": round(std_gb, 3),
-                "AllRequestsSum": int(req_sum),
-                "LookbackDays": lookback_days,
-                "ConservativeRatio": conservative_ratio,
-            }
+        sizes = cw_data.get(bucket, {})
+        by_class = sizes.get("bytes", {}) if isinstance(sizes, dict) else {}
+        objects = sizes.get("objects") if isinstance(sizes, dict) else None
+
+        est = _storage_monthly_cost(by_class) if by_class else 0.0
+        pot = _potential_tiering_saving(by_class, pct) if by_class else 0.0
+
+        signals = {
+            "Region": region,
+            "Bucket": bucket,
+            "LifecycleRules": count,
+            "HasIATransition": False,
+            "HasGlacierTransition": False,
+            "Objects": objects if objects is not None else "NULL",
+            "SizeGB": round(sum(_gb(v) for v in by_class.values()), 3) if by_class else "NULL",
+            "TieringPctHeuristic": pct,
+            "TagAppId": app_id,
+            "TagApp": app,
+            "TagEnv": env,
+        }
+        _write_row_bucket(
+            writer,
+            bucket,
+            region,
+            flags=["S3NoIATieringTransitions"],
+            signals_extra=signals,
+            logger=log,
+            estimated_cost=est,
+            potential_saving=pot,
         )
+        log.info(f"[s3] Wrote IA tiering candidate: {bucket}")
 
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=bname,
-                name=bname,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="S3Bucket",
-                estimated_cost=est_cost,
-                potential_saving=potential,
-                flags=["S3BucketIATieringCandidate"],
-                confidence=100,
-                signals=signals,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_s3_ia_tiering_candidates] write_row %s: %s", bname, exc)
+# ---------------------- Stale multipart uploads (age) --------------------- #
 
-        log.info("[check_s3_ia_tiering_candidates] Wrote: %s", bname)
+def _list_stale_multipart_uploads(
+    s3,
+    bucket: str,
+    stale_days: int,
+    log: logging.Logger,
+) -> Tuple[int, Optional[int]]:
+    key_marker: Optional[str] = None
+    upload_id_marker: Optional[str] = None
+    count = 0
+    oldest_days: Optional[int] = None
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
 
+    try:
+        while True:
+            params: Dict[str, Any] = {"Bucket": bucket, "MaxUploads": 1000}
+            if key_marker:
+                params["KeyMarker"] = key_marker
+            if upload_id_marker:
+                params["UploadIdMarker"] = upload_id_marker
 
-# ---------------- 7) Stale multipart uploads (storage leak) -------------- #
+            resp = s3.list_multipart_uploads(**params) or {}
+            uploads = resp.get("Uploads", []) or []
+            for up in uploads:
+                dt = up.get("Initiated")
+                if not isinstance(dt, datetime):
+                    continue
+                dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                age_days = int((now_utc - dt).total_seconds() // 86400)
+                if age_days >= int(stale_days):
+                    count += 1
+                    oldest_days = age_days if oldest_days is None else max(oldest_days, age_days)
+
+            if not resp.get("IsTruncated"):
+                break
+            key_marker = resp.get("NextKeyMarker")
+            upload_id_marker = resp.get("NextUploadIdMarker")
+    except ClientError as exc:
+        log.debug(f"[s3] list_multipart_uploads {bucket} failed: {exc}")
+        return 0, None
+
+    return count, oldest_days
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_s3_stale_multipart_uploads(  # pylint: disable=unused-argument
@@ -766,87 +741,144 @@ def check_s3_stale_multipart_uploads(  # pylint: disable=unused-argument
     stale_days: int = 7,
     **kwargs,
 ) -> None:
-    """
-    Flag buckets with multipart uploads initiated before 'stale_days' and not
-    completed. Size is unknown via ListMultipartUploads, so we report counts.
-    """
+    """Flag buckets with multipart uploads older than 'stale_days'."""
     log = _logger(kwargs.get("logger") or logger)
-
     try:
-        writer, s3, cloudwatch = _extract_writer_s3_cw(args, kwargs)  # cloudwatch unused
+        writer, s3 = _extract_writer_s3(args, kwargs)
     except TypeError as exc:
-        log.warning("[check_s3_stale_multipart_uploads] Skipping: %s", exc)
+        log.warning(f"[check_s3_stale_multipart_uploads] Skipping: {exc}")
         return
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_s3_stale_multipart_uploads] Skipping: checker config.")
+        log.warning("[check_s3_stale_multipart_uploads] Skipping: checker config not provided.")
         return
 
-    cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or ""
-    buckets = _list_buckets_in_region(s3, cw_region, log)
-    if not buckets:
-        return
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=stale_days)
-
-    for bname, created in buckets:
-        key_marker = None
-        upload_marker = None
-        stale_count = 0
-
-        while True:
-            try:
-                params: Dict[str, Any] = {"Bucket": bname}
-                if key_marker:
-                    params["KeyMarker"] = key_marker
-                if upload_marker:
-                    params["UploadIdMarker"] = upload_marker
-                resp = s3.list_multipart_uploads(**params)
-            except ClientError as exc:
-                code = exc.response.get("Error", {}).get("Code")
-                if code in {"NoSuchUpload", "NoSuchBucket"}:
-                    break
-                log.debug("[s3] list_multipart_uploads %s: %s", bname, exc)
-                break
-
-            uploads = resp.get("Uploads", []) or []
-            for up in uploads:
-                init = up.get("Initiated")
-                if isinstance(init, datetime):
-                    init_utc = init if init.tzinfo else init.replace(tzinfo=timezone.utc)
-                    if init_utc < cutoff:
-                        stale_count += 1
-
-            if not resp.get("IsTruncated"):
-                break
-            key_marker = resp.get("NextKeyMarker")
-            upload_marker = resp.get("NextUploadIdMarker")
-
-        if stale_count <= 0:
+    inv = _build_inventory(s3, log)
+    for bucket, info in inv.items():
+        cnt, oldest = _list_stale_multipart_uploads(s3, bucket, int(stale_days), log)
+        if cnt <= 0:
             continue
 
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=bname,
-                name=bname,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="S3Bucket",
-                estimated_cost=0.0,
-                potential_saving=0.0,
-                flags=["S3BucketStaleMultipartUploads"],
-                confidence=100,
-                signals=_signals_str(
-                    {
-                        "Region": cw_region,
-                        "Bucket": bname,
-                        "CreatedAt": _to_utc_iso(created),
-                        "StaleUploads": stale_count,
-                        "StaleDays": stale_days,
-                    }
-                ),
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_s3_stale_multipart_uploads] write_row %s: %s", bname, exc)
+        lc = info.get("lifecycle") or {}
+        abort_days = lc.get("abort_incomplete_days")
+        has_abort = isinstance(abort_days, int)
 
-        log.info("[check_s3_stale_multipart_uploads] Wrote: %s (%d stale)", bname, stale_count)
+        region = str(info.get("region") or "")
+        tags = info.get("tags") or {}
+        app_id, app, env = _tag_triplet(tags)
+
+        flags = ["S3StaleMultipartUploads"]
+        if not has_abort:
+            flags.append("S3NoAbortIncompleteMultipartUpload")
+
+        signals = {
+            "Region": region,
+            "Bucket": bucket,
+            "StaleMultipartCount": cnt,
+            "OldestAgeDays": oldest if oldest is not None else "NULL",
+            "AbortIncompleteDays": abort_days if has_abort else "NULL",
+            "LookbackDays": int(stale_days),
+            "TagAppId": app_id,
+            "TagApp": app,
+            "TagEnv": env,
+        }
+        _write_row_bucket(
+            writer,
+            bucket,
+            region,
+            flags=flags,
+            signals_extra=signals,
+            logger=log,
+        )
+        log.info(f"[s3] Wrote stale multipart uploads: {bucket} (count={cnt})")
+
+# --------------------------- Empty bucket checker ------------------------- #
+
+def _bucket_is_empty_via_list(
+    s3, bucket: str, versioning: bool, log: logging.Logger
+) -> bool:
+    try:
+        r = s3.list_objects_v2(Bucket=bucket, MaxKeys=1) or {}
+        if int(r.get("KeyCount") or 0) > 0:
+            return False
+    except ClientError as exc:
+        log.debug(f"[s3] list_objects_v2 {bucket} failed: {exc}")
+        return False
+    if not versioning:
+        return True
+    try:
+        rv = s3.list_object_versions(Bucket=bucket, MaxKeys=1) or {}
+        vers = len(rv.get("Versions", []) or [])
+        dels = len(rv.get("DeleteMarkers", []) or [])
+        return (vers + dels) == 0
+    except ClientError as exc:
+        log.debug(f"[s3] list_object_versions {bucket} failed: {exc}")
+        return False
+
+@retry_with_backoff(exceptions=(ClientError,))
+def check_s3_empty_buckets(  # pylint: disable=unused-argument
+    *args,
+    logger: Optional[logging.Logger] = None,
+    **kwargs,
+) -> None:
+    """
+    Flag buckets with zero objects (and zero versions for versioned buckets).
+    If a CloudWatch client is provided (matching bucket region), include size/objects
+    and estimated storage cost (usually 0 for empty).
+    """
+    log = _logger(kwargs.get("logger") or logger)
+    try:
+        writer, s3, cloudwatch = _extract_writer_s3_cw(args, kwargs)
+    except TypeError as exc:
+        log.warning(f"[check_s3_empty_buckets] Skipping: {exc}")
+        return
+    if not (config.ACCOUNT_ID and config.WRITE_ROW):
+        log.warning("[check_s3_empty_buckets] Skipping: checker config not provided.")
+        return
+
+    inv = _build_inventory(s3, log)
+    # Emptiness detection by direct list (fast & definitive), CW only for enrichment
+    to_check_by_region: Dict[str, List[str]] = {}
+    empty_buckets: List[str] = []
+    for bucket, info in inv.items():
+        region = str(info.get("region") or "")
+        versioning = bool(info.get("versioning"))
+        if _bucket_is_empty_via_list(s3, bucket, versioning, log):
+            empty_buckets.append(bucket)
+            to_check_by_region.setdefault(region, []).append(bucket)
+
+    now_utc = datetime.now(timezone.utc)
+    cw_data: Dict[str, Dict[str, Any]] = {}
+    for region, buckets in to_check_by_region.items():
+        cw_data.update(_cw_sizes_for_region(cloudwatch, region, buckets, now_utc, log))
+
+    for bucket in empty_buckets:
+        info = inv.get(bucket) or {}
+        region = str(info.get("region") or "")
+        tags = info.get("tags") or {}
+        app_id, app, env = _tag_triplet(tags)
+
+        sizes = cw_data.get(bucket, {})
+        by_class = sizes.get("bytes", {}) if isinstance(sizes, dict) else {}
+        objects = sizes.get("objects") if isinstance(sizes, dict) else None
+        est = _storage_monthly_cost(by_class) if by_class else 0.0
+
+        signals = {
+            "Region": region,
+            "Bucket": bucket,
+            "Objects": objects if objects is not None else "NULL",
+            "SizeGB": round(sum(_gb(v) for v in by_class.values()), 3) if by_class else "NULL",
+            "TagAppId": app_id,
+            "TagApp": app,
+            "TagEnv": env,
+        }
+        _write_row_bucket(
+            writer,
+            bucket,
+            region,
+            flags=["S3BucketEmpty"],
+            signals_extra=signals,
+            logger=log,
+            estimated_cost=est,
+            potential_saving=0.0,
+        )
+        log.info(f"[s3] Wrote empty bucket: {bucket}")
