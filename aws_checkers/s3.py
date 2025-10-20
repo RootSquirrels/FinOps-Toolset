@@ -439,7 +439,7 @@ def check_s3_versioned_without_lifecycle(  # pylint: disable=unused-argument
                 flags=["S3BucketVersionedNoLifecycle"],
                 confidence=100,
                 signals=_signals_str(
-                    {"Region": cw_region, "Bucket": bname, "CreatedAt": _to_utc_iso(created)}
+                    {"Region": cw_region, "Bucket": bname, "CreatedAt": _to_utc_iso(created), "Versioned": "False"}
                 ),
             )
         except Exception as exc:  # pylint: disable=broad-except
