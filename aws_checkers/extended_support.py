@@ -34,39 +34,19 @@ Pricebook keys used (safe defaults if absent):
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
 
 from aws_checkers import config
+from aws_checkers.common import (
+    _logger,
+    _signals_str,
+)
 from core.retry import retry_with_backoff
 
 
 # -------------------------------- helpers -------------------------------- #
-
-def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
-    return fallback or config.LOGGER or logging.getLogger(__name__)
-
-
-def _signals_str(pairs: Dict[str, object]) -> str:
-    items: List[str] = []
-    for k, v in pairs.items():
-        if v is None or v == "":
-            continue
-        items.append(f"{k}={v}")
-    return "|".join(items)
-
-
-def _to_utc_iso(dt_obj: Optional[datetime]) -> Optional[str]:
-    if not isinstance(dt_obj, datetime):
-        return None
-    if dt_obj.tzinfo is None:
-        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
-    else:
-        dt_obj = dt_obj.astimezone(timezone.utc)
-    return dt_obj.replace(microsecond=0).isoformat()
-
 
 def _extract_writer_rds(
     args: Tuple[Any, ...],

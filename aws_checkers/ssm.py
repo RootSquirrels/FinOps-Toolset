@@ -27,6 +27,9 @@ from botocore.exceptions import ClientError
 
 from core.retry import retry_with_backoff
 from aws_checkers import config
+from aws_checkers.common import (
+    _logger,
+)
 
 
 def _require_config() -> None:
@@ -37,12 +40,6 @@ def _require_config() -> None:
             "finops_toolset.checkers.config.setup(account_id=..., write_row=..., "
             "get_price=..., logger=...) first."
         )
-
-
-def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
-    """Return an appropriate logger."""
-    return fallback or config.LOGGER or logging.getLogger(__name__)
-
 
 def _to_utc(dt_obj: datetime) -> datetime:
     """Return a timezone-aware UTC datetime for comparison."""

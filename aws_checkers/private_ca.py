@@ -11,25 +11,14 @@ Enumerates Private Certificate Authorities and writes findings to CSV including:
 from __future__ import annotations
 import logging
 from typing import Optional, Callable, Any, List
-from datetime import datetime, timezone
 
 from botocore.exceptions import ClientError
 from core.retry import retry_with_backoff
 from aws_checkers import config
-
-
-def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
-    return fallback or config.LOGGER or logging.getLogger(__name__)
-
-
-def _to_utc_iso(dt_obj: Optional[datetime]) -> Optional[str]:
-    if not isinstance(dt_obj, datetime):
-        return None
-    if dt_obj.tzinfo is None:
-        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
-    else:
-        dt_obj = dt_obj.astimezone(timezone.utc)
-    return dt_obj.replace(microsecond=0).isoformat()
+from aws_checkers.common import (
+    _logger,
+    _to_utc_iso,
+)
 
 
 @retry_with_backoff(exceptions=(ClientError,))

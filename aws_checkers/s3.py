@@ -21,6 +21,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from botocore.exceptions import ClientError
 
 from aws_checkers import config
+from aws_checkers.common import (
+    _logger,
+    _signals_str,
+)
 from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher
 
@@ -58,17 +62,6 @@ def _tiering_pct_no_lifecycle_default() -> float:
     return float(config.safe_price("S3", "NO_LIFECYCLE_TIERING_PCT", 0.15))
 
 # -------------------------------- helpers -------------------------------- #
-
-def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
-    return fallback or config.LOGGER or logging.getLogger(__name__)
-
-def _signals_str(pairs: Dict[str, object]) -> str:
-    items: List[str] = []
-    for k, v in pairs.items():
-        if v is None or v == "":
-            continue
-        items.append(f"{k}={v}")
-    return "|".join(items)
 
 def _nonnull_tag(val: Optional[str]) -> str:
     return "NULL" if not val else val
