@@ -38,6 +38,30 @@ from core.cloudwatch import CloudWatchBatcher
 
 # -------------------------------- helpers -------------------------------- #
 
+def _get_bucket_tags_dict(s3_client, bucket_name: str) -> tuple[dict, str]:
+    """
+    Returns (tags_kv, tags_string). Handles buckets without tags gracefully.
+    """
+    try:
+        resp = s3_client.get_bucket_tagging(Bucket=bucket_name)
+        tagset = resp.get("TagSet", [])
+        tags_kv = {t.get("Key", ""): t.get("Value", "") for t in tagset}
+        tag_string = ";".join(f"{t.get('Key','')}={t.get('Value','')}" for t in tagset)
+        return tags_kv, tag_string
+    except ClientError as e:
+        # No tags on the bucket — this is common and not an error.
+        code = e.response.get("Error", {}).get("Code")
+        if code in ("NoSuchTagSet", "NoSuchTagSetError"):
+            return {}, ""
+        # Some regions/bucket types can raise InvalidRequest for unsupported features.
+        if code in ("InvalidRequest",):
+            return {}, ""
+        # Anything else should be visible in logs but shouldn't break the scan.
+        # You likely already have a logger in the toolset; adjust as needed.
+        # logger.warning("get_bucket_tagging failed for %s: %s", bucket_name, e)
+        return {}, ""
+
+
 def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
 
@@ -489,6 +513,16 @@ def check_s3_buckets_without_lifecycle(  # pylint: disable=unused-argument
         if has_lc:
             continue
 
+        
+        # NEW: fetch bucket tags (safe no-op when none)
+        tags_kv, tags_str = _get_bucket_tags_dict(s3_client, bucket_name)
+
+        # Map common owner taxonomy into normalized columns (keep your keys as you use them)
+        application_id = tags_kv.get("ApplicationID") or tags_kv.get("app_id") or ""
+        application    = tags_kv.get("Application")   or tags_kv.get("app")    or ""
+        environment    = tags_kv.get("Environment")   or tags_kv.get("env")    or ""
+
+
         try:
             # type: ignore[call-arg]
             config.WRITE_ROW(
@@ -499,6 +533,9 @@ def check_s3_buckets_without_lifecycle(  # pylint: disable=unused-argument
                 resource_type="S3Bucket",
                 estimated_cost=0.0,
                 potential_saving=0.0,
+                ApplicationID=application_id,
+                Environment=environment,
+                Application=application,
                 flags=["S3BucketNoLifecycle"],
                 confidence=100,
                 signals=_signals_str(
