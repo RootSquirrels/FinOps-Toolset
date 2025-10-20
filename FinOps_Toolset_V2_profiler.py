@@ -692,18 +692,18 @@ def main():
                         ecr_checks.check_ecr_stale_or_untagged_images,
                         writer=writer, ecr=clients["ecr"])
 
-                run_check(profiler, "check_ebs_snapshots_unreferenced",
-                          region, ebs_checks.check_ebs_snapshots_unreferenced, writer=writer,
+                run_check(profiler, "check_ebs_orphan_snapshots",
+                          region, ebs_checks.check_ebs_orphan_snapshots, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
 
-                run_check(profiler, "check_ebs_snapshots_old",
-                          region, ebs_checks.check_ebs_snapshots_old, writer=writer,
+                run_check(profiler, "check_ebs_snapshot_stale",
+                          region, ebs_checks.check_ebs_snapshot_stale, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
-                
+
                 run_check(profiler, "check_ebs_snapshots_public_or_shared",
                           region, ebs_checks.check_ebs_snapshots_public_or_shared, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
-                
+
                 run_check(profiler, "check_ebs_volumes_low_utilization",
                           region, ebs_checks.check_ebs_volumes_low_utilization, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
@@ -711,11 +711,11 @@ def main():
                 run_check(profiler, "check_ebs_unencrypted_volumes", region,
                           ebs_checks.check_ebs_unencrypted_volumes, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
-                
-                run_check(profiler, "check_ebs_gp2_to_gp3_candidates", region,
-                          ebs_checks.check_ebs_gp2_to_gp3_candidates, writer=writer,
+
+                run_check(profiler, "check_ebs_gp2_not_gp3", region,
+                          ebs_checks.check_ebs_gp2_not_gp3, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
-                
+
                 run_check(profiler, "check_ebs_unattached_volumes", region,
                           ebs_checks.check_ebs_unattached_volumes, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])

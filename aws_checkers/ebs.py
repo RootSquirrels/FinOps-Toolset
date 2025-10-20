@@ -1,12 +1,14 @@
-"""Checkers: Amazon EBS — volumes & snapshots (fast, tagged, no duplicates).
+"""AWS Checkers: EBS — volumes & snapshots (fast, cached, pylint-friendly).
 
-Highlights
-- Single-pass inventories for volumes, snapshots, and AMI-used snapshots (per EC2 client).
-- Concurrent snapshot attribute fetch for PUBLIC/SHARED detection (bounded pool).
-- Tag enrichment via CSV columns: app_id / app / env (NOT in Signals).
-- f-strings, ≤100 chars/line, pylint-friendly.
-- No-regression: legacy checker name aliases preserved.
+Goals
+- Keep all existing checks; no feature additions.
+- Make 'public/shared snapshots' fast via bounded, adaptive concurrency.
+- Avoid redundant AWS calls with per-client inventories cached by id(client).
+- Write tags into CSV columns (app_id/app/env), not into signals.
+- Use lazy logger formatting (no f-strings in logs) to satisfy pylint.
+- Lines kept ≤100 chars.
 
+Relies on shared helpers from aws_checkers.common to avoid duplication.
 """
 
 from __future__ import annotations
@@ -21,22 +23,26 @@ from botocore.exceptions import ClientError
 from aws_checkers import config
 from aws_checkers.common import (
     _logger,
+    _to_utc_iso,
+    tags_to_dict,
     tag_triplet,
+    _safe_workers,
+    iter_chunks,
     _write_row,
-    tags_to_dict
 )
 from core.retry import retry_with_backoff
-from core.cloudwatch import CloudWatchBatcher 
+from core.cloudwatch import CloudWatchBatcher
 
 
-# ------------------------------- module state ------------------------------ #
+# ------------------------------- module caches ------------------------------ #
 
 _VOL_INV: Dict[int, List[Dict[str, Any]]] = {}
 _SNAP_INV: Dict[int, List[Dict[str, Any]]] = {}
 _AMI_SNAP_IDS: Dict[int, Set[str]] = {}
+_SNAP_ATTRS: Dict[int, Dict[str, List[Dict[str, Any]]]] = {}  # client_id -> {sid: perms}
 
 
-# ------------------------------- price helpers ----------------------------- #
+# ------------------------------ pricing helpers ---------------------------- #
 
 def _p(service: str, key: str, default: float) -> float:
     return float(config.safe_price(service, key, default))
@@ -55,13 +61,11 @@ _EBS_GB_MONTH: Dict[str, float] = {
 _SNAPSHOT_GB_MONTH = _p("EBS", "SNAPSHOT_GB_MONTH", 0.05)
 
 
-# ------------------------------- tiny helpers ------------------------------ #
+# -------------------------------- tiny helpers ----------------------------- #
 
-def _iso(dt: Optional[datetime]) -> str:
-    if not isinstance(dt, datetime):
-        return ""
-    d = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    return d.replace(microsecond=0).isoformat()
+def _iso(dt_obj: Optional[datetime]) -> str:
+    val = _to_utc_iso(dt_obj)
+    return "" if val is None else val
 
 
 def _extract_writer_ec2(
@@ -71,7 +75,9 @@ def _extract_writer_ec2(
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
     ec2 = kwargs.get("ec2", args[1] if len(args) >= 2 else None)
     if writer is None or ec2 is None:
-        raise TypeError(f"Expected 'writer' and 'ec2' (got writer={writer!r}, ec2={ec2!r})")
+        raise TypeError(
+            f"Expected 'writer' and 'ec2' (got writer={writer!r}, ec2={ec2!r})"
+        )
     return writer, ec2
 
 
@@ -87,10 +93,11 @@ def _extract_writer_ec2_cw(
 # ------------------------------- inventories ------------------------------- #
 
 @retry_with_backoff(exceptions=(ClientError,))
-def _inventory_volumes(ec2, log: logging.Logger) -> List[Dict[str, Any]]:
+def _ensure_volumes(ec2, log: logging.Logger) -> List[Dict[str, Any]]:
     key = id(ec2)
     if key in _VOL_INV:
         return _VOL_INV[key]
+
     vols: List[Dict[str, Any]] = []
     try:
         paginator = ec2.get_paginator("describe_volumes")
@@ -112,16 +119,19 @@ def _inventory_volumes(ec2, log: logging.Logger) -> List[Dict[str, Any]]:
                     }
                 )
     except ClientError as exc:
-        log.error(f"[ebs] describe_volumes failed: {exc}")
+        log.error("[ebs] describe_volumes failed: %s", exc)
+
     _VOL_INV[key] = vols
     return vols
 
 
 @retry_with_backoff(exceptions=(ClientError,))
-def _inventory_snapshots(ec2, log: logging.Logger) -> List[Dict[str, Any]]:
+def _ensure_snapshots(ec2, log: logging.Logger) -> List[Dict[str, Any]]:
+    """One-time, per-client snapshot inventory (your snapshots only)."""
     key = id(ec2)
     if key in _SNAP_INV:
         return _SNAP_INV[key]
+
     snaps: List[Dict[str, Any]] = []
     try:
         paginator = ec2.get_paginator("describe_snapshots")
@@ -142,16 +152,18 @@ def _inventory_snapshots(ec2, log: logging.Logger) -> List[Dict[str, Any]]:
                     }
                 )
     except ClientError as exc:
-        log.error(f"[ebs] describe_snapshots failed: {exc}")
+        log.error("[ebs] describe_snapshots failed: %s", exc)
+
     _SNAP_INV[key] = snaps
     return snaps
 
 
 @retry_with_backoff(exceptions=(ClientError,))
-def _ami_snapshot_ids(ec2, log: logging.Logger) -> Set[str]:
+def _ensure_ami_snapshot_ids(ec2, log: logging.Logger) -> Set[str]:
     key = id(ec2)
     if key in _AMI_SNAP_IDS:
         return _AMI_SNAP_IDS[key]
+
     used: Set[str] = set()
     try:
         paginator = ec2.get_paginator("describe_images")
@@ -163,9 +175,53 @@ def _ami_snapshot_ids(ec2, log: logging.Logger) -> Set[str]:
                     if sid:
                         used.add(str(sid))
     except ClientError as exc:
-        log.error(f"[ebs] describe_images failed: {exc}")
+        log.error("[ebs] describe_images failed: %s", exc)
+
     _AMI_SNAP_IDS[key] = used
     return used
+
+
+# ------------------- snapshot attributes (concurrent, cached) -------------- #
+
+@retry_with_backoff(exceptions=(ClientError,))
+def _get_cvperm(ec2, snapshot_id: str) -> List[Dict[str, Any]]:
+    r = ec2.describe_snapshot_attribute(
+        SnapshotId=snapshot_id, Attribute="createVolumePermission"
+    )
+    return r.get("CreateVolumePermissions", []) or []
+
+
+def _ensure_snapshot_attrs(
+    ec2,
+    snapshot_ids: List[str],
+    log: logging.Logger,
+    max_workers: Optional[int],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Fetch snapshot permissions concurrently, with per-client caching."""
+    key = id(ec2)
+    cache = _SNAP_ATTRS.setdefault(key, {})
+    needed = [sid for sid in snapshot_ids if sid not in cache]
+    if not needed:
+        return cache
+
+    workers = _safe_workers(ec2, max_workers)
+    chunk = max(1, workers * 8)
+
+    for ids in iter_chunks(needed, chunk):
+        with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_get_cvperm, ec2, sid): sid for sid in ids}
+            for fut in cf.as_completed(futs):
+                sid = futs[fut]
+                try:
+                    cache[sid] = list(fut.result())
+                except ClientError as exc:
+                    log.debug("[ebs] attr %s failed: %s", sid, exc)
+                    cache[sid] = []
+                except Exception as exc:  # pylint: disable=broad-except
+                    log.debug("[ebs] attr worker %s error: %s", sid, exc)
+                    cache[sid] = []
+
+    return cache
 
 
 # ----------------------------- cost estimators ----------------------------- #
@@ -189,41 +245,7 @@ def _snapshot_monthly_cost_guesstimate(snap: Dict[str, Any]) -> float:
     return size * _SNAPSHOT_GB_MONTH
 
 
-# ------------------- snapshot attributes (concurrent) --------------------- #
-
-@retry_with_backoff(exceptions=(ClientError,))
-def _get_cvperm(ec2, snapshot_id: str) -> List[Dict[str, Any]]:
-    r = ec2.describe_snapshot_attribute(
-        SnapshotId=snapshot_id, Attribute="createVolumePermission"
-    )
-    return r.get("CreateVolumePermissions", []) or []
-
-
-def _fetch_attrs_concurrent(
-    ec2,
-    snapshot_ids: List[str],
-    log: logging.Logger,
-    max_workers: int,
-) -> Dict[str, List[Dict[str, Any]]]:
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    if not snapshot_ids:
-        return out
-    with cf.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futs = {pool.submit(_get_cvperm, ec2, sid): sid for sid in snapshot_ids}
-        for fut in cf.as_completed(futs):
-            sid = futs[fut]
-            try:
-                out[sid] = list(fut.result())
-            except ClientError as exc:
-                log.debug(f"[ebs] attribute fetch {sid} failed: {exc}")
-                out[sid] = []
-            except Exception as exc:  # pylint: disable=broad-except
-                log.debug(f"[ebs] attribute worker {sid} error: {exc}")
-                out[sid] = []
-    return out
-
-
-# -------------------------------- checkers -------------------------------- #
+# --------------------------------- checks --------------------------------- #
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ebs_unattached_volumes(  # pylint: disable=unused-argument
@@ -236,24 +258,25 @@ def check_ebs_unattached_volumes(  # pylint: disable=unused-argument
     try:
         writer, ec2 = _extract_writer_ec2(args, kwargs)
     except TypeError as exc:
-        log.warning(f"[check_ebs_unattached_volumes] Skipping: {exc}")
+        log.warning("[check_ebs_unattached_volumes] Skipping: %s", exc)
         return
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_unattached_volumes] Skipping: checker config not provided.")
+        log.warning("[check_ebs_unattached_volumes] Skipping: config not provided.")
         return
 
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    for v in _inventory_volumes(ec2, log):
+    for v in _ensure_volumes(ec2, log):
         if str(v.get("State")) != "available":
             continue
         tags = tags_to_dict(v.get("Tags"))
         app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
+
         _write_row(
             writer=writer,
             resource_id=str(v.get("VolumeId")),
-            resource_type="EBSVolume",
             name=str(v.get("VolumeId")),
+            resource_type="EBSVolume",
             region=region,
             flags=["EBSUnattachedVolume"],
             estimated_cost=est,
@@ -272,11 +295,12 @@ def check_ebs_unattached_volumes(  # pylint: disable=unused-argument
             app=app,
             env=env,
         )
-        log.info(f"[ebs] Wrote unattached volume: {v.get('VolumeId')}")
+
+    log.info("[ebs] Completed check_ebs_unattached_volumes")
 
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_gp2_to_gp3_candidates(  # pylint: disable=unused-argument
+def check_ebs_gp2_not_gp3(  # pylint: disable=unused-argument
     *args,
     logger: Optional[logging.Logger] = None,
     **kwargs,
@@ -286,25 +310,26 @@ def check_ebs_gp2_to_gp3_candidates(  # pylint: disable=unused-argument
     try:
         writer, ec2 = _extract_writer_ec2(args, kwargs)
     except TypeError as exc:
-        log.warning(f"[check_ebs_gp2_to_gp3_candidates] Skipping: {exc}")
+        log.warning("[check_ebs_gp2_not_gp3] Skipping: %s", exc)
         return
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_gp2_to_gp3_candidates] Skipping: checker config not provided.")
+        log.warning("[check_ebs_gp2_not_gp3] Skipping: config not provided.")
         return
 
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    for v in _inventory_volumes(ec2, log):
+    for v in _ensure_volumes(ec2, log):
         if str(v.get("VolumeType")).lower() != "gp2":
             continue
         tags = tags_to_dict(v.get("Tags"))
         app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
         pot = _gp2_to_gp3_saving(v)
+
         _write_row(
             writer=writer,
             resource_id=str(v.get("VolumeId")),
-            resource_type="EBSVolume",
             name=str(v.get("VolumeId")),
+            resource_type="EBSVolume",
             region=region,
             flags=["EBSGp2ToGp3Candidate"],
             estimated_cost=est,
@@ -326,8 +351,8 @@ def check_ebs_gp2_to_gp3_candidates(  # pylint: disable=unused-argument
             app=app,
             env=env,
         )
-        log.info(f"[ebs] Wrote gp2→gp3 candidate: {v.get('VolumeId')}")
 
+    log.info("[ebs] Completed check_ebs_gp2_not_gp3")
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ebs_unencrypted_volumes(  # pylint: disable=unused-argument
@@ -340,33 +365,30 @@ def check_ebs_unencrypted_volumes(  # pylint: disable=unused-argument
     try:
         writer, ec2 = _extract_writer_ec2(args, kwargs)
     except TypeError as exc:
-        log.warning(f"[check_ebs_unencrypted_volumes] Skipping: {exc}")
+        log.warning("[check_ebs_unencrypted_volumes] Skipping: %s", exc)
         return
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_unencrypted_volumes] Skipping: checker config not provided.")
+        log.warning("[check_ebs_unencrypted_volumes] Skipping: config not provided.")
         return
 
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    for v in _inventory_volumes(ec2, log):
+    for v in _ensure_volumes(ec2, log):
         if bool(v.get("Encrypted")):
             continue
         tags = tags_to_dict(v.get("Tags"))
         app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
+
         _write_row(
             writer=writer,
             resource_id=str(v.get("VolumeId")),
-            resource_type="EBSVolume",
             name=str(v.get("VolumeId")),
+            resource_type="EBSVolume",
             region=region,
             flags=["EBSVolumeUnencrypted"],
             estimated_cost=est,
             potential_saving=0.0,
-            signals={
-                "Region": region,
-                "Type": v.get("VolumeType"),
-                "AZ": v.get("AvailabilityZone"),
-            },
+            signals={"Region": region, "Type": v.get("VolumeType"), "AZ": v.get("AvailabilityZone")},
             logger=log,
             state=str(v.get("State") or ""),
             creation_date=_iso(v.get("CreateTime")),
@@ -375,7 +397,8 @@ def check_ebs_unencrypted_volumes(  # pylint: disable=unused-argument
             app=app,
             env=env,
         )
-        log.info(f"[ebs] Wrote unencrypted volume: {v.get('VolumeId')}")
+
+    log.info("[ebs] Completed check_ebs_unencrypted_volumes")
 
 
 @retry_with_backoff(exceptions=(ClientError,))
@@ -385,23 +408,24 @@ def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
     window_days: int = 7,
     **kwargs,
 ) -> None:
-    """Heuristic: flag volumes with very low I/O over the lookback window."""
+    """Heuristic: flag attached volumes with very low I/O in the lookback window."""
     log = _logger(kwargs.get("logger") or logger)
     try:
         writer, ec2, cw = _extract_writer_ec2_cw(args, kwargs)
     except TypeError as exc:
-        log.warning(f"[check_ebs_volumes_low_utilization] Skipping: {exc}")
+        log.warning("[check_ebs_volumes_low_utilization] Skipping: %s", exc)
         return
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_volumes_low_utilization] Skipping: checker config not provided.")
+        log.warning("[check_ebs_volumes_low_utilization] Skipping: config not provided.")
         return
     if CloudWatchBatcher is None or cw is None:
         log.debug("[ebs] CloudWatchBatcher unavailable; skipping low-util check.")
         return
 
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    vols = [v for v in _inventory_volumes(ec2, log) if str(v.get("State")) == "in-use"]
+    vols = [v for v in _ensure_volumes(ec2, log) if str(v.get("State")) == "in-use"]
     if not vols:
+        log.info("[ebs] No in-use volumes for low-utilization check")
         return
 
     start = datetime.now(timezone.utc) - timedelta(days=int(window_days))
@@ -424,31 +448,32 @@ def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
                 )
         results = batch.execute(start=start, end=end)
     except ClientError as exc:
-        log.debug(f"[ebs] CloudWatch metrics failed: {exc}")
+        log.debug("[ebs] CloudWatch metrics failed: %s", exc)
         return
     except Exception as exc:  # pylint: disable=broad-except
-        log.debug(f"[ebs] CloudWatch batch error: {exc}")
+        log.debug("[ebs] CloudWatch batch error: %s", exc)
         return
 
-    def _last_val(mid: str) -> float:
-        r = results.get(mid)
-        if isinstance(r, list) and r:
+    def _last(mid: str) -> float:
+        series = results.get(mid)
+        if isinstance(series, list) and series:
             try:
-                return float(r[-1][1])
+                return float(series[-1][1])
             except Exception:  # pylint: disable=broad-except
                 return 0.0
-        if isinstance(r, dict):
-            vals = r.get("Values") or []
+        if isinstance(series, dict):
+            vals = series.get("Values") or []
             return float(vals[-1]) if vals else 0.0
         return 0.0
 
     for v in vols:
         vid = str(v.get("VolumeId"))
-        rb = _last_val(f"VolumeReadBytes_{vid}")
-        wb = _last_val(f"VolumeWriteBytes_{vid}")
-        ro = _last_val(f"VolumeReadOps_{vid}")
-        wo = _last_val(f"VolumeWriteOps_{vid}")
+        rb = _last(f"VolumeReadBytes_{vid}")
+        wb = _last(f"VolumeWriteBytes_{vid}")
+        ro = _last(f"VolumeReadOps_{vid}")
+        wo = _last(f"VolumeWriteOps_{vid}")
 
+        # Very low across board (simple heuristic)
         if rb + wb > 5 * 1024 * 1024 or ro + wo > 10:
             continue
 
@@ -459,8 +484,8 @@ def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
         _write_row(
             writer=writer,
             resource_id=vid,
-            resource_type="EBSVolume",
             name=vid,
+            resource_type="EBSVolume",
             region=region,
             flags=["EBSLowUtilization"],
             estimated_cost=est,
@@ -481,14 +506,15 @@ def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
             app=app,
             env=env,
         )
-        log.info(f"[ebs] Wrote low-utilization volume: {vid}")
+
+    log.info("[ebs] Completed check_ebs_volumes_low_utilization")
 
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
     *args,
     logger: Optional[logging.Logger] = None,
-    max_workers: int = 12,
+    max_workers: Optional[int] = None,
     **kwargs,
 ) -> None:
     """Flag EBS snapshots that are PUBLIC or shared with other accounts."""
@@ -496,25 +522,28 @@ def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
     try:
         writer, ec2 = _extract_writer_ec2(args, kwargs)
     except TypeError as exc:
-        log.warning(f"[check_ebs_snapshots_public_or_shared] Skipping: {exc}")
+        log.warning("[check_ebs_snapshots_public_or_shared] Skipping: %s", exc)
         return
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
         log.warning("[check_ebs_snapshots_public_or_shared] Skipping: config not provided.")
         return
 
-    snaps = _inventory_snapshots(ec2, log)
-    if not snaps:
-        return
-    sid_list = [s["SnapshotId"] for s in snaps if s.get("SnapshotId")]
-    attrs = _fetch_attrs_concurrent(ec2, sid_list, log, int(max_workers))
-
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    for s in snaps:
-        sid = s.get("SnapshotId")
-        if not sid:
-            continue
+    snaps = _ensure_snapshots(ec2, log)
+    # Only completed snapshots with an id
+    subset = [s for s in snaps if s.get("SnapshotId") and s.get("State") == "completed"]
+    if not subset:
+        log.info("[ebs] No eligible snapshots for public/shared check")
+        return
+
+    sid_list = [str(s["SnapshotId"]) for s in subset]
+    attrs = _ensure_snapshot_attrs(ec2, sid_list, log, max_workers)
+
+    for s in subset:
+        sid = str(s["SnapshotId"])
         perms = attrs.get(sid, [])
-        is_public = any(p.get("Group") == "all" for p in perms)
+        # 'public' only makes sense for unencrypted snaps
+        is_public = (not bool(s.get("Encrypted"))) and any(p.get("Group") == "all" for p in perms)
         shared_to = [p.get("UserId") for p in perms if p.get("UserId")]
         shared_to = [x for x in shared_to if x and x != str(config.ACCOUNT_ID)]
         if not is_public and not shared_to:
@@ -533,9 +562,9 @@ def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
 
         _write_row(
             writer=writer,
-            resource_id=str(sid),
+            resource_id=sid,
+            name=sid,
             resource_type="EBSSnapshot",
-            name=str(sid),
             region=region,
             flags=flags,
             estimated_cost=0.0,
@@ -557,47 +586,47 @@ def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
             app=app,
             env=env,
         )
-        log.info(
-            f"[ebs] Wrote snapshot {sid} "
-            f"({'public' if is_public else 'shared'})"
-        )
+
+    log.info("[ebs] Completed check_ebs_snapshots_public_or_shared")
 
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_snapshots_old(  # pylint: disable=unused-argument
+def check_ebs_snapshot_stale(  # pylint: disable=unused-argument
     *args,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 90,
     **kwargs,
 ) -> None:
-    """Flag snapshots older than ``lookback_days``."""
+    """Flag snapshots older than `lookback_days`."""
     log = _logger(kwargs.get("logger") or logger)
     try:
         writer, ec2 = _extract_writer_ec2(args, kwargs)
     except TypeError as exc:
-        log.warning(f"[check_ebs_snapshots_old] Skipping: {exc}")
+        log.warning("[check_ebs_snapshot_stale] Skipping: %s", exc)
         return
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_snapshots_old] Skipping: checker config not provided.")
+        log.warning("[check_ebs_snapshot_stale] Skipping: config not provided.")
         return
 
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
     cutoff = datetime.now(timezone.utc) - timedelta(days=int(lookback_days))
-    for s in _inventory_snapshots(ec2, log):
+    for s in _ensure_snapshots(ec2, log):
         st = s.get("StartTime")
         if not isinstance(st, datetime):
             continue
         st = st if st.tzinfo else st.replace(tzinfo=timezone.utc)
         if st > cutoff:
             continue
+
         tags = tags_to_dict(s.get("Tags"))
         app_id, app, env = tag_triplet(tags)
         est = _snapshot_monthly_cost_guesstimate(s)
+
         _write_row(
             writer=writer,
             resource_id=str(s.get("SnapshotId")),
-            resource_type="EBSSnapshot",
             name=str(s.get("SnapshotId")),
+            resource_type="EBSSnapshot",
             region=region,
             flags=["EBSSnapshotOld"],
             estimated_cost=est,
@@ -615,11 +644,12 @@ def check_ebs_snapshots_old(  # pylint: disable=unused-argument
             app=app,
             env=env,
         )
-        log.info(f"[ebs] Wrote old snapshot: {s.get('SnapshotId')}")
+
+    log.info("[ebs] Completed check_ebs_snapshot_stale")
 
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_snapshots_unreferenced(  # pylint: disable=unused-argument
+def check_ebs_orphan_snapshots(  # pylint: disable=unused-argument
     *args,
     logger: Optional[logging.Logger] = None,
     **kwargs,
@@ -629,28 +659,31 @@ def check_ebs_snapshots_unreferenced(  # pylint: disable=unused-argument
     try:
         writer, ec2 = _extract_writer_ec2(args, kwargs)
     except TypeError as exc:
-        log.warning(f"[check_ebs_snapshots_unreferenced] Skipping: {exc}")
+        log.warning("[check_ebs_orphan_snapshots] Skipping: %s", exc)
         return
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_snapshots_unreferenced] Skipping: config not provided.")
+        log.warning("[check_ebs_orphan_snapshots] Skipping: config not provided.")
         return
 
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    used_ids = _ami_snapshot_ids(ec2, log)
-    for s in _inventory_snapshots(ec2, log):
+    used_ids = _ensure_ami_snapshot_ids(ec2, log)
+
+    for s in _ensure_snapshots(ec2, log):
         sid = str(s.get("SnapshotId"))
         if not sid or sid in used_ids:
             continue
+
         tags = tags_to_dict(s.get("Tags"))
         app_id, app, env = tag_triplet(tags)
         est = _snapshot_monthly_cost_guesstimate(s)
+
         _write_row(
             writer=writer,
             resource_id=sid,
-            resource_type="EBSSnapshot",
             name=sid,
+            resource_type="EBSSnapshot",
             region=region,
-            flags=["EBSSnapshotUnreferenced"],
+            flags=["EBSSnapshotOrphan"],
             estimated_cost=est,
             potential_saving=est,
             signals={"Region": region},
@@ -663,4 +696,5 @@ def check_ebs_snapshots_unreferenced(  # pylint: disable=unused-argument
             env=env,
             referenced_in="",
         )
-        log.info(f"[ebs] Wrote unreferenced snapshot: {sid}")
+
+    log.info("[ebs] Completed check_ebs_orphan_snapshots")
