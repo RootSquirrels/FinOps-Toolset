@@ -825,30 +825,17 @@ def main():
                           writer=writer, firehose=clients["firehose"],
                           cloudwatch=clients["cloudwatch"])
                 
-                run_check(profiler, "check_dynamodb_unused_tables", region,
-                          ddb_checks.check_dynamodb_unused_tables, writer=writer,
+                run_check(profiler, "check_dynamodb_tables_overprovisioned", region,
+                          ddb_checks.check_dynamodb_tables_overprovisioned, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_dynamodb_underutilized_provisioned", region,
-                          ddb_checks.check_dynamodb_underutilized_provisioned, writer=writer,
+                run_check(profiler, "check_dynamodb_tables_unused", region,
+                          ddb_checks.check_dynamodb_tables_unused, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_dynamodb_continuous_backups", region,
-                          ddb_checks.check_dynamodb_continuous_backups, writer=writer,
+                run_check(profiler, "check_dynamodb_tables_no_ttl", region,
+                          ddb_checks.check_dynamodb_tables_no_ttl, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_dynamodb_gsi_underutilized", region,
-                          ddb_checks.check_dynamodb_gsi_underutilized, writer=writer,
-                          dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_dynamodb_streams_enabled_no_consumers", region,
-                          ddb_checks.check_dynamodb_streams_enabled_no_consumers, writer=writer,
-                          dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"],
-                          dynamodbstreams=clients.get("dynamodbstreams"))
-                run_check(profiler, "check_dynamodb_ttl_disabled", region,
-                          ddb_checks.check_dynamodb_ttl_disabled, writer=writer,
-                          dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_dynamodb_table_class_mismatch", region,
-                          ddb_checks.check_dynamodb_table_class_mismatch, writer=writer,
-                          dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_dynamodb_global_tables_low_activity", region,
-                          ddb_checks.check_dynamodb_global_tables_low_activity, writer=writer,
+                run_check(profiler, "check_dynamodb_tables_no_pitr", region,
+                          ddb_checks.check_dynamodb_tables_no_pitr, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
                 
                 run_check(

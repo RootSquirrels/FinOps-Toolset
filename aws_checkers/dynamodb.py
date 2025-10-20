@@ -1,1001 +1,698 @@
-"""Checkers: Amazon DynamoDB.
+"""Checkers: Amazon DynamoDB — performance, cost signals, and hygiene.
 
-Contains:
-  - check_dynamodb_unused_tables
-  - check_dynamodb_underutilized_provisioned
-  - check_dynamodb_continuous_backups
-  - check_dynamodb_gsi_underutilized
-  - check_dynamodb_streams_enabled_no_consumers
-  - check_dynamodb_ttl_disabled
-  - check_dynamodb_table_class_mismatch
-  - check_dynamodb_global_tables_low_activity
+Highlights
+- Concurrent DescribeTable, ListTagsOfResource, and DescribeTimeToLive (adaptive workers).
+- CloudWatchBatcher metrics for consumed capacity (optional, region-aware).
+- Cost estimation (provisioned capacity + storage) and potential savings heuristics.
+- Tags go to CSV columns (app_id/app/env), not in signals.
+- f-strings, ≤100-char lines, pylint friendly. No redundant API calls.
 
-Design:
-  - Shared deps via finops_toolset.checkers.config.setup(...)
-  - CloudWatch via finops_toolset.cloudwatch.CloudWatchBatcher
-  - Tolerant signatures; graceful skips if clients/config missing
-  - Emits Flags, Signals (compact k=v), Estimated_Cost_USD, Potential_Saving_USD
-  - Timezone-aware (datetime.now(timezone.utc)), lazy %s logging
+CSV writer signature (from core):
+    writer: csv.writer,
+    resource_id: str,
+    name: str,
+    resource_type: str,
+    owner_id: str = "",
+    state: str = "",
+    creation_date: str = "",
+    storage_gb: Union[float, str] = 0.0,
+    estimated_cost: Union[float, str] = 0.0,
+    app_id: str = "",
+    app: str = "",
+    env: str = "",
+    referenced_in: str = "",
+    flags: Union[str, List[str]] = "",
+    object_count: Union[int, str, None] = "",
+    potential_saving: Union[float, str, None] = None,
+    confidence: Optional[int] = None,
+    signals: Union[str, Dict[str, Any], List[str], None] = None,
 """
 
 from __future__ import annotations
 
-import math
+import concurrent.futures as cf
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from math import ceil
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
 
 from aws_checkers import config
 from core.retry import retry_with_backoff
-from core.cloudwatch import CloudWatchBatcher
+from core.cloudwatch import CloudWatchBatcher  # type: ignore
 
 
-# ----------------------------- helpers --------------------------------- #
+# ------------------------------ pricing knobs ------------------------------ #
+
+def _p(service: str, key: str, default: float) -> float:
+    return float(config.safe_price(service, key, default))
+
+
+# Heuristic prices (defaults, region-agnostic). Override via pricing map if needed.
+# Provisioned capacity ($/unit-hour)
+_DDB_RCU_HR = _p("DDB", "RCU_PER_HOUR", 0.000065)   # ~ $0.065 per 1000 hours
+_DDB_WCU_HR = _p("DDB", "WCU_PER_HOUR", 0.00013)
+# On-demand ($/million requests)
+_DDB_OD_RCU_M = _p("DDB", "OD_RCU_PER_MILLION", 0.25)
+_DDB_OD_WCU_M = _p("DDB", "OD_WCU_PER_MILLION", 1.25)
+# Storage ($/GB-month)
+_DDB_STORAGE_GB_MO = _p("DDB", "STORAGE_GB_MONTH", 0.25)
+
+# Savings heuristics
+_UTIL_THRESHOLD = float(_p("DDB", "LOW_UTIL_THRESHOLD", 0.10))  # 10% avg util
+_HEADROOM = float(_p("DDB", "PROV_HEADROOM_FACTOR", 1.5))       # 50% headroom
+
+
+# ------------------------------- tiny helpers ------------------------------ #
 
 def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
 
 
+def _nonnull(s: Optional[str]) -> str:
+    return "NULL" if not s else s
+
+
 def _signals_str(pairs: Dict[str, object]) -> str:
-    items: List[str] = []
+    out: List[str] = []
     for k, v in pairs.items():
         if v is None or v == "":
             continue
-        items.append(f"{k}={v}")
-    return "|".join(items)
+        out.append(f"{k}={v}")
+    return " | ".join(out)
 
 
-def _to_utc_iso(dt_obj: Optional[datetime]) -> Optional[str]:
-    if not isinstance(dt_obj, datetime):
-        return None
-    if dt_obj.tzinfo is None:
-        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
-    else:
-        dt_obj = dt_obj.astimezone(timezone.utc)
-    return dt_obj.replace(microsecond=0).isoformat()
+def _iso(dt: Optional[datetime]) -> str:
+    if not isinstance(dt, datetime):
+        return ""
+    d = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return d.replace(microsecond=0).isoformat()
 
 
-def _sum_from_result(res: Any) -> float:
-    """Reduce CloudWatchBatcher result → sum of values; supports [(ts, val)] or {Values:[...] }."""
-    if res is None:
-        return 0.0
-    if isinstance(res, list) and res and isinstance(res[0], tuple):
-        try:
-            return float(sum(float(v) for _, v in res))
-        except Exception:  # pylint: disable=broad-except
-            return 0.0
-    if isinstance(res, dict):
-        values = res.get("Values") or res.get("values") or []
-        try:
-            return float(sum(values))
-        except Exception:  # pylint: disable=broad-except
-            return 0.0
-    return 0.0
+def _tags_to_dict(pairs: Optional[List[Dict[str, str]]]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for t in pairs or []:
+        k, v = t.get("Key"), t.get("Value")
+        if k:
+            out[str(k)] = "" if v is None else str(v)
+    return out
 
 
-def _max_from_result(res: Any) -> float:
-    """Reduce CloudWatchBatcher result → max value; supports [(ts, val)] or {Values:[...] }."""
-    if res is None:
-        return 0.0
-    if isinstance(res, list) and res and isinstance(res[0], tuple):
-        try:
-            return float(max(float(v) for _, v in res))
-        except Exception:  # pylint: disable=broad-except
-            return 0.0
-    if isinstance(res, dict):
-        values = res.get("Values") or res.get("values") or []
-        try:
-            return float(max(values)) if values else 0.0
-        except Exception:  # pylint: disable=broad-except
-            return 0.0
-    return 0.0
+def _pick_tag(tags: Dict[str, str], keys: Iterable[str]) -> Optional[str]:
+    low = {k.lower(): v for k, v in tags.items()}
+    for k in keys:
+        v = low.get(str(k).lower())
+        if v:
+            return v
+    return None
 
 
-def _extract_writer_ddb_cw(
-    args: Tuple[Any, ...],
-    kwargs: Dict[str, Any],
-) -> Tuple[Any, Any, Any]:
-    """Accept writer/dynamodb/cloudwatch passed positionally or by keyword; prefer keywords."""
-    writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    dynamodb = kwargs.get("dynamodb", args[1] if len(args) >= 2 else None)
-    cloudwatch = kwargs.get("cloudwatch", args[2] if len(args) >= 3 else None)
-    if writer is None or dynamodb is None or cloudwatch is None:
-        raise TypeError(
-            "Expected 'writer', 'dynamodb', and 'cloudwatch' "
-            f"(got writer={writer!r}, dynamodb={dynamodb!r}, cloudwatch={cloudwatch!r})"
+def _tag_triplet(tags: Dict[str, str]) -> Tuple[str, str, str]:
+    app_id = _pick_tag(tags, ["app_id", "application_id", "app-id"])
+    app = _pick_tag(tags, ["app", "application", "service"])
+    env = _pick_tag(tags, ["environment", "env", "stage"])
+    return _nonnull(app_id), _nonnull(app), _nonnull(env)
+
+
+def _pool_size(client) -> int:
+    try:
+        cfg = getattr(getattr(client, "meta", None), "config", None)
+        val = getattr(cfg, "max_pool_connections", 10)
+        return int(val) if val else 10
+    except Exception:  # pylint: disable=broad-except
+        return 10
+
+
+def _safe_workers(client, requested: Optional[int]) -> int:
+    pool = _pool_size(client)
+    target = requested if requested is not None else min(16, pool)
+    return max(2, min(int(target), max(1, pool - 2)))
+
+
+def _iter_chunks(items: List[str], n: int):
+    size = max(1, n)
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def _write_row(  # noqa: D401
+    *,
+    writer,
+    resource_id: str,
+    name: str,
+    region: str,
+    flags: List[str],
+    resource_type: str = "DynamoDBTable",
+    state: str = "",
+    creation_date: str = "",
+    storage_gb: float | str = 0.0,
+    object_count: int | str | None = "",
+    estimated_cost: float | str = 0.0,
+    potential_saving: float | str | None = None,
+    app_id: str = "NULL",
+    app: str = "NULL",
+    env: str = "NULL",
+    referenced_in: str = "",
+    signals: Dict[str, object] | None = None,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Write a normalized CSV row via toolset writer."""
+    log = _logger(logger)
+    try:
+        # type: ignore[call-arg]
+        config.WRITE_ROW(
+            writer=writer,
+            resource_id=resource_id,
+            name=name,
+            resource_type=resource_type,
+            owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
+            state=state,
+            creation_date=creation_date,
+            storage_gb=storage_gb,
+            estimated_cost=estimated_cost,
+            app_id=app_id,
+            app=app,
+            env=env,
+            referenced_in=referenced_in,
+            flags=flags,
+            object_count=object_count if object_count is not None else "",
+            potential_saving=potential_saving,
+            confidence=100,
+            signals=_signals_str(signals or {}),
         )
-    return writer, dynamodb, cloudwatch
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(f"[ddb] write_row failed for {resource_id}: {exc}")
 
 
+# ------------------------------- inventories ------------------------------- #
+
+@retry_with_backoff(exceptions=(ClientError,))
 def _list_tables(dynamodb, log: logging.Logger) -> List[str]:
     names: List[str] = []
     try:
-        last: Optional[str] = None
-        while True:
-            params: Dict[str, Any] = {}
-            if last:
-                params["ExclusiveStartTableName"] = last
-            resp = dynamodb.list_tables(**params)
-            for n in resp.get("TableNames", []) or []:
-                names.append(n)
-            last = resp.get("LastEvaluatedTableName")
-            if not last:
-                break
+        paginator = dynamodb.get_paginator("list_tables")
+        for page in paginator.paginate():
+            for n in page.get("TableNames", []) or []:
+                names.append(str(n))
     except ClientError as exc:
-        log.error("[dynamodb] list_tables failed: %s", exc)
+        log.error(f"[ddb] list_tables failed: {exc}")
     return names
 
 
-def _describe_table(dynamodb, name: str, log: logging.Logger) -> Dict[str, Any]:
-    try:
-        resp = dynamodb.describe_table(TableName=name)
-        return resp.get("Table", {}) or {}
-    except ClientError as exc:
-        log.debug("[dynamodb] describe_table failed for %s: %s", name, exc)
-        return {}
+@retry_with_backoff(exceptions=(ClientError,))
+def _describe_table(dynamodb, name: str) -> Dict[str, Any]:
+    return dynamodb.describe_table(TableName=name).get("Table", {})  # type: ignore
 
 
-def _pitr_status(dynamodb, name: str, log: logging.Logger) -> Dict[str, Any]:
-    """Best-effort PITR status via describe_continuous_backups."""
-    try:
-        resp = dynamodb.describe_continuous_backups(TableName=name)
-        return resp.get("ContinuousBackupsDescription", {}) or {}
-    except ClientError as exc:
-        log.debug("[dynamodb] describe_continuous_backups failed for %s: %s", name, exc)
-        return {}
+def _describe_tables_concurrent(
+    dynamodb, names: List[str], log: logging.Logger, max_workers: Optional[int]
+) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    if not names:
+        return out
+    workers = _safe_workers(dynamodb, max_workers)
+    # Keep in-flight bounded to avoid task storms on large fleets.
+    chunk_size = workers * 8
+    for chunk in _iter_chunks(names, chunk_size):
+        with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_describe_table, dynamodb, n): n for n in chunk}
+            for fut in cf.as_completed(futs):
+                n = futs[fut]
+                try:
+                    out[n] = dict(fut.result())
+                except ClientError as exc:
+                    log.debug(f"[ddb] describe_table {n} failed: {exc}")
+                except Exception as exc:  # pylint: disable=broad-except
+                    log.debug(f"[ddb] describe worker {n} error: {exc}")
+    return out
 
-
-def _table_storage_gb(table: Dict[str, Any]) -> float:
-    size_bytes = float(table.get("TableSizeBytes") or 0)
-    return max(0.0, size_bytes / (1024.0 ** 3))
-
-
-def _provisioned_monthly_cost(rcu: float, wcu: float) -> float:
-    """Heuristic monthly cost from provisioned capacity."""
-    price_rcu_hr = config.safe_price("DynamoDB", "PROV_RCU_HR", 0.00013)
-    price_wcu_hr = config.safe_price("DynamoDB", "PROV_WCU_HR", 0.00065)
-    hours = 730.0
-    return hours * (rcu * price_rcu_hr + wcu * price_wcu_hr)
-
-
-# ============================ 1) Unused tables ============================ #
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_dynamodb_unused_tables(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    lookback_days: int = 30,
-    **kwargs,
-) -> None:
-    """
-    Flag tables whose Sum(ConsumedReadCapacityUnits) + Sum(ConsumedWriteCapacityUnits) == 0
-    over the lookback window. Estimate cost = storage + (if PROVISIONED) current throughput.
-    """
-    log = _logger(kwargs.get("logger") or logger)
-
-    try:
-        writer, dynamodb, cloudwatch = _extract_writer_ddb_cw(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_dynamodb_unused_tables] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        log.warning("[check_dynamodb_unused_tables] Skipping: checker config not provided.")
-        return
-
-    region = getattr(getattr(dynamodb, "meta", None), "region_name", "") or ""
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
-    start_time = now_utc - timedelta(days=lookback_days)
-    period = 3600  # 1h
-
-    names = _list_tables(dynamodb, log)
-    if not names:
-        log.info("[check_dynamodb_unused_tables] No tables in %s", region)
-        return
-
-    metrics_ok = True
-    results: Dict[str, Any] = {}
-    id_map: Dict[str, Dict[str, str]] = {}
-
-    try:
-        cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or region
-        cw_batch = CloudWatchBatcher(region=cw_region, client=cloudwatch)
-        for name in names:
-            dims = [("TableName", name)]
-            rid = f"rcu_{name}"
-            wid = f"wcu_{name}"
-            cw_batch.add_q(id_hint=rid, namespace="AWS/DynamoDB", metric="ConsumedReadCapacityUnits",
-                           dims=dims, stat="Sum", period=period)
-            cw_batch.add_q(id_hint=wid, namespace="AWS/DynamoDB", metric="ConsumedWriteCapacityUnits",
-                           dims=dims, stat="Sum", period=period)
-            id_map[name] = {"rcu": rid, "wcu": wid}
-        results = cw_batch.execute(start=start_time, end=now_utc)
-    except ClientError as exc:
-        log.warning("[check_dynamodb_unused_tables] CloudWatch metrics unavailable: %s", exc)
-        metrics_ok = False
-    except Exception as exc:  # pylint: disable=broad-except
-        log.warning("[check_dynamodb_unused_tables] CloudWatch batch error: %s", exc)
-        metrics_ok = False
-
-    if not metrics_ok:
-        return
-
-    price_storage = config.safe_price("DynamoDB", "STORAGE_GB_MONTH", 0.25)
-
-    for name in names:
-        rsum = _sum_from_result(results.get(id_map.get(name, {}).get("rcu")))
-        wsum = _sum_from_result(results.get(id_map.get(name, {}).get("wcu")))
-        if (rsum + wsum) > 0.0:
-            continue
-
-        tbl = _describe_table(dynamodb, name, log)
-        arn = tbl.get("TableArn") or name
-        billing_mode = (tbl.get("BillingModeSummary", {}).get("BillingMode") or "PROVISIONED").upper()
-        rcu = float(tbl.get("ProvisionedThroughput", {}).get("ReadCapacityUnits") or 0)
-        wcu = float(tbl.get("ProvisionedThroughput", {}).get("WriteCapacityUnits") or 0)
-        storage_gb = _table_storage_gb(tbl)
-
-        est_storage = storage_gb * price_storage
-        est_prov = _provisioned_monthly_cost(rcu, wcu) if billing_mode == "PROVISIONED" else 0.0
-        estimated_cost = est_storage + est_prov
-        potential_saving = estimated_cost
-
-        flags = ["DynamoDBTableUnused"]
-
-        signals = _signals_str(
-            {
-                "Region": region,
-                "TableName": name,
-                "ARN": arn,
-                "BillingMode": billing_mode,
-                "RCU": int(rcu),
-                "WCU": int(wcu),
-                "StorageGB": round(storage_gb, 3),
-                "ConsumedRCUSum": int(rsum),
-                "ConsumedWCUSum": int(wsum),
-                "LookbackDays": lookback_days,
-            }
-        )
-
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=arn,
-                name=name,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="DynamoDBTable",
-                estimated_cost=estimated_cost,
-                potential_saving=potential_saving,
-                flags=flags,
-                confidence=100,
-                signals=signals,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_dynamodb_unused_tables] write_row failed for %s: %s", name, exc)
-
-        log.info("[check_dynamodb_unused_tables] Wrote unused table: %s (storage=%.3fGB mode=%s)", name, storage_gb, billing_mode)
+def _list_tags(dynamodb, table_arn: str) -> List[Dict[str, str]]:
+    resp = dynamodb.list_tags_of_resource(ResourceArn=table_arn)
+    return resp.get("Tags", []) or []
 
 
-# =========== 2) Provisioned mode – underutilized throughput ============== #
+def _tags_concurrent(
+    dynamodb, arns: List[str], log: logging.Logger, max_workers: Optional[int]
+) -> Dict[str, List[Dict[str, str]]]:
+    out: Dict[str, List[Dict[str, str]]] = {}
+    if not arns:
+        return out
+    workers = _safe_workers(dynamodb, max_workers)
+    chunk_size = workers * 8
+    for chunk in _iter_chunks(arns, chunk_size):
+        with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_list_tags, dynamodb, arn): arn for arn in chunk}
+            for fut in cf.as_completed(futs):
+                arn = futs[fut]
+                try:
+                    out[arn] = list(fut.result())
+                except ClientError as exc:
+                    log.debug(f"[ddb] list_tags_of_resource {arn} failed: {exc}")
+                    out[arn] = []
+                except Exception as exc:  # pylint: disable=broad-except
+                    log.debug(f"[ddb] tags worker {arn} error: {exc}")
+                    out[arn] = []
+    return out
+
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_dynamodb_underutilized_provisioned(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    lookback_days: int = 30,
-    utilization_threshold: float = 0.10,
-    headroom: float = 0.20,
-    **kwargs,
-) -> None:
-    """
-    Flag PROVISIONED tables where avg consumed RCU/WCU << current provisioned.
+def _describe_ttl(dynamodb, name: str) -> Dict[str, Any]:
+    return dynamodb.describe_time_to_live(TableName=name)  # type: ignore
 
-    avg_rcu_per_s = Sum(ConsumedRCU) / seconds_in_window
-    avg_wcu_per_s = Sum(ConsumedWCU) / seconds_in_window
-    utilization_read  = avg_rcu_per_s / RCU
-    utilization_write = avg_wcu_per_s / WCU
-    If both utilizations < utilization_threshold (default 10%), flag.
 
-    Savings (heuristic):
-      current_cost  = monthly(provisioned RCU/WCU)
-      recommended   = ceil(avg_per_sec * (1 + headroom))
-      potential_saving = max(0, current_cost - monthly(recommended))
-    """
-    log = _logger(kwargs.get("logger") or logger)
-
-    try:
-        writer, dynamodb, cloudwatch = _extract_writer_ddb_cw(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_dynamodb_underutilized_provisioned] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        log.warning("[check_dynamodb_underutilized_provisioned] Skipping: checker config not provided.")
-        return
-
-    region = getattr(getattr(dynamodb, "meta", None), "region_name", "") or ""
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
-    start_time = now_utc - timedelta(days=lookback_days)
-    period = 300  # 5m
-    seconds = float(lookback_days) * 86400.0 if lookback_days > 0 else 1.0
-
-    names = _list_tables(dynamodb, log)
+def _ttl_concurrent(
+    dynamodb, names: List[str], log: logging.Logger, max_workers: Optional[int]
+) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
     if not names:
-        return
-
-    prov_names: List[str] = []
-    table_meta: Dict[str, Dict[str, Any]] = {}
-    for name in names:
-        t = _describe_table(dynamodb, name, log)
-        mode = (t.get("BillingModeSummary", {}).get("BillingMode") or "PROVISIONED").upper()
-        if mode != "PROVISIONED":
-            continue
-        rcu = float(t.get("ProvisionedThroughput", {}).get("ReadCapacityUnits") or 0)
-        wcu = float(t.get("ProvisionedThroughput", {}).get("WriteCapacityUnits") or 0)
-        table_meta[name] = {"arn": t.get("TableArn") or name, "rcu": rcu, "wcu": wcu}
-        prov_names.append(name)
-
-    if not prov_names:
-        log.info("[check_dynamodb_underutilized_provisioned] No PROVISIONED tables in %s", region)
-        return
-
-    metrics_ok = True
-    results: Dict[str, Any] = {}
-    id_map: Dict[str, Dict[str, str]] = {}
-    try:
-        cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or region
-        cw_batch = CloudWatchBatcher(region=cw_region, client=cloudwatch)
-        for name in prov_names:
-            dims = [("TableName", name)]
-            rid = f"rcu_{name}"
-            wid = f"wcu_{name}"
-            cw_batch.add_q(id_hint=rid, namespace="AWS/DynamoDB", metric="ConsumedReadCapacityUnits",
-                           dims=dims, stat="Sum", period=period)
-            cw_batch.add_q(id_hint=wid, namespace="AWS/DynamoDB", metric="ConsumedWriteCapacityUnits",
-                           dims=dims, stat="Sum", period=period)
-            id_map[name] = {"rcu": rid, "wcu": wid}
-        results = cw_batch.execute(start=start_time, end=now_utc)
-    except ClientError as exc:
-        log.warning("[check_dynamodb_underutilized_provisioned] CloudWatch metrics unavailable: %s", exc)
-        metrics_ok = False
-    except Exception as exc:  # pylint: disable=broad-except
-        log.warning("[check_dynamodb_underutilized_provisioned] CloudWatch batch error: %s", exc)
-        metrics_ok = False
-
-    if not metrics_ok:
-        return
-
-    for name in prov_names:
-        meta = table_meta.get(name, {})
-        rcu = float(meta.get("rcu") or 0.0)
-        wcu = float(meta.get("wcu") or 0.0)
-        arn = meta.get("arn") or name
-
-        rsum = _sum_from_result(results.get(id_map.get(name, {}).get("rcu")))
-        wsum = _sum_from_result(results.get(id_map.get(name, {}).get("wcu")))
-
-        avg_rcu_ps = (rsum / seconds) if seconds > 0 else 0.0
-        avg_wcu_ps = (wsum / seconds) if seconds > 0 else 0.0
-
-        util_r = (avg_rcu_ps / rcu) if rcu > 0 else 0.0
-        util_w = (avg_wcu_ps / wcu) if wcu > 0 else 0.0
-
-        if (rcu <= 0 and wcu <= 0) or (util_r >= utilization_threshold or util_w >= utilization_threshold):
-            continue
-
-        current_cost = _provisioned_monthly_cost(rcu, wcu)
-        rec_rcu = max(1, int(math.ceil(avg_rcu_ps * (1.0 + headroom))))
-        rec_wcu = max(1, int(math.ceil(avg_wcu_ps * (1.0 + headroom))))
-        rec_cost = _provisioned_monthly_cost(rec_rcu, rec_wcu)
-        potential_saving = max(0.0, current_cost - rec_cost)
-
-        tbl = _describe_table(dynamodb, name, log)
-        storage_gb = _table_storage_gb(tbl)
-
-        flags = ["DynamoDBProvisionedUnderutilized"]
-
-        signals = _signals_str(
-            {
-                "Region": region,
-                "TableName": name,
-                "ARN": arn,
-                "RCU": int(rcu),
-                "WCU": int(wcu),
-                "AvgRCU_per_s": round(avg_rcu_ps, 3),
-                "AvgWCU_per_s": round(avg_wcu_ps, 3),
-                "UtilRead": round(util_r, 3),
-                "UtilWrite": round(util_w, 3),
-                "SuggestedRCU": rec_rcu,
-                "SuggestedWCU": rec_wcu,
-                "StorageGB": round(storage_gb, 3),
-                "LookbackDays": lookback_days,
-                "Threshold": utilization_threshold,
-                "Headroom": headroom,
-            }
-        )
-
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=arn,
-                name=name,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="DynamoDBTable",
-                estimated_cost=current_cost,
-                potential_saving=potential_saving,
-                flags=flags,
-                confidence=100,
-                signals=signals,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_dynamodb_underutilized_provisioned] write_row failed for %s: %s", name, exc)
-
-        log.info(
-            "[check_dynamodb_underutilized_provisioned] Wrote: %s (rcu=%d wcu=%d util_r=%.3f util_w=%.3f)",
-            name, rcu, wcu, util_r, util_w,
-        )
+        return out
+    workers = _safe_workers(dynamodb, max_workers)
+    chunk_size = workers * 8
+    for chunk in _iter_chunks(names, chunk_size):
+        with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_describe_ttl, dynamodb, n): n for n in chunk}
+            for fut in cf.as_completed(futs):
+                n = futs[fut]
+                try:
+                    out[n] = dict(fut.result())
+                except ClientError as exc:
+                    log.debug(f"[ddb] describe_time_to_live {n} failed: {exc}")
+                    out[n] = {}
+                except Exception as exc:  # pylint: disable=broad-except
+                    log.debug(f"[ddb] ttl worker {n} error: {exc}")
+                    out[n] = {}
+    return out
 
 
-# =================== 3) PITR / Continuous backups cost =================== #
+# ------------------------- CloudWatch (consumed R/W) ----------------------- #
 
-@retry_with_backoff(exceptions=(ClientError,))
-def check_dynamodb_continuous_backups(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    **kwargs,
-) -> None:
-    """Surface PITR-enabled tables and estimate backup storage cost (heuristic)."""
-    log = _logger(kwargs.get("logger") or logger)
+def _cw_region(cloudwatch) -> str:
+    return getattr(getattr(cloudwatch, "meta", None), "region_name", "") or ""
 
-    try:
-        writer, dynamodb, cloudwatch = _extract_writer_ddb_cw(args, kwargs)  # cloudwatch unused
-    except TypeError as exc:
-        log.warning("[check_dynamodb_continuous_backups] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        log.warning("[check_dynamodb_continuous_backups] Skipping: checker config not provided.")
-        return
 
-    region = getattr(getattr(dynamodb, "meta", None), "region_name", "") or ""
-    price_pitr_gb = config.safe_price("DynamoDB", "PITR_GB_MONTH", 0.20)
-
-    names = _list_tables(dynamodb, log)
+def _cw_consumed_capacity(
+    cloudwatch,
+    region: str,
+    names: List[str],
+    start: datetime,
+    end: datetime,
+    log: logging.Logger,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Return { table: {rcu_sum: float, wcu_sum: float} } over [start, end).
+    If CloudWatchBatcher is unavailable or region mismatch, return {}.
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    if CloudWatchBatcher is None or not cloudwatch:
+        return out
+    if _cw_region(cloudwatch) != region:
+        return out
     if not names:
-        return
-
-    for name in names:
-        tbl = _describe_table(dynamodb, name, log)
-        arn = tbl.get("TableArn") or name
-        storage_gb = _table_storage_gb(tbl)
-
-        cbd = _pitr_status(dynamodb, name, log)
-        pitr = (cbd.get("PointInTimeRecoveryDescription", {}) or {})
-        status = (pitr.get("PointInTimeRecoveryStatus") or "DISABLED").upper()
-        enabled = (status == "ENABLED")
-        last_restorable = pitr.get("LatestRestorableDateTime")
-
-        if not enabled:
-            continue
-
-        est = storage_gb * price_pitr_gb
-        potential_saving = est  # heuristic
-
-        signals = _signals_str(
-            {
-                "Region": region,
-                "TableName": name,
-                "ARN": arn,
-                "PITRStatus": status,
-                "StorageGB": round(storage_gb, 3),
-                "LatestRestorable": _to_utc_iso(last_restorable) if isinstance(last_restorable, datetime) else None,
-            }
-        )
-
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=arn,
-                name=name,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="DynamoDBTable",
-                estimated_cost=est,
-                potential_saving=potential_saving,
-                flags=["DynamoDBPITREnabled"],
-                confidence=100,
-                signals=signals,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_dynamodb_continuous_backups] write_row failed for %s: %s", name, exc)
-
-        log.info("[check_dynamodb_continuous_backups] Wrote PITR: %s (storage=%.3fGB)", name, storage_gb)
-
-
-# ======================= 4) GSI underutilization ========================= #
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_dynamodb_gsi_underutilized(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    lookback_days: int = 30,
-    utilization_threshold: float = 0.10,
-    headroom: float = 0.20,
-    **kwargs,
-) -> None:
-    """
-    Flag PROVISIONED GSIs where avg consumed RCU/WCU is << provisioned.
-
-    Savings (heuristic) = monthly(current RCU/WCU) - monthly(recommended with headroom).
-    """
-    log = _logger(kwargs.get("logger") or logger)
+        return out
 
     try:
-        writer, dynamodb, cloudwatch = _extract_writer_ddb_cw(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_dynamodb_gsi_underutilized] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        log.warning("[check_dynamodb_gsi_underutilized] Skipping: checker config not provided.")
-        return
-
-    region = getattr(getattr(dynamodb, "meta", None), "region_name", "") or ""
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
-    start_time = now_utc - timedelta(days=lookback_days)
-    period = 300
-    seconds = float(lookback_days) * 86400.0 if lookback_days > 0 else 1.0
-
-    names = _list_tables(dynamodb, log)
-    if not names:
-        return
-
-    # Build list of (table, gsi) with provisioned capacity
-    gsi_meta: List[Tuple[str, str, float, float]] = []
-    for name in names:
-        t = _describe_table(dynamodb, name, log)
-        for gsi in t.get("GlobalSecondaryIndexes", []) or []:
-            proj = gsi.get("ProvisionedThroughput") or {}
-            rcu = float(proj.get("ReadCapacityUnits") or 0)
-            wcu = float(proj.get("WriteCapacityUnits") or 0)
-            if rcu > 0 or wcu > 0:
-                gsi_meta.append((name, gsi.get("IndexName") or "", rcu, wcu))
-
-    if not gsi_meta:
-        log.info("[check_dynamodb_gsi_underutilized] No provisioned GSIs in %s", region)
-        return
-
-    # Batch metrics per (table, gsi)
-    metrics_ok = True
-    results: Dict[str, Any] = {}
-    id_map: Dict[Tuple[str, str], Dict[str, str]] = {}
-
-    try:
-        cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or region
-        cw_batch = CloudWatchBatcher(region=cw_region, client=cloudwatch)
-        for table, gsi_name, _, _ in gsi_meta:
-            dims = [("TableName", table), ("GlobalSecondaryIndexName", gsi_name)]
-            rid = f"rcu_{table}_{gsi_name}"
-            wid = f"wcu_{table}_{gsi_name}"
-            cw_batch.add_q(id_hint=rid, namespace="AWS/DynamoDB", metric="ConsumedReadCapacityUnits",
-                           dims=dims, stat="Sum", period=period)
-            cw_batch.add_q(id_hint=wid, namespace="AWS/DynamoDB", metric="ConsumedWriteCapacityUnits",
-                           dims=dims, stat="Sum", period=period)
-            id_map[(table, gsi_name)] = {"rcu": rid, "wcu": wid}
-        results = cw_batch.execute(start=start_time, end=now_utc)
-    except ClientError as exc:
-        log.warning("[check_dynamodb_gsi_underutilized] CloudWatch metrics unavailable: %s", exc)
-        metrics_ok = False
-    except Exception as exc:  # pylint: disable=broad-except
-        log.warning("[check_dynamodb_gsi_underutilized] CloudWatch batch error: %s", exc)
-        metrics_ok = False
-
-    if not metrics_ok:
-        return
-
-    for table, gsi_name, rcu, wcu in gsi_meta:
-        rsum = _sum_from_result(results.get(id_map.get((table, gsi_name), {}).get("rcu")))
-        wsum = _sum_from_result(results.get(id_map.get((table, gsi_name), {}).get("wcu")))
-        avg_r = (rsum / seconds) if seconds > 0 else 0.0
-        avg_w = (wsum / seconds) if seconds > 0 else 0.0
-
-        util_r = (avg_r / rcu) if rcu > 0 else 0.0
-        util_w = (avg_w / wcu) if wcu > 0 else 0.0
-
-        if (rcu <= 0 and wcu <= 0) or (util_r >= utilization_threshold or util_w >= utilization_threshold):
-            continue
-
-        current_cost = _provisioned_monthly_cost(rcu, wcu)
-        rec_rcu = max(1, int(math.ceil(avg_r * (1.0 + headroom))))
-        rec_wcu = max(1, int(math.ceil(avg_w * (1.0 + headroom))))
-        rec_cost = _provisioned_monthly_cost(rec_rcu, rec_wcu)
-        potential_saving = max(0.0, current_cost - rec_cost)
-
-        signals = _signals_str(
-            {
-                "Region": region,
-                "TableName": table,
-                "GSI": gsi_name,
-                "RCU": int(rcu),
-                "WCU": int(wcu),
-                "AvgRCU_per_s": round(avg_r, 3),
-                "AvgWCU_per_s": round(avg_w, 3),
-                "UtilRead": round(util_r, 3),
-                "UtilWrite": round(util_w, 3),
-                "SuggestedRCU": rec_rcu,
-                "SuggestedWCU": rec_wcu,
-                "LookbackDays": lookback_days,
-            }
-        )
-
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=f"{table}/{gsi_name}",
-                name=f"{table}:{gsi_name}",
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="DynamoDBGSI",
-                estimated_cost=current_cost,
-                potential_saving=potential_saving,
-                flags=["DynamoDBGSIUnderutilized"],
-                confidence=100,
-                signals=signals,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_dynamodb_gsi_underutilized] write_row failed for %s:%s: %s", table, gsi_name, exc)
-
-        log.info("[check_dynamodb_gsi_underutilized] Wrote GSI: %s:%s", table, gsi_name)
-
-
-# ================= Streams enabled but no consumers (best-effort) ======== #
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_dynamodb_streams_enabled_no_consumers(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    **kwargs,
-) -> None:
-    """
-    If Streams are enabled but there are no registered stream consumers,
-    flag 'DynamoDBStreamNoConsumers'. Requires a 'dynamodbstreams' client.
-    """
-    log = _logger(kwargs.get("logger") or logger)
-
-    # Accept an optional 'dynamodbstreams' client in kwargs
-    streams_client = kwargs.get("dynamodbstreams")
-    try:
-        writer, dynamodb, _cloudwatch = _extract_writer_ddb_cw(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_dynamodb_streams_enabled_no_consumers] Skipping: %s", exc)
-        return
-    if streams_client is None:
-        log.warning("[check_dynamodb_streams_enabled_no_consumers] Skipping: no 'dynamodbstreams' client provided.")
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_dynamodb_streams_enabled_no_consumers] Skipping: checker config not provided.")
-        return
-
-    region = getattr(getattr(dynamodb, "meta", None), "region_name", "") or ""
-    names = _list_tables(dynamodb, log)
-    if not names:
-        return
-
-    for name in names:
-        t = _describe_table(dynamodb, name, log)
-        arn = t.get("TableArn") or name
-        spec = t.get("StreamSpecification") or {}
-        if not spec.get("StreamEnabled"):
-            continue
-        latest_arn = t.get("LatestStreamArn")
-        if not latest_arn:
-            continue
-
-        # list_stream_consumers best-effort
-        try:
-            resp = streams_client.list_stream_consumers(StreamARN=latest_arn)
-            consumers = resp.get("Consumers", []) or []
-            if not consumers:
-                # type: ignore[call-arg]
-                config.WRITE_ROW(
-                    writer=writer,
-                    resource_id=arn,
-                    name=name,
-                    owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                    resource_type="DynamoDBTable",
-                    estimated_cost=0.0,
-                    potential_saving=0.0,
-                    flags=["DynamoDBStreamNoConsumers"],
-                    confidence=100,
-                    signals=_signals_str({"Region": region, "TableName": name, "StreamEnabled": True}),
+        batch = CloudWatchBatcher(region=region, client=cloudwatch)
+        for n in names:
+            dims = [("TableName", n)]
+            for metric in ("ConsumedReadCapacityUnits", "ConsumedWriteCapacityUnits"):
+                batch.add_q(
+                    id_hint=f"{metric}_{n}",
+                    namespace="AWS/DynamoDB",
+                    metric=metric,
+                    dims=dims,
+                    stat="Sum",
+                    period=300,
                 )
-                log.info("[check_dynamodb_streams_enabled_no_consumers] Wrote: %s (no consumers)", name)
-        except ClientError as exc:
-            log.debug("[dynamodb streams] list_stream_consumers failed for %s: %s", name, exc)
+        results = batch.execute(start=start, end=end)
+    except ClientError as exc:
+        log.debug(f"[ddb] CloudWatch metrics failed: {exc}")
+        return out
+    except Exception as exc:  # pylint: disable=broad-except
+        log.debug(f"[ddb] CloudWatch batch error: {exc}")
+        return out
+
+    def _sum_series(series: Any) -> float:
+        if isinstance(series, list):
+            try:
+                return float(sum(v for _, v in series))
+            except Exception:  # pylint: disable=broad-except
+                return 0.0
+        if isinstance(series, dict):
+            vals = series.get("Values") or []
+            try:
+                return float(sum(vals))
+            except Exception:  # pylint: disable=broad-except
+                return 0.0
+        return 0.0
+
+    for n in names:
+        r = _sum_series(results.get(f"ConsumedReadCapacityUnits_{n}"))
+        w = _sum_series(results.get(f"ConsumedWriteCapacityUnits_{n}"))
+        out[n] = {"rcu_sum": r, "wcu_sum": w}
+
+    return out
 
 
-# ============================= TTL disabled ============================== #
+# --------------------------- cost/saving calculators ----------------------- #
+
+def _monthly_storage_cost(bytes_val: int | float) -> float:
+    gb = float(bytes_val) / (1024.0 ** 3)
+    return gb * _DDB_STORAGE_GB_MO
+
+
+def _monthly_provisioned_cost(rcu: int, wcu: int) -> float:
+    # 730 hours/month approximation
+    return float(rcu) * _DDB_RCU_HR * 730.0 + float(wcu) * _DDB_WCU_HR * 730.0
+
+
+def _monthly_ondemand_cost(rcu_sum: float, wcu_sum: float) -> float:
+    # sums are measured in capacity units; convert to "per million requests" pricing
+    return (rcu_sum / 1_000_000.0) * _DDB_OD_RCU_M + (wcu_sum / 1_000_000.0) * _DDB_OD_WCU_M
+
+
+# ------------------------------- extract args ------------------------------ #
+
+def _extract_writer_ddb(*args, **kwargs) -> Tuple[Any, Any]:
+    writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
+    dynamodb = kwargs.get("dynamodb", args[1] if len(args) >= 2 else None)
+    if writer is None or dynamodb is None:
+        raise TypeError(f"Expected 'writer' and 'dynamodb' (got {writer!r}, {dynamodb!r})")
+    return writer, dynamodb
+
+
+def _extract_writer_ddb_cw(*args, **kwargs) -> Tuple[Any, Any, Optional[Any]]:
+    writer, dynamodb = _extract_writer_ddb(*args, **kwargs)
+    cloudwatch = kwargs.get("cloudwatch", args[2] if len(args) >= 3 else None)
+    return writer, dynamodb, cloudwatch
+
+
+# --------------------------------- checkers -------------------------------- #
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_dynamodb_ttl_disabled(  # pylint: disable=unused-argument
+def check_dynamodb_tables_no_pitr(  # pylint: disable=unused-argument
     *args,
     logger: Optional[logging.Logger] = None,
+    max_workers: Optional[int] = None,
     **kwargs,
 ) -> None:
-    """Flag tables without TTL enabled (hygiene; no cost estimate)."""
+    """Flag tables with Point-in-Time Recovery disabled (hygiene)."""
     log = _logger(kwargs.get("logger") or logger)
-
     try:
-        writer, dynamodb, _cloudwatch = _extract_writer_ddb_cw(args, kwargs)
+        writer, dynamodb = _extract_writer_ddb(*args, **kwargs)
     except TypeError as exc:
-        log.warning("[check_dynamodb_ttl_disabled] Skipping: %s", exc)
+        log.warning(f"[check_dynamodb_tables_no_pitr] Skipping: {exc}")
         return
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_dynamodb_ttl_disabled] Skipping: checker config not provided.")
+        log.warning("[check_dynamodb_tables_no_pitr] Skipping: checker config not provided.")
         return
 
     region = getattr(getattr(dynamodb, "meta", None), "region_name", "") or ""
     names = _list_tables(dynamodb, log)
-    if not names:
-        return
+    desc = _describe_tables_concurrent(dynamodb, names, log, max_workers)
+    # Tags
+    arns = [t.get("TableArn") for t in desc.values() if t.get("TableArn")]
+    tags_map = _tags_concurrent(dynamodb, arns, log, max_workers)
+    arn_to_tags = {arn: _tags_to_dict(tags) for arn, tags in tags_map.items()}
 
-    for name in names:
-        try:
-            ttl = dynamodb.describe_time_to_live(TableName=name).get("TimeToLiveDescription", {}) or {}
-            status = (ttl.get("TimeToLiveStatus") or "DISABLED").upper()
-            if status != "ENABLED":
-                # type: ignore[call-arg]
-                config.WRITE_ROW(
-                    writer=writer,
-                    resource_id=name,
-                    name=name,
-                    owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                    resource_type="DynamoDBTable",
-                    estimated_cost=0.0,
-                    potential_saving=0.0,
-                    flags=["DynamoDBTTLOff"],
-                    confidence=100,
-                    signals=_signals_str({"Region": region, "TableName": name, "TTLStatus": status}),
-                )
-                log.info("[check_dynamodb_ttl_disabled] Wrote: %s (TTL=%s)", name, status)
-        except ClientError as exc:
-            log.debug("[dynamodb] describe_time_to_live failed for %s: %s", name, exc)
-
-
-# ======================= Table class mismatch (IA) ======================= #
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_dynamodb_table_class_mismatch(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    lookback_days: int = 30,
-    access_per_gb_threshold: float = 0.001,
-    **kwargs,
-) -> None:
-    """
-    Suggest switching Standard ↔ Standard-IA based on traffic/storage heuristic.
-
-    Heuristic:
-      - Compute (ConsumedRCU+ConsumedWCU) / StorageGB over window.
-      - If TableClass=STANDARD and ratio <= threshold → candidate for IA.
-      - If TableClass=STANDARD_INFREQUENT_ACCESS and ratio >> threshold → candidate for STANDARD.
-
-    Potential saving (if Standard→IA):
-      storage_gb * (price_std - price_ia)  [if price keys exist]
-    """
-    log = _logger(kwargs.get("logger") or logger)
-
-    try:
-        writer, dynamodb, cloudwatch = _extract_writer_ddb_cw(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_dynamodb_table_class_mismatch] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        log.warning("[check_dynamodb_table_class_mismatch] Skipping: checker config not provided.")
-        return
-
-    region = getattr(getattr(dynamodb, "meta", None), "region_name", "") or ""
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
-    start_time = now_utc - timedelta(days=lookback_days)
-    period = 3600
-
-    names = _list_tables(dynamodb, log)
-    if not names:
-        return
-
-    metrics_ok = True
-    results: Dict[str, Any] = {}
-    id_map: Dict[str, Dict[str, str]] = {}
-    try:
-        cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or region
-        cw_batch = CloudWatchBatcher(region=cw_region, client=cloudwatch)
-        for name in names:
-            dims = [("TableName", name)]
-            rid = f"rcu_{name}"
-            wid = f"wcu_{name}"
-            cw_batch.add_q(id_hint=rid, namespace="AWS/DynamoDB", metric="ConsumedReadCapacityUnits",
-                           dims=dims, stat="Sum", period=period)
-            cw_batch.add_q(id_hint=wid, namespace="AWS/DynamoDB", metric="ConsumedWriteCapacityUnits",
-                           dims=dims, stat="Sum", period=period)
-            id_map[name] = {"rcu": rid, "wcu": wid}
-        results = cw_batch.execute(start=start_time, end=now_utc)
-    except ClientError as exc:
-        log.warning("[check_dynamodb_table_class_mismatch] CloudWatch metrics unavailable: %s", exc)
-        metrics_ok = False
-    except Exception as exc:  # pylint: disable=broad-except
-        log.warning("[check_dynamodb_table_class_mismatch] CloudWatch batch error: %s", exc)
-        metrics_ok = False
-
-    if not metrics_ok:
-        return
-
-    price_std = config.safe_price("DynamoDB", "STORAGE_GB_MONTH", 0.25)
-    price_ia = config.safe_price("DynamoDB", "STORAGE_IA_GB_MONTH", 0.10)
-
-    for name in names:
-        tbl = _describe_table(dynamodb, name, log)
-        arn = tbl.get("TableArn") or name
-        storage_gb = _table_storage_gb(tbl)
-        cls = (tbl.get("TableClassSummary", {}).get("TableClass") or "STANDARD").upper()
-
-        rsum = _sum_from_result(results.get(id_map.get(name, {}).get("rcu")))
-        wsum = _sum_from_result(results.get(id_map.get(name, {}).get("wcu")))
-        ratio = ((rsum + wsum) / storage_gb) if storage_gb > 0 else 0.0
-
-        flags: List[str] = []
-        potential_saving = 0.0
-
-        if cls == "STANDARD" and ratio <= access_per_gb_threshold:
-            flags.append("DynamoDBTableClassConsiderIA")
-            potential_saving = max(0.0, (price_std - price_ia) * storage_gb)
-        elif cls == "STANDARD_INFREQUENT_ACCESS" and ratio > access_per_gb_threshold * 10:
-            flags.append("DynamoDBTableClassConsiderStandard")
-
-        if not flags:
+    for name, tab in desc.items():
+        arn = tab.get("TableArn", "")
+        pitrd = (tab.get("PointInTimeRecoverySummary") or {}).get("PointInTimeRecoveryStatus")
+        pitr_on = str(pitrd).upper() == "ENABLED"
+        if pitr_on:
             continue
 
-        signals = _signals_str(
-            {
+        tags = arn_to_tags.get(arn, {})
+        app_id, app, env = _tag_triplet(tags)
+
+        _write_row(
+            writer=writer,
+            resource_id=name,
+            name=name,
+            region=region,
+            flags=["DDBPITRDisabled"],
+            state=str(tab.get("TableStatus") or ""),
+            creation_date=_iso(tab.get("CreationDateTime")),
+            storage_gb=round(float(tab.get("TableSizeBytes") or 0.0) / (1024**3), 3),
+            object_count=int(tab.get("ItemCount") or 0),
+            estimated_cost=0.0,
+            potential_saving=0.0,
+            app_id=app_id,
+            app=app,
+            env=env,
+            signals={
                 "Region": region,
-                "TableName": name,
-                "ARN": arn,
-                "TableClass": cls,
-                "StorageGB": round(storage_gb, 3),
-                "ConsumedRCUSum": int(rsum),
-                "ConsumedWCUSum": int(wsum),
-                "AccessPerGB": round(ratio, 6),
-                "Threshold": access_per_gb_threshold,
-                "LookbackDays": lookback_days,
-            }
+                "BillingMode": (tab.get("BillingModeSummary") or {}).get("BillingMode", "PROVISIONED"),
+            },
+            logger=log,
         )
+        log.info(f"[ddb] Wrote PITR disabled: {name}")
 
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=arn,
-                name=name,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="DynamoDBTable",
-                estimated_cost=0.0 if "ConsiderStandard" in flags else potential_saving,
-                potential_saving=potential_saving,
-                flags=flags,
-                confidence=100,
-                signals=signals,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_dynamodb_table_class_mismatch] write_row failed for %s: %s", name, exc)
-
-        log.info("[check_dynamodb_table_class_mismatch] Wrote: %s (class=%s ratio=%.6f flags=%s)", name, cls, ratio, flags)
-
-
-# =================== Global tables: low activity (info) ================== #
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_dynamodb_global_tables_low_activity(  # pylint: disable=unused-argument
+def check_dynamodb_tables_no_ttl(  # pylint: disable=unused-argument
     *args,
     logger: Optional[logging.Logger] = None,
-    lookback_days: int = 30,
+    max_workers: Optional[int] = None,
     **kwargs,
 ) -> None:
-    """
-    For global tables (replicas > 1), flag very low overall consumption in the window.
-    This is informational; savings depend on whether a replica can be removed.
-    """
+    """Flag tables with TTL disabled (hygiene)."""
     log = _logger(kwargs.get("logger") or logger)
-
     try:
-        writer, dynamodb, cloudwatch = _extract_writer_ddb_cw(args, kwargs)
+        writer, dynamodb = _extract_writer_ddb(*args, **kwargs)
     except TypeError as exc:
-        log.warning("[check_dynamodb_global_tables_low_activity] Skipping: %s", exc)
+        log.warning(f"[check_dynamodb_tables_no_ttl] Skipping: {exc}")
         return
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_dynamodb_global_tables_low_activity] Skipping: checker config not provided.")
+        log.warning("[check_dynamodb_tables_no_ttl] Skipping: checker config not provided.")
         return
 
     region = getattr(getattr(dynamodb, "meta", None), "region_name", "") or ""
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
-    start_time = now_utc - timedelta(days=lookback_days)
-    period = 3600
-
     names = _list_tables(dynamodb, log)
-    if not names:
-        return
+    desc = _describe_tables_concurrent(dynamodb, names, log, max_workers)
+    # TTL (parallel)
+    ttl_map = _ttl_concurrent(dynamodb, names, log, max_workers)
+    # Tags
+    arns = [t.get("TableArn") for t in desc.values() if t.get("TableArn")]
+    tags_map = _tags_concurrent(dynamodb, arns, log, max_workers)
+    arn_to_tags = {arn: _tags_to_dict(tags) for arn, tags in tags_map.items()}
 
-    # Identify global tables (replicas > 1)
-    globals_: List[str] = []
-    for name in names:
-        t = _describe_table(dynamodb, name, log)
-        replicas = (t.get("Replicas", []) or [])  # 2019 GT version
-        if replicas and len(replicas) > 1:
-            globals_.append(name)
-
-    if not globals_:
-        return
-
-    # Batch metrics for those tables
-    metrics_ok = True
-    results: Dict[str, Any] = {}
-    id_map: Dict[str, Dict[str, str]] = {}
-    try:
-        cw_region = getattr(getattr(cloudwatch, "meta", None), "region_name", "") or region
-        cw_batch = CloudWatchBatcher(region=cw_region, client=cloudwatch)
-        for name in globals_:
-            dims = [("TableName", name)]
-            rid = f"rcu_{name}"
-            wid = f"wcu_{name}"
-            cw_batch.add_q(id_hint=rid, namespace="AWS/DynamoDB", metric="ConsumedReadCapacityUnits",
-                           dims=dims, stat="Sum", period=period)
-            cw_batch.add_q(id_hint=wid, namespace="AWS/DynamoDB", metric="ConsumedWriteCapacityUnits",
-                           dims=dims, stat="Sum", period=period)
-            id_map[name] = {"rcu": rid, "wcu": wid}
-        results = cw_batch.execute(start=start_time, end=now_utc)
-    except ClientError as exc:
-        log.warning("[check_dynamodb_global_tables_low_activity] CloudWatch metrics unavailable: %s", exc)
-        metrics_ok = False
-    except Exception as exc:  # pylint: disable=broad-except
-        log.warning("[check_dynamodb_global_tables_low_activity] CloudWatch batch error: %s", exc)
-        metrics_ok = False
-
-    if not metrics_ok:
-        return
-
-    for name in globals_:
-        rsum = _sum_from_result(results.get(id_map.get(name, {}).get("rcu")))
-        wsum = _sum_from_result(results.get(id_map.get(name, {}).get("wcu")))
-        if (rsum + wsum) > 0.0:
-            # very low activity threshold; tune as you like
+    for name, tab in desc.items():
+        status = (ttl_map.get(name) or {}).get("TimeToLiveDescription") or {}
+        ttl_on = str(status.get("TimeToLiveStatus", "")).upper() == "ENABLED"
+        if ttl_on:
             continue
 
-        t = _describe_table(dynamodb, name, log)
-        arn = t.get("TableArn") or name
-        replica_regions = [r.get("RegionName") for r in (t.get("Replicas", []) or []) if r.get("RegionName")]
+        tags = arn_to_tags.get(tab.get("TableArn", ""), {})
+        app_id, app, env = _tag_triplet(tags)
 
-        # type: ignore[call-arg]
-        try:
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=arn,
-                name=name,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="DynamoDBTable",
-                estimated_cost=0.0,
-                potential_saving=0.0,
-                flags=["DynamoDBGlobalTableLowActivity"],
-                confidence=100,
-                signals=_signals_str(
-                    {
-                        "Region": region,
-                        "TableName": name,
-                        "ARN": arn,
-                        "ReplicaRegions": ",".join(replica_regions),
-                        "ConsumedRCUSum": int(rsum),
-                        "ConsumedWCUSum": int(wsum),
-                        "LookbackDays": lookback_days,
-                    }
-                ),
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_dynamodb_global_tables_low_activity] write_row failed for %s: %s", name, exc)
+        _write_row(
+            writer=writer,
+            resource_id=name,
+            name=name,
+            region=region,
+            flags=["DDBTTLDisabled"],
+            state=str(tab.get("TableStatus") or ""),
+            creation_date=_iso(tab.get("CreationDateTime")),
+            storage_gb=round(float(tab.get("TableSizeBytes") or 0.0) / (1024**3), 3),
+            object_count=int(tab.get("ItemCount") or 0),
+            estimated_cost=0.0,
+            potential_saving=0.0,
+            app_id=app_id,
+            app=app,
+            env=env,
+            signals={
+                "Region": region,
+                "BillingMode": (tab.get("BillingModeSummary") or {}).get("BillingMode", "PROVISIONED"),
+            },
+            logger=log,
+        )
+        log.info(f"[ddb] Wrote TTL disabled: {name}")
 
-        log.info("[check_dynamodb_global_tables_low_activity] Wrote: %s", name)
+
+@retry_with_backoff(exceptions=(ClientError,))
+def check_dynamodb_tables_unused(  # pylint: disable=unused-argument
+    *args,
+    logger: Optional[logging.Logger] = None,
+    lookback_days: int = 14,
+    max_workers: Optional[int] = None,
+    **kwargs,
+) -> None:
+    """
+    Flag tables with no traffic in the last `lookback_days`.
+
+    Potential saving:
+      - Provisioned: monthly provisioned capacity cost (assumes delete or switch to OD).
+      - On-demand: 0 (no capacity to reduce).
+    """
+    log = _logger(kwargs.get("logger") or logger)
+    try:
+        writer, dynamodb, cloudwatch = _extract_writer_ddb_cw(*args, **kwargs)
+    except TypeError as exc:
+        log.warning(f"[check_dynamodb_tables_unused] Skipping: {exc}")
+        return
+    if not (config.ACCOUNT_ID and config.WRITE_ROW):
+        log.warning("[check_dynamodb_tables_unused] Skipping: checker config not provided.")
+        return
+
+    region = getattr(getattr(dynamodb, "meta", None), "region_name", "") or ""
+    names = _list_tables(dynamodb, log)
+    desc = _describe_tables_concurrent(dynamodb, names, log, max_workers)
+    arns = [t.get("TableArn") for t in desc.values() if t.get("TableArn")]
+    tags_map = _tags_concurrent(dynamodb, arns, log, max_workers)
+    arn_to_tags = {arn: _tags_to_dict(tags) for arn, tags in tags_map.items()}
+
+    start = datetime.now(timezone.utc) - timedelta(days=int(lookback_days))
+    end = datetime.now(timezone.utc)
+    cw = _cw_consumed_capacity(cloudwatch, region, names, start, end, log)
+
+    for name, tab in desc.items():
+        rcu_sum = float((cw.get(name) or {}).get("rcu_sum") or 0.0)
+        wcu_sum = float((cw.get(name) or {}).get("wcu_sum") or 0.0)
+        if rcu_sum > 0.0 or wcu_sum > 0.0:
+            continue
+
+        billing = (tab.get("BillingModeSummary") or {}).get("BillingMode", "PROVISIONED")
+        prov = tab.get("ProvisionedThroughput") or {}
+        rcu = int(prov.get("ReadCapacityUnits") or 0)
+        wcu = int(prov.get("WriteCapacityUnits") or 0)
+
+        est_storage = _monthly_storage_cost(float(tab.get("TableSizeBytes") or 0.0))
+        est_prov = 0.0 if billing == "PAY_PER_REQUEST" else _monthly_provisioned_cost(rcu, wcu)
+        pot = est_prov  # storage remains even if unused
+
+        tags = arn_to_tags.get(tab.get("TableArn", ""), {})
+        app_id, app, env = _tag_triplet(tags)
+
+        _write_row(
+            writer=writer,
+            resource_id=name,
+            name=name,
+            region=region,
+            flags=["DDBTableNoTraffic"],
+            state=str(tab.get("TableStatus") or ""),
+            creation_date=_iso(tab.get("CreationDateTime")),
+            storage_gb=round(float(tab.get("TableSizeBytes") or 0.0) / (1024**3), 3),
+            object_count=int(tab.get("ItemCount") or 0),
+            estimated_cost=round(est_storage + est_prov, 4),
+            potential_saving=round(pot, 4),
+            app_id=app_id,
+            app=app,
+            env=env,
+            signals={
+                "Region": region,
+                "BillingMode": billing,
+                "RCU": rcu,
+                "WCU": wcu,
+                "LookbackDays": int(lookback_days),
+                "ConsumedRCU": rcu_sum,
+                "ConsumedWCU": wcu_sum,
+            },
+            logger=log,
+        )
+        log.info(f"[ddb] Wrote table no-traffic: {name}")
+
+
+@retry_with_backoff(exceptions=(ClientError,))
+def check_dynamodb_tables_overprovisioned(  # pylint: disable=unused-argument
+    *args,
+    logger: Optional[logging.Logger] = None,
+    lookback_days: int = 14,
+    max_workers: Optional[int] = None,
+    **kwargs,
+) -> None:
+    """
+    Flag PROVISIONED tables with low utilization (avg < threshold).
+
+    Recommendation: reduce provisioned capacity or switch to on-demand.
+    Potential saving: current monthly provisioned cost minus recommended capacity cost.
+    """
+    log = _logger(kwargs.get("logger") or logger)
+    try:
+        writer, dynamodb, cloudwatch = _extract_writer_ddb_cw(*args, **kwargs)
+    except TypeError as exc:
+        log.warning(f"[check_dynamodb_tables_overprovisioned] Skipping: {exc}")
+        return
+    if not (config.ACCOUNT_ID and config.WRITE_ROW):
+        log.warning(
+            "[check_dynamodb_tables_overprovisioned] Skipping: checker config not provided."
+        )
+        return
+
+    region = getattr(getattr(dynamodb, "meta", None), "region_name", "") or ""
+    names = _list_tables(dynamodb, log)
+    desc = _describe_tables_concurrent(dynamodb, names, log, max_workers)
+    arns = [t.get("TableArn") for t in desc.values() if t.get("TableArn")]
+    tags_map = _tags_concurrent(dynamodb, arns, log, max_workers)
+    arn_to_tags = {arn: _tags_to_dict(tags) for arn, tags in tags_map.items()}
+
+    start = datetime.now(timezone.utc) - timedelta(days=int(lookback_days))
+    end = datetime.now(timezone.utc)
+    cw = _cw_consumed_capacity(cloudwatch, region, names, start, end, log)
+    window_secs = (end - start).total_seconds() or 1.0
+
+    for name, tab in desc.items():
+        billing = (tab.get("BillingModeSummary") or {}).get("BillingMode", "PROVISIONED")
+        if billing == "PAY_PER_REQUEST":
+            continue  # OD tables cannot be overprovisioned by definition
+
+        prov = tab.get("ProvisionedThroughput") or {}
+        rcu = int(prov.get("ReadCapacityUnits") or 0)
+        wcu = int(prov.get("WriteCapacityUnits") or 0)
+        if rcu <= 0 and wcu <= 0:
+            continue
+
+        r_sum = float((cw.get(name) or {}).get("rcu_sum") or 0.0)
+        w_sum = float((cw.get(name) or {}).get("wcu_sum") or 0.0)
+        r_avg_sec = r_sum / window_secs
+        w_avg_sec = w_sum / window_secs
+
+        r_util = (r_avg_sec / max(1, rcu)) if rcu else 0.0
+        w_util = (w_avg_sec / max(1, wcu)) if wcu else 0.0
+        low_util = (r_util < _UTIL_THRESHOLD) and (w_util < _UTIL_THRESHOLD)
+        if not low_util:
+            continue
+
+        # Recommended new capacity: headroom over observed avg
+        rec_rcu = max(1, int(ceil(r_avg_sec * _HEADROOM)))
+        rec_wcu = max(1, int(ceil(w_avg_sec * _HEADROOM)))
+
+        cur_cost = _monthly_provisioned_cost(rcu, wcu)
+        rec_cost = _monthly_provisioned_cost(rec_rcu, rec_wcu)
+        saving = max(0.0, cur_cost - rec_cost)
+
+        tags = arn_to_tags.get(tab.get("TableArn", ""), {})
+        app_id, app, env = _tag_triplet(tags)
+
+        _write_row(
+            writer=writer,
+            resource_id=name,
+            name=name,
+            region=region,
+            flags=["DDBOverprovisioned"],
+            state=str(tab.get("TableStatus") or ""),
+            creation_date=_iso(tab.get("CreationDateTime")),
+            storage_gb=round(float(tab.get("TableSizeBytes") or 0.0) / (1024**3), 3),
+            object_count=int(tab.get("ItemCount") or 0),
+            estimated_cost=round(cur_cost + _monthly_storage_cost(float(tab.get("TableSizeBytes") or 0.0)), 4),  # noqa: E501
+            potential_saving=round(saving, 4),
+            app_id=app_id,
+            app=app,
+            env=env,
+            signals={
+                "Region": region,
+                "RCU": rcu,
+                "WCU": wcu,
+                "AvgRCUps": round(r_avg_sec, 4),
+                "AvgWCUps": round(w_avg_sec, 4),
+                "RecRCU": rec_rcu,
+                "RecWCU": rec_wcu,
+                "UtilR": round(r_util, 4),
+                "UtilW": round(w_util, 4),
+                "LookbackDays": int(lookback_days),
+            },
+            logger=log,
+        )
+        log.info(f"[ddb] Wrote overprovisioned table: {name}")
