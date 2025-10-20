@@ -513,9 +513,7 @@ def check_s3_buckets_without_lifecycle(  # pylint: disable=unused-argument
         if has_lc:
             continue
 
-        
-        # NEW: fetch bucket tags (safe no-op when none)
-        tags_kv, tags_str = _get_bucket_tags_dict(s3_client, bucket_name)
+        tags_kv, tags_str = _get_bucket_tags_dict(s3, bname)
 
         # Map common owner taxonomy into normalized columns (keep your keys as you use them)
         application_id = tags_kv.get("ApplicationID") or tags_kv.get("app_id") or ""
@@ -533,9 +531,9 @@ def check_s3_buckets_without_lifecycle(  # pylint: disable=unused-argument
                 resource_type="S3Bucket",
                 estimated_cost=0.0,
                 potential_saving=0.0,
-                ApplicationID=application_id,
-                Environment=environment,
-                Application=application,
+                app_id=application_id,
+                env=environment,
+                app=application,
                 flags=["S3BucketNoLifecycle"],
                 confidence=100,
                 signals=_signals_str(
