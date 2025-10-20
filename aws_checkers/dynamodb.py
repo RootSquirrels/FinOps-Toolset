@@ -44,7 +44,8 @@ from aws_checkers.common import (
     tag_triplet,
     _safe_workers,
     iter_chunks,
-    _write_row
+    _write_row,
+    tags_to_dict
 )
 from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher  # type: ignore
@@ -78,16 +79,6 @@ def _iso(dt: Optional[datetime]) -> str:
         return ""
     d = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     return d.replace(microsecond=0).isoformat()
-
-
-def _tags_to_dict(pairs: Optional[List[Dict[str, str]]]) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for t in pairs or []:
-        k, v = t.get("Key"), t.get("Value")
-        if k:
-            out[str(k)] = "" if v is None else str(v)
-    return out
-
 
 # ------------------------------- inventories ------------------------------- #
 
@@ -319,7 +310,7 @@ def check_dynamodb_tables_no_pitr(  # pylint: disable=unused-argument
     # Tags
     arns = [t.get("TableArn") for t in desc.values() if t.get("TableArn")]
     tags_map = _tags_concurrent(dynamodb, arns, log, max_workers)
-    arn_to_tags = {arn: _tags_to_dict(tags) for arn, tags in tags_map.items()}
+    arn_to_tags = {arn: tags_to_dict(tags) for arn, tags in tags_map.items()}
 
     for name, tab in desc.items():
         arn = tab.get("TableArn", "")
@@ -382,7 +373,7 @@ def check_dynamodb_tables_no_ttl(  # pylint: disable=unused-argument
     # Tags
     arns = [t.get("TableArn") for t in desc.values() if t.get("TableArn")]
     tags_map = _tags_concurrent(dynamodb, arns, log, max_workers)
-    arn_to_tags = {arn: _tags_to_dict(tags) for arn, tags in tags_map.items()}
+    arn_to_tags = {arn: tags_to_dict(tags) for arn, tags in tags_map.items()}
 
     for name, tab in desc.items():
         status = (ttl_map.get(name) or {}).get("TimeToLiveDescription") or {}
@@ -448,7 +439,7 @@ def check_dynamodb_tables_unused(  # pylint: disable=unused-argument
     desc = _describe_tables_concurrent(dynamodb, names, log, max_workers)
     arns = [t.get("TableArn") for t in desc.values() if t.get("TableArn")]
     tags_map = _tags_concurrent(dynamodb, arns, log, max_workers)
-    arn_to_tags = {arn: _tags_to_dict(tags) for arn, tags in tags_map.items()}
+    arn_to_tags = {arn: tags_to_dict(tags) for arn, tags in tags_map.items()}
 
     start = datetime.now(timezone.utc) - timedelta(days=int(lookback_days))
     end = datetime.now(timezone.utc)
@@ -533,7 +524,7 @@ def check_dynamodb_tables_overprovisioned(  # pylint: disable=unused-argument
     desc = _describe_tables_concurrent(dynamodb, names, log, max_workers)
     arns = [t.get("TableArn") for t in desc.values() if t.get("TableArn")]
     tags_map = _tags_concurrent(dynamodb, arns, log, max_workers)
-    arn_to_tags = {arn: _tags_to_dict(tags) for arn, tags in tags_map.items()}
+    arn_to_tags = {arn: tags_to_dict(tags) for arn, tags in tags_map.items()}
 
     start = datetime.now(timezone.utc) - timedelta(days=int(lookback_days))
     end = datetime.now(timezone.utc)

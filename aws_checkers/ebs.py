@@ -22,7 +22,8 @@ from aws_checkers import config
 from aws_checkers.common import (
     _logger,
     tag_triplet,
-    _write_row
+    _write_row,
+    tags_to_dict
 )
 from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher 
@@ -55,16 +56,6 @@ _SNAPSHOT_GB_MONTH = _p("EBS", "SNAPSHOT_GB_MONTH", 0.05)
 
 
 # ------------------------------- tiny helpers ------------------------------ #
-
-
-def _tags_to_dict(pairs: Optional[List[Dict[str, str]]]) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for t in pairs or []:
-        k, v = t.get("Key"), t.get("Value")
-        if k:
-            out[str(k)] = "" if v is None else str(v)
-    return out
-
 
 def _iso(dt: Optional[datetime]) -> str:
     if not isinstance(dt, datetime):
@@ -255,7 +246,7 @@ def check_ebs_unattached_volumes(  # pylint: disable=unused-argument
     for v in _inventory_volumes(ec2, log):
         if str(v.get("State")) != "available":
             continue
-        tags = _tags_to_dict(v.get("Tags"))
+        tags = tags_to_dict(v.get("Tags"))
         app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
         _write_row(
@@ -305,7 +296,7 @@ def check_ebs_gp2_to_gp3_candidates(  # pylint: disable=unused-argument
     for v in _inventory_volumes(ec2, log):
         if str(v.get("VolumeType")).lower() != "gp2":
             continue
-        tags = _tags_to_dict(v.get("Tags"))
+        tags = tags_to_dict(v.get("Tags"))
         app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
         pot = _gp2_to_gp3_saving(v)
@@ -359,7 +350,7 @@ def check_ebs_unencrypted_volumes(  # pylint: disable=unused-argument
     for v in _inventory_volumes(ec2, log):
         if bool(v.get("Encrypted")):
             continue
-        tags = _tags_to_dict(v.get("Tags"))
+        tags = tags_to_dict(v.get("Tags"))
         app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
         _write_row(
@@ -461,7 +452,7 @@ def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
         if rb + wb > 5 * 1024 * 1024 or ro + wo > 10:
             continue
 
-        tags = _tags_to_dict(v.get("Tags"))
+        tags = tags_to_dict(v.get("Tags"))
         app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
 
@@ -529,7 +520,7 @@ def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
         if not is_public and not shared_to:
             continue
 
-        tags = _tags_to_dict(s.get("Tags"))
+        tags = tags_to_dict(s.get("Tags"))
         app_id, app, env = tag_triplet(tags)
 
         flags: List[str] = []
@@ -599,7 +590,7 @@ def check_ebs_snapshots_old(  # pylint: disable=unused-argument
         st = st if st.tzinfo else st.replace(tzinfo=timezone.utc)
         if st > cutoff:
             continue
-        tags = _tags_to_dict(s.get("Tags"))
+        tags = tags_to_dict(s.get("Tags"))
         app_id, app, env = tag_triplet(tags)
         est = _snapshot_monthly_cost_guesstimate(s)
         _write_row(
@@ -650,7 +641,7 @@ def check_ebs_snapshots_unreferenced(  # pylint: disable=unused-argument
         sid = str(s.get("SnapshotId"))
         if not sid or sid in used_ids:
             continue
-        tags = _tags_to_dict(s.get("Tags"))
+        tags = tags_to_dict(s.get("Tags"))
         app_id, app, env = tag_triplet(tags)
         est = _snapshot_monthly_cost_guesstimate(s)
         _write_row(
