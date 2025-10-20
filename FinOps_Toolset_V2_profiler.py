@@ -690,22 +690,33 @@ def main():
                         ecr_checks.check_ecr_stale_or_untagged_images,
                         writer=writer, ecr=clients["ecr"])
 
-                run_check(profiler, "check_unattached_ebs_volumes",
-                          region, ebs_checks.check_unattached_ebs_volumes, writer=writer,
+                run_check(profiler, "check_ebs_snapshots_unreferenced",
+                          region, ebs_checks.check_ebs_snapshots_unreferenced, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
 
-                run_check(profiler, "check_ebs_low_activity_volumes",
-                          region, ebs_checks.check_ebs_low_activity_volumes, writer=writer,
+                run_check(profiler, "check_ebs_snapshots_old",
+                          region, ebs_checks.check_ebs_snapshots_old, writer=writer,
+                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
+                
+                run_check(profiler, "check_ebs_snapshots_public_or_shared",
+                          region, ebs_checks.check_ebs_snapshots_public_or_shared, writer=writer,
+                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
+                
+                run_check(profiler, "check_ebs_volumes_low_utilization",
+                          region, ebs_checks.check_ebs_volumes_low_utilization, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
 
-                run_check(profiler, "check_ebs_gp2_to_gp3_migration",
-                          region, ebs_checks.check_ebs_gp2_to_gp3_migration, writer=writer,
+                run_check(profiler, "check_ebs_unencrypted_volumes", region,
+                          ebs_checks.check_ebs_unencrypted_volumes, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
-
-                run_check(profiler, "check_ebs_snapshots_old_or_orphaned", region,
-                          ebs_checks.check_ebs_snapshots_old_or_orphaned, writer=writer,
+                
+                run_check(profiler, "check_ebs_gp2_to_gp3_candidates", region,
+                          ebs_checks.check_ebs_gp2_to_gp3_candidates, writer=writer,
                           ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
-
+                
+                run_check(profiler, "check_ebs_unattached_volumes", region,
+                          ebs_checks.check_ebs_unattached_volumes, writer=writer,
+                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
 
                 run_check(
                     profiler, "check_acm_expiring_certificates",
@@ -839,16 +850,6 @@ def main():
                 run_check(profiler, "check_dynamodb_global_tables_low_activity", region,
                           ddb_checks.check_dynamodb_global_tables_low_activity, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                
-                run_check(profiler, "check_ebs_snapshots_public_or_shared", region,
-                          ebs_checks.check_ebs_snapshots_public_or_shared, writer=writer,
-                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_ebs_snapshots_unencrypted", region,
-                          ebs_checks.check_ebs_snapshots_unencrypted, writer=writer,
-                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
-                run_check(profiler, "check_ebs_snapshots_missing_description", region,
-                          ebs_checks.check_ebs_snapshots_missing_description, writer=writer,
-                          ec2=clients["ec2"], cloudwatch=clients["cloudwatch"])
                 
                 run_check(
                             profiler, "check_ami_public_or_shared",
