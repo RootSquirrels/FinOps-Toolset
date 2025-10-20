@@ -14,12 +14,12 @@ This tool:
 import argparse
 import os
 import sys
+from datetime import datetime
+from typing import Optional
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go #type: ignore
 import plotly.io as pio #type: ignore
-from datetime import datetime
-from typing import Optional
 
 # ---------- CSV schema helpers ----------
 REQUIRED_COLS = [
@@ -85,8 +85,7 @@ def _read_csv_csv(path: str) -> pd.DataFrame:
             df = pd.read_csv(path, sep=sep_arg, skiprows=skiprows, engine="python",
                              encoding="utf-8-sig", dtype=str, keep_default_na=False)
             return normalize(df)
-        except Exception as e:
-            # fall through
+        except Exception: # pylint: disable=broad-except
             pass
 
     # 2) Automatic sniffing
@@ -95,7 +94,7 @@ def _read_csv_csv(path: str) -> pd.DataFrame:
         df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig",
                          dtype=str, keep_default_na=False)
         return normalize(df)
-    except Exception:
+    except Exception: # pylint: disable=broad-except
         pass
 
     # 3) Hard try with semicolon
@@ -103,14 +102,14 @@ def _read_csv_csv(path: str) -> pd.DataFrame:
         tried.append("sep=';' (C engine)")
         df = pd.read_csv(path, sep=';', encoding="utf-8-sig", dtype=str, keep_default_na=False)
         return normalize(df)
-    except Exception:
+    except Exception: # pylint: disable=broad-except
         pass
     # 4) Hard try with comma
     try:
         tried.append("sep=',' (C engine)")
         df = pd.read_csv(path, sep=',', encoding="utf-8-sig", dtype=str, keep_default_na=False)
         return normalize(df)
-    except Exception:
+    except Exception: # pylint: disable=broad-except
         pass
 
     # 5) Last resort: skip bad lines with semicolon, Python engine
@@ -440,7 +439,7 @@ def build_html(df: pd.DataFrame, out_html: str, title: str = "AWS FinOps Cleanup
     f1 = fig_cost_by_type(ag_type)
     f2 = fig_savings_by_type(ag_type)      # we’ll attach click → filter by ResourceType
     f3 = fig_top_findings(top_df)          # optional click wiring (by type)
-    
+
     f4 = fig_heatmap_enhanced(
         ag_region,
         metric="Potential",        
@@ -726,7 +725,7 @@ def main():
     try:
         out = generate_dashboard(args.csv, out_html=args.out, top_n=args.top, embed_js=not args.cdn)
         print(f"Dashboard written to {out}")
-    except Exception as e:
+    except Exception as e: # pylint: disable=broad-except
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(2)
 

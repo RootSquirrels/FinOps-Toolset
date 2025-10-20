@@ -15,13 +15,13 @@ def _env_str(key: str, default: str) -> str:
 def _env_int(key: str, default: int) -> int:
     try:
         return int(os.getenv(key, str(default)))
-    except Exception:
+    except Exception: # pylint: disable=broad-except
         return default
 
 def _env_float(key: str, default: float) -> float:
     try:
         return float(os.getenv(key, str(default)))
-    except Exception:
+    except Exception: # pylint: disable=broad-except
         return default
 
 def _env_bool(key: str, default: bool) -> bool:

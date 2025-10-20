@@ -8,118 +8,7 @@ report with metadata, estimated costs, and optimization flags for review.
 
 Key Features
 ------------
-1. **Amazon Machine Images (AMIs)**
-   - Lists owned AMIs, checks references in EC2, ASG, Launch Templates, and CloudFormation.
-   - Flags unreferenced, old, or externally shared AMIs.
-   - Estimates snapshot storage cost.
-
-2. **Amazon S3**
-   - Lists all buckets, analyzes object count, size, and last modified date.
-   - Flags large, old, or untagged buckets.
-   - Estimates storage cost.
-   - Detect >7‑day old multipart uploads, sum part sizes, and estimate storage cost.
-
-
-3. **Elastic IPs**
-   - Detects unused Elastic IP addresses and estimates monthly cost.
-
-4. **Elastic Network Interfaces (ENIs)**
-   - Identifies detached ENIs.
-
-5. **Elastic File System (EFS)**
-   - Finds unused file systems (no mount targets).
-   - Flags storage class usage (Standard vs IA).
-   - Estimates monthly cost.
-   - Idle EFS, Provisioned Throughput under-utilization
-   - HighIAReads -> large IA footprint + frequent read activity (can incur IA retrieval cost).
-   - checks for too many AZ mount targets for a low-traffic FS
-   - Consider Archive lifecycle when STD is large
-
-6. **Elastic Load Balancers (ALB/NLB)**
-   - Flags idle load balancers (no healthy targets).
-
-7. **NAT Gateways**
-   - Detects potentially unused NAT Gateways and estimates monthly cost.
-
-8. **CloudWatch Logs**
-   - Identifies log groups with infinite retention and estimates storage cost.
-
-9. **AWS Backup**
-   - Flags backup plans with misconfigured retention policies.
-
-10. **Amazon FSx**
-    - Detects orphaned FSx backups and estimates storage cost.
-
-11. **Route 53**
-    - Flags stale DNS records pointing to non-existent ELB or S3 targets.
-
-12. **AWS Lambda**
-    - Flags functions with no invocations in 90 days or high error rates.
-    - Stale published versions: find versions with zero invocations over the lookback window.
-    - Version sprawl: flag functions with many published versions.
-    - Reserved concurrency underuse: compare reserved vs observed max concurrency.
-    - Package bloat: flag large deployment packages.
-    - Layer review: flag large or old layers (by size and creation date when retrievable).
-    - Memory rightsizing heuristic: propose a lower memory setting and estimate potential savings.
-    - Low traffic categorization: distinguish “no traffic” from “low traffic” functions.
-    - /tmp usage heuristic: highlight functions likely incurring time due to heavy temp usage.
-
-13. **Amazon DynamoDB**
-    - Analyzes tables for:
-        * Over-provisioned capacity (rightsizing recommendations).
-        * Idle tables.
-        * Missing TTL.
-        * PITR and backup hygiene.
-        * Table class optimization (Standard → Standard-IA).
-        * Unused or over-provisioned GSIs.
-    - Estimates current monthly cost (storage + capacity).
-    - Reports potential savings in flags.
-
-14. **EBS Snapshots**
-    - Flags replicated snapshots and estimates storage cost.
-
-15. **VPC & TGW**
-    - Lists active inter-region VPC peerings (`describe_vpc_peering_connections`).
-    - Lists inter-region TGW peering attachments (`describe_transit_gateway_peering_attachments`).
-    - Queries CloudWatch `BytesOutToRegion` metrics to estimate monthly transfer volume and cost.
-    - Adds FinOps flags including PotentialSaving≈X$ and high-level remediation advice. 
-
-16. **FSR**
-    - Checks EBS that has FSR and flags them
-
-17. **ECR**
-    - Checks storage and staleness for ECR
-
-18. **EKS**
-    - Checks EKS for empty clusters
-
-19. **EBS**
-    - Flags unattached volumes (state=available) with monthly storage cost.
-    - Flags gp2 volumes for gp3 migration with savings estimate.
-    - Flags EBS Cold Volumes with savings estimate
-    - Flags gp3 volumes with over-provisioned add-ons (IOPS/Throughput) vs observed IO.
-      Suggests reductions and estimates PotentialSaving using PRICING['EBS'] add-on rates.
-    - Flags io1/io2 as "ConsiderGP3" when observed IO is low (no exact $ without pricing here).
-
-20. **SSM**
-    - Flag Advanced tier parameters not updated >180 days
-
-21. **EC2**
-    - Flags idle instances 
-
-22. **CF**
-    - Flags IdleDistribution when requests and data are near zero over the lookback window.
-    - Detects Dedicated IP custom SSL
-
-23. **RDS**
-    - Identity deprecated RDS (mysql 5.7 or aurora 2) that leads in expensive extended support 
-    - Identify orphans / old snapshots 
-
-24. **KMS**
-    - Identify KMS keys with no usage in the last 90d
-
-25. **Certificates**
-    - Identify private certificates not used
+Described in checkers
 
 Output
 ------
@@ -133,14 +22,7 @@ Additional Features
 - Multi-region support (configured via REGIONS constant).
 - Retry logic with exponential backoff and jitter for API calls.
 - Logging to `cleanup_analysis.log`.
-- Threaded processing for AMI analysis.
-- Tag validation for ApplicationID, Application, Environment.
 - Profiler active that enables to check script performance 
-
-Usage
------
-- Configure AWS credentials and permissions.
-- Adjust constants for pricing assumptions and thresholds.
 """
 
 #region Imports SECTION
@@ -164,33 +46,21 @@ from finops_toolset.config import (
 from finops_toolset.pricing import get_price
 from aws_checkers.eip import check_unused_elastic_ips as eip
 from aws_checkers.network_interfaces import check_detached_network_interfaces as eni
-from aws_checkers import ssm as ssm_checks
 from aws_checkers import config as checkers_config
 from aws_checkers.private_ca import check_private_certificate_authorities
 from aws_checkers.kms import check_kms_customer_managed_keys
 from aws_checkers.efs import check_unused_efs_filesystems
-from aws_checkers import backup as backup_checks
 from aws_checkers.cloudfront import check_cloudfront_distributions
-from aws_checkers import ecr as ecr_checks
 from aws_checkers.nat_gateways import check_nat_gateways
-from aws_checkers import ebs as ebs_checks
-from aws_checkers import kinesis as kinesis_checks
-from aws_checkers import dynamodb as ddb_checks
-from aws_checkers import s3 as s3_checks
-from aws_checkers import ami as ami_checks
-from aws_checkers import lambda_svc as lambda_checks
-from aws_checkers import ec2 as ec2_checks
-from aws_checkers import loggroups as lg_checks
-from aws_checkers import fsx as fsx_checks
-from aws_checkers import rds_snapshots as rds_snaps
-from aws_checkers import lb as lb_checks
-from aws_checkers import wafv2 as waf_checks
-from aws_checkers import acm as acm_checks
-from aws_checkers import vpc_tgw as vpc_tgw_checks
-from aws_checkers import route53 as r53_checks
-from aws_checkers import extended_support as ext_checks
-from aws_checkers import eks as eks_checks
-from aws_checkers import fsr as fsr_checks
+from aws_checkers import (
+    eks as eks_checks, fsr as fsr_checks, acm as acm_checks,
+    wafv2 as waf_checks, lb as lb_checks, route53 as r53_checks,
+    fsx as fsx_checks, ec2 as ec2_checks, s3 as s3_checks,
+    ami as ami_checks, kinesis as kinesis_checks, ebs as ebs_checks,
+    dynamodb as ddb_checks, loggroups as lg_checks, vpc_tgw as vpc_tgw_checks,
+    lambda_svc as lambda_checks, rds_snapshots as rds_snaps, extended_support as ext_checks,
+    backup as backup_checks, ecr as ecr_checks, ssm as ssm_checks,
+)
 
 #endregion
 
@@ -279,8 +149,8 @@ def write_resource_to_csv(
             app_id, app, env, referenced_in, flagged,
             confidence if confidence is not None else "", signals_str
         ])
-    except Exception as e:
-        logging.error(f"[write_resource_to_csv] Failed to write row for {resource_id or name}: {e}")
+    except Exception as e: # pylint: disable=broad-except
+        logging.error("[write_resource_to_csv] Failed to write row for {%s or %s}: %s", resource_id, name, e)
 
 
 def _fmt_dt(dt: Optional[datetime]) -> str:
@@ -337,7 +207,7 @@ def get_account_id(sts_client=None) -> str:
         return c.get_caller_identity().get("Account", "")
     except Exception: # pylint: disable=broad-except
         return ""
-    
+
 ACCOUNT_ID = get_account_id()
 
 # ===== Profiling helpers =====
@@ -354,6 +224,7 @@ class CountingCSVWriter:
         self.rows = 0
 
     def writerow(self, row):
+        """Counts number of rows in CSV"""
         self._inner.writerow(row)
         self.rows += 1
 
@@ -371,6 +242,7 @@ class RunProfiler:
             ok: bool, error: Optional[str] = None,
             started_at: Optional[datetime] = None,
             ended_at: Optional[datetime] = None):
+        """Retrieves check metrics"""
         self.records.append({
             "TimestampUTC": datetime.now(timezone.utc).isoformat(),
             "Step": step,
@@ -581,15 +453,15 @@ def main():
                 run_check(profiler, check_name="check_unused_efs_filesystems", region=region,
                           fn=check_unused_efs_filesystems, writer=writer,
                           efs=clients['efs'], cloudwatch=clients['cloudwatch'])
-                
-                run_check(profiler, "check_backup_plans_without_selections", 
-                          region, backup_checks.check_backup_plans_without_selections, writer=writer, 
+
+                run_check(profiler, "check_backup_plans_without_selections",
+                          region, backup_checks.check_backup_plans_without_selections,
+                          writer=writer, backup=clients["backup"])
+                run_check(profiler, "check_backup_rules_no_lifecycle",
+                          region, backup_checks.check_backup_rules_no_lifecycle, writer=writer,
                           backup=clients["backup"])
-                run_check(profiler, "check_backup_rules_no_lifecycle",      
-                          region, backup_checks.check_backup_rules_no_lifecycle, writer=writer, 
-                          backup=clients["backup"])
-                run_check(profiler, "check_backup_stale_recovery_points",   
-                          region, backup_checks.check_backup_stale_recovery_points, writer=writer, 
+                run_check(profiler, "check_backup_stale_recovery_points",
+                          region, backup_checks.check_backup_stale_recovery_points, writer=writer,
                           backup=clients["backup"])
 
                 run_check(
@@ -617,14 +489,14 @@ def main():
                 run_check(
                     profiler, "check_lambda_unused_functions",
                     region, lambda_checks.check_lambda_unused_functions,
-                    writer=writer, lambda_client=clients["lambda"], 
+                    writer=writer, lambda_client=clients["lambda"],
                     cloudwatch=clients["cloudwatch"],
                 )
 
                 run_check(
                     profiler, "check_lambda_provisioned_concurrency_underutilized",
                     region, lambda_checks.check_lambda_provisioned_concurrency_underutilized,
-                    writer=writer, lambda_client=clients["lambda"], 
+                    writer=writer, lambda_client=clients["lambda"],
                     cloudwatch=clients["cloudwatch"],
                     # knobs: lookback_days=14, util_threshold=0.05
                 )
@@ -647,7 +519,7 @@ def main():
                 run_check(
                     profiler, "check_lambda_old_functions",
                     region, lambda_checks.check_lambda_old_functions,
-                    writer=writer, lambda_client=clients["lambda"], 
+                    writer=writer, lambda_client=clients["lambda"],
                     cloudwatch=clients["cloudwatch"],
                     # knobs: age_days=180
                 )
@@ -796,8 +668,8 @@ def main():
                 region=region,fn=check_private_certificate_authorities,
                 writer=writer, acmpca=clients["acm-pca"])
 
-                run_check(profiler=profiler, check_name="check_kms_customer_managed_keys", 
-                          region=region, fn=check_kms_customer_managed_keys, writer=writer, 
+                run_check(profiler=profiler, check_name="check_kms_customer_managed_keys",
+                          region=region, fn=check_kms_customer_managed_keys, writer=writer,
                           cloudtrail=clients['cloudtrail'], kms=clients['kms'])
                           # lookback_days=90,  # optional override
 
@@ -1009,7 +881,6 @@ def main():
                     eks_checks.check_eks_logging_incomplete,
                     writer=writer,
                     eks=clients["eks"],
-                    # knobs: required=["api","audit","authenticator","controllerManager","scheduler"]
                 )
 
                 run_check(
