@@ -34,11 +34,18 @@ import concurrent.futures as cf
 import logging
 from datetime import datetime, timedelta, timezone
 from math import ceil
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
 
 from aws_checkers import config
+from aws_checkers.common import (
+    _logger,
+    tag_triplet,
+    _safe_workers,
+    iter_chunks,
+    _write_row
+)
 from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher  # type: ignore
 
@@ -66,23 +73,6 @@ _HEADROOM = float(_p("DDB", "PROV_HEADROOM_FACTOR", 1.5))       # 50% headroom
 
 # ------------------------------- tiny helpers ------------------------------ #
 
-def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
-    return fallback or config.LOGGER or logging.getLogger(__name__)
-
-
-def _nonnull(s: Optional[str]) -> str:
-    return "NULL" if not s else s
-
-
-def _signals_str(pairs: Dict[str, object]) -> str:
-    out: List[str] = []
-    for k, v in pairs.items():
-        if v is None or v == "":
-            continue
-        out.append(f"{k}={v}")
-    return " | ".join(out)
-
-
 def _iso(dt: Optional[datetime]) -> str:
     if not isinstance(dt, datetime):
         return ""
@@ -97,92 +87,6 @@ def _tags_to_dict(pairs: Optional[List[Dict[str, str]]]) -> Dict[str, str]:
         if k:
             out[str(k)] = "" if v is None else str(v)
     return out
-
-
-def _pick_tag(tags: Dict[str, str], keys: Iterable[str]) -> Optional[str]:
-    low = {k.lower(): v for k, v in tags.items()}
-    for k in keys:
-        v = low.get(str(k).lower())
-        if v:
-            return v
-    return None
-
-
-def _tag_triplet(tags: Dict[str, str]) -> Tuple[str, str, str]:
-    app_id = _pick_tag(tags, ["app_id", "application_id", "app-id"])
-    app = _pick_tag(tags, ["app", "application", "service"])
-    env = _pick_tag(tags, ["environment", "env", "stage"])
-    return _nonnull(app_id), _nonnull(app), _nonnull(env)
-
-
-def _pool_size(client) -> int:
-    try:
-        cfg = getattr(getattr(client, "meta", None), "config", None)
-        val = getattr(cfg, "max_pool_connections", 10)
-        return int(val) if val else 10
-    except Exception:  # pylint: disable=broad-except
-        return 10
-
-
-def _safe_workers(client, requested: Optional[int]) -> int:
-    pool = _pool_size(client)
-    target = requested if requested is not None else min(16, pool)
-    return max(2, min(int(target), max(1, pool - 2)))
-
-
-def _iter_chunks(items: List[str], n: int):
-    size = max(1, n)
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
-
-
-def _write_row(  # noqa: D401
-    *,
-    writer,
-    resource_id: str,
-    name: str,
-    region: str,
-    flags: List[str],
-    resource_type: str = "DynamoDBTable",
-    state: str = "",
-    creation_date: str = "",
-    storage_gb: float | str = 0.0,
-    object_count: int | str | None = "",
-    estimated_cost: float | str = 0.0,
-    potential_saving: float | str | None = None,
-    app_id: str = "NULL",
-    app: str = "NULL",
-    env: str = "NULL",
-    referenced_in: str = "",
-    signals: Dict[str, object] | None = None,
-    logger: Optional[logging.Logger] = None,
-) -> None:
-    """Write a normalized CSV row via toolset writer."""
-    log = _logger(logger)
-    try:
-        # type: ignore[call-arg]
-        config.WRITE_ROW(
-            writer=writer,
-            resource_id=resource_id,
-            name=name,
-            resource_type=resource_type,
-            owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-            state=state,
-            creation_date=creation_date,
-            storage_gb=storage_gb,
-            estimated_cost=estimated_cost,
-            app_id=app_id,
-            app=app,
-            env=env,
-            referenced_in=referenced_in,
-            flags=flags,
-            object_count=object_count if object_count is not None else "",
-            potential_saving=potential_saving,
-            confidence=100,
-            signals=_signals_str(signals or {}),
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        log.warning(f"[ddb] write_row failed for {resource_id}: {exc}")
 
 
 # ------------------------------- inventories ------------------------------- #
@@ -214,7 +118,7 @@ def _describe_tables_concurrent(
     workers = _safe_workers(dynamodb, max_workers)
     # Keep in-flight bounded to avoid task storms on large fleets.
     chunk_size = workers * 8
-    for chunk in _iter_chunks(names, chunk_size):
+    for chunk in iter_chunks(names, chunk_size):
         with cf.ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(_describe_table, dynamodb, n): n for n in chunk}
             for fut in cf.as_completed(futs):
@@ -242,7 +146,7 @@ def _tags_concurrent(
         return out
     workers = _safe_workers(dynamodb, max_workers)
     chunk_size = workers * 8
-    for chunk in _iter_chunks(arns, chunk_size):
+    for chunk in iter_chunks(arns, chunk_size):
         with cf.ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(_list_tags, dynamodb, arn): arn for arn in chunk}
             for fut in cf.as_completed(futs):
@@ -271,7 +175,7 @@ def _ttl_concurrent(
         return out
     workers = _safe_workers(dynamodb, max_workers)
     chunk_size = workers * 8
-    for chunk in _iter_chunks(names, chunk_size):
+    for chunk in iter_chunks(names, chunk_size):
         with cf.ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(_describe_ttl, dynamodb, n): n for n in chunk}
             for fut in cf.as_completed(futs):
@@ -425,13 +329,14 @@ def check_dynamodb_tables_no_pitr(  # pylint: disable=unused-argument
             continue
 
         tags = arn_to_tags.get(arn, {})
-        app_id, app, env = _tag_triplet(tags)
+        app_id, app, env = tag_triplet(tags)
 
         _write_row(
             writer=writer,
             resource_id=name,
             name=name,
             region=region,
+            resource_type="Dynamo_DB",
             flags=["DDBPITRDisabled"],
             state=str(tab.get("TableStatus") or ""),
             creation_date=_iso(tab.get("CreationDateTime")),
@@ -486,13 +391,14 @@ def check_dynamodb_tables_no_ttl(  # pylint: disable=unused-argument
             continue
 
         tags = arn_to_tags.get(tab.get("TableArn", ""), {})
-        app_id, app, env = _tag_triplet(tags)
+        app_id, app, env = tag_triplet(tags)
 
         _write_row(
             writer=writer,
             resource_id=name,
             name=name,
             region=region,
+            resource_type="Dynamo_DB",
             flags=["DDBTTLDisabled"],
             state=str(tab.get("TableStatus") or ""),
             creation_date=_iso(tab.get("CreationDateTime")),
@@ -564,12 +470,13 @@ def check_dynamodb_tables_unused(  # pylint: disable=unused-argument
         pot = est_prov  # storage remains even if unused
 
         tags = arn_to_tags.get(tab.get("TableArn", ""), {})
-        app_id, app, env = _tag_triplet(tags)
+        app_id, app, env = tag_triplet(tags)
 
         _write_row(
             writer=writer,
             resource_id=name,
             name=name,
+            resource_type="Dynamo_DB",
             region=region,
             flags=["DDBTableNoTraffic"],
             state=str(tab.get("TableStatus") or ""),
@@ -664,11 +571,12 @@ def check_dynamodb_tables_overprovisioned(  # pylint: disable=unused-argument
         saving = max(0.0, cur_cost - rec_cost)
 
         tags = arn_to_tags.get(tab.get("TableArn", ""), {})
-        app_id, app, env = _tag_triplet(tags)
+        app_id, app, env = tag_triplet(tags)
 
         _write_row(
             writer=writer,
             resource_id=name,
+            resource_type="Dynamo_DB",
             name=name,
             region=region,
             flags=["DDBOverprovisioned"],

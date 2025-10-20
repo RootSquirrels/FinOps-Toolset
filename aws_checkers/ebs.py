@@ -14,11 +14,16 @@ from __future__ import annotations
 import concurrent.futures as cf
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from botocore.exceptions import ClientError
 
 from aws_checkers import config
+from aws_checkers.common import (
+    _logger,
+    tag_triplet,
+    _write_row
+)
 from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher 
 
@@ -51,13 +56,6 @@ _SNAPSHOT_GB_MONTH = _p("EBS", "SNAPSHOT_GB_MONTH", 0.05)
 
 # ------------------------------- tiny helpers ------------------------------ #
 
-def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
-    return fallback or config.LOGGER or logging.getLogger(__name__)
-
-
-def _nonnull(s: Optional[str]) -> str:
-    return "NULL" if not s else s
-
 
 def _tags_to_dict(pairs: Optional[List[Dict[str, str]]]) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -68,84 +66,11 @@ def _tags_to_dict(pairs: Optional[List[Dict[str, str]]]) -> Dict[str, str]:
     return out
 
 
-def _pick_tag(tags: Dict[str, str], keys: Iterable[str]) -> Optional[str]:
-    low = {k.lower(): v for k, v in tags.items()}
-    for k in keys:
-        v = low.get(str(k).lower())
-        if v:
-            return v
-    return None
-
-
-def _tag_triplet(tags: Dict[str, str]) -> Tuple[str, str, str]:
-    app_id = _pick_tag(tags, ["app_id", "application_id", "app-id"])
-    app = _pick_tag(tags, ["app", "application", "service"])
-    env = _pick_tag(tags, ["environment", "env", "stage"])
-    return _nonnull(app_id), _nonnull(app), _nonnull(env)
-
-
-def _signals_str(pairs: Dict[str, object]) -> str:
-    parts: List[str] = []
-    for k, v in pairs.items():
-        if v is None or v == "":
-            continue
-        parts.append(f"{k}={v}")
-    return " | ".join(parts)
-
-
 def _iso(dt: Optional[datetime]) -> str:
     if not isinstance(dt, datetime):
         return ""
     d = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     return d.replace(microsecond=0).isoformat()
-
-
-def _write_row(  # noqa: D401
-    *,
-    writer,
-    resource_id: str,
-    resource_type: str,
-    name: str,
-    region: str,
-    flags: List[str],
-    estimated_cost: float = 0.0,
-    potential_saving: float = 0.0,
-    signals: Dict[str, object],
-    logger: logging.Logger,
-    state: str = "",
-    creation_date: str = "",
-    storage_gb: float = 0.0,
-    app_id: str = "NULL",
-    app: str = "NULL",
-    env: str = "NULL",
-    referenced_in: str = "",
-    object_count: Optional[int] = None,
-) -> None:
-    """Safely write one normalized row via the toolset writer."""
-    try:
-        # type: ignore[call-arg]
-        config.WRITE_ROW(
-            writer=writer,
-            resource_id=resource_id,
-            name=name,
-            resource_type=resource_type,
-            owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-            state=state,
-            creation_date=creation_date,
-            storage_gb=storage_gb,
-            estimated_cost=float(estimated_cost),
-            app_id=app_id,
-            app=app,
-            env=env,
-            referenced_in=referenced_in,
-            flags=flags,
-            object_count=object_count if object_count is not None else "",
-            potential_saving=float(potential_saving),
-            confidence=100,
-            signals=_signals_str(signals),
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning(f"[ebs] write_row failed for {resource_id}: {exc}")
 
 
 def _extract_writer_ec2(
@@ -331,7 +256,7 @@ def check_ebs_unattached_volumes(  # pylint: disable=unused-argument
         if str(v.get("State")) != "available":
             continue
         tags = _tags_to_dict(v.get("Tags"))
-        app_id, app, env = _tag_triplet(tags)
+        app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
         _write_row(
             writer=writer,
@@ -381,7 +306,7 @@ def check_ebs_gp2_to_gp3_candidates(  # pylint: disable=unused-argument
         if str(v.get("VolumeType")).lower() != "gp2":
             continue
         tags = _tags_to_dict(v.get("Tags"))
-        app_id, app, env = _tag_triplet(tags)
+        app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
         pot = _gp2_to_gp3_saving(v)
         _write_row(
@@ -435,7 +360,7 @@ def check_ebs_unencrypted_volumes(  # pylint: disable=unused-argument
         if bool(v.get("Encrypted")):
             continue
         tags = _tags_to_dict(v.get("Tags"))
-        app_id, app, env = _tag_triplet(tags)
+        app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
         _write_row(
             writer=writer,
@@ -537,7 +462,7 @@ def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
             continue
 
         tags = _tags_to_dict(v.get("Tags"))
-        app_id, app, env = _tag_triplet(tags)
+        app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
 
         _write_row(
@@ -605,7 +530,7 @@ def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
             continue
 
         tags = _tags_to_dict(s.get("Tags"))
-        app_id, app, env = _tag_triplet(tags)
+        app_id, app, env = tag_triplet(tags)
 
         flags: List[str] = []
         if is_public:
@@ -675,7 +600,7 @@ def check_ebs_snapshots_old(  # pylint: disable=unused-argument
         if st > cutoff:
             continue
         tags = _tags_to_dict(s.get("Tags"))
-        app_id, app, env = _tag_triplet(tags)
+        app_id, app, env = tag_triplet(tags)
         est = _snapshot_monthly_cost_guesstimate(s)
         _write_row(
             writer=writer,
@@ -726,7 +651,7 @@ def check_ebs_snapshots_unreferenced(  # pylint: disable=unused-argument
         if not sid or sid in used_ids:
             continue
         tags = _tags_to_dict(s.get("Tags"))
-        app_id, app, env = _tag_triplet(tags)
+        app_id, app, env = tag_triplet(tags)
         est = _snapshot_monthly_cost_guesstimate(s)
         _write_row(
             writer=writer,

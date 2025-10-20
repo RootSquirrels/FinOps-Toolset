@@ -203,7 +203,7 @@ logging.basicConfig(
 
 #logger = logging.getLogger("aws-finops")  # base logger for your script
 
-#region CSV Helpers 
+#region CSV Helpers
 
 def write_resource_to_csv(
     writer: csv.writer,
@@ -228,7 +228,7 @@ def write_resource_to_csv(
     """
     Unified CSV writer with extended columns:
       - Object_Count: numeric count (e.g., S3 NumberOfObjects).
-      - Potential_Saving_USD: numeric, auto-parsed from flags 'PotentialSaving=12.34$' (if not provided).
+      - Potential_Saving_USD: numeric, auto-parsed from flags 'PotentialSaving=12.34$'
       - Confidence: int 0-100 indicating how strong the evidence is.
       - Signals: compact diagnostics (str or 'k=v;...' built from dict/list).
     """
@@ -266,7 +266,7 @@ def write_resource_to_csv(
             for k, v in signals.items():
                 try:
                     parts.append(f"{k}={v}")
-                except Exception:
+                except Exception: # pylint: disable=broad-except
                     parts.append(f"{k}=<err>")
             signals_str = " | ".join(parts)
         else:
@@ -335,7 +335,7 @@ def get_account_id(sts_client=None) -> str:
     try:
         c = sts_client or boto3.client("sts", config=SDK_CONFIG)
         return c.get_caller_identity().get("Account", "")
-    except Exception:
+    except Exception: # pylint: disable=broad-except
         return ""
     
 ACCOUNT_ID = get_account_id()
@@ -384,6 +384,7 @@ class RunProfiler:
         })
 
     def dump_csv(self, path: Optional[str] = None):
+        """dump csv"""
         path = path or self.profile_file
         header = ["TimestampUTC", "Step", "Region", "Seconds", "RowsWritten", "OK",
                   "Error", "StartedAtUTC", "EndedAtUTC"]
@@ -396,6 +397,7 @@ class RunProfiler:
                 w.writerow([r[h] for h in header])
 
     def log_summary(self, top_n: int = 15):
+        """retrieves statistic at the end of scan"""
         if not self.records:
             logging.info("[PROFILE] No records.")
             return
@@ -503,8 +505,8 @@ def main():
                 s3_global = boto3.client("s3", config=SDK_CONFIG)
                 cloudwatch_global = boto3.client("cloudwatch", config=SDK_CONFIG)
                 region="GLOBAL"
-            except Exception as e:
-                logging.error(f"[main] Failed to create global S3 client: {e}")
+            except Exception as e: # pylint: disable=broad-except
+                logging.error("[main] Failed to create global S3 client: %s", e)
                 s3_global = boto3.client("s3")  # fallback
                 cloudwatch_global = boto3.client("cloudwatch")
 
@@ -554,11 +556,11 @@ def main():
 
             # -------- Per-region steps
             for region in REGIONS:
-                logging.info(f"Running cleanup for region: {region}")
+                logging.info("Running cleanup for region: %s", region)
                 try:
                     clients = init_clients(region)
-                except Exception as e:
-                    logging.error(f"[main] init_clients({region}) failed: {e}")
+                except Exception as e: # pylint: disable=broad-except
+                    logging.error("[main] init_clients(%s) failed: %s", region, e)
                     continue
 
                 #correlator WIP
@@ -743,7 +745,7 @@ def main():
                     writer=writer,
                     acm=clients["acm"],
                 )
-                #TODO: ignore slave instances (sap db)
+                #roadmap: ignore slave instances (sap db)
                 run_check(
                     profiler, "check_ec2_underutilized_instances",
                     region, ec2_checks.check_ec2_underutilized_instances,
@@ -824,7 +826,7 @@ def main():
                           region, kinesis_checks.check_firehose_delivery_streams,
                           writer=writer, firehose=clients["firehose"],
                           cloudwatch=clients["cloudwatch"])
-                
+
                 run_check(profiler, "check_dynamodb_tables_overprovisioned", region,
                           ddb_checks.check_dynamodb_tables_overprovisioned, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
@@ -837,7 +839,7 @@ def main():
                 run_check(profiler, "check_dynamodb_tables_no_pitr", region,
                           ddb_checks.check_dynamodb_tables_no_pitr, writer=writer,
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
-                
+
                 run_check(
                             profiler, "check_ami_public_or_shared",
                             region, ami_checks.check_ami_public_or_shared,
@@ -1060,11 +1062,11 @@ def main():
 
         profiler.dump_csv()
         profiler.log_summary(top_n=30)
-        logging.info(f"CSV export complete: {OUTPUT_FILE}")
-        logging.info(f"Profile export complete: {PROFILE_FILE}")
+        logging.info("CSV export complete: %s", OUTPUT_FILE)
+        logging.info("Profile export complete: %s", PROFILE_FILE)
 
-    except Exception as e:
-        logging.error(f"[main] Fatal error: {e}")
+    except Exception as e: # pylint: disable=broad-except
+        logging.exception("[main] Fatal error: %s", e)
 
 if __name__ == "__main__":
     main()
