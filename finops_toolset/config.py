@@ -40,6 +40,7 @@ def _env_set(key: str, default: Iterable[str]) -> Set[str]:
 SDK_CONFIG = Config(
     retries={"max_attempts": 10, "mode": "standard"},
     connect_timeout=5, read_timeout=60,
+    max_pool_connections=16,
     user_agent_extra="finops-toolset/1.0",
 )
 

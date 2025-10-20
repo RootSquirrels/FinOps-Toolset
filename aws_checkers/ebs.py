@@ -413,12 +413,6 @@ def check_ebs_gp2_to_gp3_candidates(  # pylint: disable=unused-argument
         log.info(f"[ebs] Wrote gp2→gp3 candidate: {v.get('VolumeId')}")
 
 
-# Legacy alias (no regression)
-def check_ebs_gp2_not_gp3(*args, **kwargs) -> None:  # noqa: D401
-    """Alias of :func:`check_ebs_gp2_to_gp3_candidates`."""
-    return check_ebs_gp2_to_gp3_candidates(*args, **kwargs)
-
-
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ebs_unencrypted_volumes(  # pylint: disable=unused-argument
     *args,
@@ -578,7 +572,7 @@ def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
 def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
     *args,
     logger: Optional[logging.Logger] = None,
-    max_workers: int = 16,
+    max_workers: int = 12,
     **kwargs,
 ) -> None:
     """Flag EBS snapshots that are PUBLIC or shared with other accounts."""
@@ -708,12 +702,6 @@ def check_ebs_snapshots_old(  # pylint: disable=unused-argument
         log.info(f"[ebs] Wrote old snapshot: {s.get('SnapshotId')}")
 
 
-# Legacy alias (no regression)
-def check_ebs_snapshot_stale(*args, **kwargs) -> None:  # noqa: D401
-    """Alias of :func:`check_ebs_snapshots_old`."""
-    return check_ebs_snapshots_old(*args, **kwargs)
-
-
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ebs_snapshots_unreferenced(  # pylint: disable=unused-argument
     *args,
@@ -760,9 +748,3 @@ def check_ebs_snapshots_unreferenced(  # pylint: disable=unused-argument
             referenced_in="",
         )
         log.info(f"[ebs] Wrote unreferenced snapshot: {sid}")
-
-
-# Legacy alias (no regression)
-def check_ebs_orphan_snapshots(*args, **kwargs) -> None:  # noqa: D401
-    """Alias of :func:`check_ebs_snapshots_unreferenced`."""
-    return check_ebs_snapshots_unreferenced(*args, **kwargs)
