@@ -142,13 +142,13 @@ def fixture_captured_rows(monkeypatch) -> List[Dict[str, object]]:
     return rows
 
 
-@pytest.fixture(name="fake_account_id")
+@pytest.fixture(name="ACCOUNT_ID")
 def fixture_fake_account_id(monkeypatch) -> str:
     """Force a deterministic 12-digit account id in config."""
     cfg = import_module(CONFIG_MODULE)
-    account_id = "123456789012"
-    monkeypatch.setattr(cfg, "account_id", account_id, raising=True)
-    return account_id
+    ACCOUNT_ID = "123456789012"
+    monkeypatch.setattr(cfg, "ACCOUNT_ID", ACCOUNT_ID, raising=True)
+    return ACCOUNT_ID
 
 
 def test_static_owner_id_safety_across_all_checkers() -> None:

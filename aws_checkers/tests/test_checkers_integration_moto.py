@@ -79,9 +79,9 @@ def fixture_captured_rows(monkeypatch) -> List[Dict[str, object]]:
 @pytest.fixture(name="fake_account_id")
 def fixture_fake_account_id(monkeypatch) -> str:
     cfg = import_module(CONFIG_MODULE)
-    account_id = "123456789012"
-    monkeypatch.setattr(cfg, "account_id", account_id, raising=True)
-    return account_id
+    ACCOUNT_ID = "123456789012"
+    monkeypatch.setattr(cfg, "ACCOUNT_ID", ACCOUNT_ID, raising=True)
+    return ACCOUNT_ID
 
 
 @pytest.mark.integration
