@@ -461,4 +461,5 @@ def run_s3_checks(
     for br in _iter_bucket_rows(
         regions, s3_global=s3_global, s3_for_region=s3_for_region
     ):
-        cfg.WRITE_ROW(br.to_row())
+        row = br.to_row()
+        cfg.WRITE_ROW(**row)
