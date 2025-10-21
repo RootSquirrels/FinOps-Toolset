@@ -23,7 +23,7 @@ from botocore.exceptions import ClientError
 from aws_checkers import config
 from aws_checkers.common import (
     _logger,
-    _signals_str,
+    _write_row,
 )
 from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher
@@ -244,34 +244,6 @@ def _tag_triplet(tags: Dict[str, str]) -> Tuple[str, str, str]:
     env = _pick_tag(tags, ["environment", "env", "stage"])
     return _nonnull_tag(app_id), _nonnull_tag(app), _nonnull_tag(env)
 
-def _write_row_bucket(
-    writer,
-    bucket: str,
-    region: str,
-    flags: List[str],
-    signals_extra: Optional[Dict[str, object]] = None,
-    logger: Optional[logging.Logger] = None,
-    estimated_cost: Optional[float] = None,
-    potential_saving: Optional[float] = None,
-) -> None:
-    log = _logger(logger)
-    try:
-        # type: ignore[call-arg]
-        config.WRITE_ROW(
-            writer=writer,
-            resource_id=bucket,
-            name=bucket,
-            owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-            resource_type="S3Bucket",
-            estimated_cost=float(estimated_cost or 0.0),
-            potential_saving=float(potential_saving or 0.0),
-            flags=flags,
-            confidence=100,
-            signals=_signals_str(signals_extra or {}),
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        log.warning(f"[s3] write_row bucket {bucket}: {exc}")
-
 # ------------------------- CloudWatch enrichment -------------------------- #
 
 def _latest_from_result(res: Any) -> Optional[float]:
@@ -451,17 +423,18 @@ def check_s3_lifecycle_hygiene(  # pylint: disable=unused-argument
             "Objects": objects if objects is not None else "NULL",
             "SizeGB": round(sum(_gb(v) for v in by_class.values()), 3) if by_class else "NULL",
             "TieringPctHeuristic": pct,
-            "TagAppId": app_id,
-            "TagApp": app,
-            "TagEnv": env,
         }
-        _write_row_bucket(
-            writer,
-            bucket,
-            region,
-            flags,
-            signals,
-            log,
+        _write_row(
+            resource_id=bucket,
+            resource_type="S3Bucket",
+            writer=writer,
+            name=bucket,
+            region=region,
+            flags=flags,
+            signals=signals,
+            app_id=app_id,
+            app=app,
+            env=env,
             estimated_cost=est,
             potential_saving=pot,
         )
@@ -515,18 +488,20 @@ def check_s3_no_default_encryption(  # pylint: disable=unused-argument
             "DefaultEncryption": False,
             "Objects": objects if objects is not None else "NULL",
             "SizeGB": round(sum(_gb(v) for v in by_class.values()), 3) if by_class else "NULL",
-            "TagAppId": app_id,
-            "TagApp": app,
-            "TagEnv": env,
+
         }
 
-        _write_row_bucket(
-            writer,
-            bucket,
-            region,
+        _write_row(
+            resource_id=bucket,
+            resource_type="S3Bucket",
+            writer=writer,
+            name=bucket,
+            region=region,
             flags=["S3NoDefaultEncryption"],
-            signals_extra=signals,
-            logger=log,
+            signals=signals,
+            app_id=app_id,
+            app=app,
+            env=env,
             estimated_cost=est,
             potential_saving=0.0,
         )
@@ -568,17 +543,21 @@ def check_s3_public_access_block_off(  # pylint: disable=unused-argument
                 "Region": region,
                 "Bucket": bucket,
                 "PAB": "Missing",
-                "TagAppId": app_id,
-                "TagApp": app,
-                "TagEnv": env,
             }
-            _write_row_bucket(
-                writer,
-                bucket,
-                region,
+
+            _write_row(
+                resource_id=bucket,
+                resource_type="S3Bucket",
+                writer=writer,
+                name=bucket,
+                region=region,
                 flags=["S3PublicAccessBlockMissing"],
-                signals_extra=signals,
-                logger=log,
+                signals=signals,
+                app_id=app_id,
+                app=app,
+                env=env,
+                estimated_cost=0.0,
+                potential_saving=0.0,
             )
             log.info(f"[s3] Wrote PAB missing: {bucket}")
             continue
@@ -591,18 +570,22 @@ def check_s3_public_access_block_off(  # pylint: disable=unused-argument
             "Region": region,
             "Bucket": bucket,
             "PAB": "|".join(f"{k}={bool(cfg.get(k))}" for k in needed.keys()),
-            "TagAppId": app_id,
-            "TagApp": app,
-            "TagEnv": env,
         }
-        _write_row_bucket(
-            writer,
-            bucket,
-            region,
+
+        _write_row(
+            resource_id=bucket,
+            resource_type="S3Bucket",
+            writer=writer,
+            name=bucket,
+            region=region,
             flags=["S3PublicAccessBlockPartial"],
-            signals_extra=signals,
-            logger=log,
-        )
+            signals=signals,
+            app_id=app_id,
+            app=app,
+            env=env,
+            estimated_cost=0.0,
+            potential_saving=0.0,
+            )
         log.info(f"[s3] Wrote PAB partial: {bucket}")
 
 @retry_with_backoff(exceptions=(ClientError,))
@@ -667,20 +650,22 @@ def check_s3_ia_tiering_candidates(  # pylint: disable=unused-argument
             "Objects": objects if objects is not None else "NULL",
             "SizeGB": round(sum(_gb(v) for v in by_class.values()), 3) if by_class else "NULL",
             "TieringPctHeuristic": pct,
-            "TagAppId": app_id,
-            "TagApp": app,
-            "TagEnv": env,
         }
-        _write_row_bucket(
-            writer,
-            bucket,
-            region,
+        _write_row(
+            resource_id=bucket,
+            resource_type="S3Bucket",
+            writer=writer,
+            name=bucket,
+            region=region,
             flags=["S3NoIATieringTransitions"],
-            signals_extra=signals,
-            logger=log,
+            signals=signals,
+            app_id=app_id,
+            app=app,
+            env=env,
             estimated_cost=est,
             potential_saving=pot,
-        )
+            )
+
         log.info(f"[s3] Wrote IA tiering candidate: {bucket}")
 
 # ---------------------- Stale multipart uploads (age) --------------------- #
@@ -770,18 +755,22 @@ def check_s3_stale_multipart_uploads(  # pylint: disable=unused-argument
             "OldestAgeDays": oldest if oldest is not None else "NULL",
             "AbortIncompleteDays": abort_days if has_abort else "NULL",
             "LookbackDays": int(stale_days),
-            "TagAppId": app_id,
-            "TagApp": app,
-            "TagEnv": env,
         }
-        _write_row_bucket(
-            writer,
-            bucket,
-            region,
+        _write_row(
+            resource_id=bucket,
+            resource_type="S3Bucket",
+            writer=writer,
+            name=bucket,
+            region=region,
             flags=flags,
-            signals_extra=signals,
-            logger=log,
-        )
+            signals=signals,
+            app_id=app_id,
+            app=app,
+            env=env,
+            estimated_cost=0.0,
+            potential_saving=0.0,
+            )
+
         log.info(f"[s3] Wrote stale multipart uploads: {bucket} (count={cnt})")
 
 # --------------------------- Empty bucket checker ------------------------- #
@@ -860,18 +849,20 @@ def check_s3_empty_buckets(  # pylint: disable=unused-argument
             "Bucket": bucket,
             "Objects": objects if objects is not None else "NULL",
             "SizeGB": round(sum(_gb(v) for v in by_class.values()), 3) if by_class else "NULL",
-            "TagAppId": app_id,
-            "TagApp": app,
-            "TagEnv": env,
         }
-        _write_row_bucket(
-            writer,
-            bucket,
-            region,
+        _write_row(
+            resource_id=bucket,
+            resource_type="S3Bucket",
+            writer=writer,
+            name=bucket,
+            region=region,
             flags=["S3BucketEmpty"],
-            signals_extra=signals,
-            logger=log,
+            signals=signals,
+            app_id=app_id,
+            app=app,
+            env=env,
             estimated_cost=est,
             potential_saving=0.0,
-        )
+            )
+
         log.info(f"[s3] Wrote empty bucket: {bucket}")
