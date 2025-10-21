@@ -533,13 +533,13 @@ def run(
     s3_global=None,
     s3_for_region=None,
 ) -> None:
-    ...
     for br in _iter_bucket_rows(
         regions,
         s3_global=s3_global,
         s3_for_region=s3_for_region,
     ):
-        _emit_row(writer, br.to_row()) 
+        print("test")
+        _emit_row(writer, br.to_row())
 
 
 def run_s3_checks(
