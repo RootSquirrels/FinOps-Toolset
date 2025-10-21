@@ -451,7 +451,7 @@ def _iter_bucket_rows(
         )
 
 
-def run(
+def run_s3_checks(
     regions: Optional[Iterable[str]] = None,
     *,
     s3_global=None,
