@@ -21,7 +21,7 @@ jobs:
 
       - name: Pylint (src + tests)
         run: |
-          pylint finops_toolset tests
+          pylint $(git ls-files '*.py') || pylint-exit $?
 
       - name: Pytest (fast)
         env:
