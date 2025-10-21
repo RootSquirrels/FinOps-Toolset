@@ -6,12 +6,11 @@ Keeps modules DRY and silences pylint R0801:
 - _to_utc_iso: safe UTC ISO8601 (no microseconds) for CSV dates.
 - Tag helpers: _nonnull, tags_to_dict, pick_tag, tag_triplet.
 - Concurrency helpers: _pool_size, _safe_workers, iter_chunks.
-- _write_row: normalized CSV writer wrapper using config.WRITE_ROW.
 
 All functions are small and dependency-free; import what you need:
     from finops_toolset.checkers.common import (
         _logger, _signals_str, _to_utc_iso,
-        tags_to_dict, tag_triplet, _safe_workers, iter_chunks, _write_row
+        tags_to_dict, tag_triplet, _safe_workers, iter_chunks
     )
 """
 

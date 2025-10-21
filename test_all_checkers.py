@@ -603,7 +603,6 @@ class TestCSVInvariants(unittest.TestCase):
             storage_gb=None,
             object_count=None,
             estimated_cost=16.43,
-            potential_saving=2.47,
             app_id="NULL",
             app="App",
             env="dev",

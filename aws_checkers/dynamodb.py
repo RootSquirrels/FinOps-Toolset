@@ -341,7 +341,6 @@ def check_dynamodb_tables_no_pitr(  # pylint: disable=unused-argument
                 "Region": region,
                 "BillingMode": (tab.get("BillingModeSummary") or {}).get("BillingMode", "PROVISIONED"),
             },
-            logger=log,
         )
         log.info(f"[ddb] Wrote PITR disabled: {name}")
 
@@ -403,7 +402,6 @@ def check_dynamodb_tables_no_ttl(  # pylint: disable=unused-argument
                 "Region": region,
                 "BillingMode": (tab.get("BillingModeSummary") or {}).get("BillingMode", "PROVISIONED"),
             },
-            logger=log,
         )
         log.info(f"[ddb] Wrote TTL disabled: {name}")
 
@@ -487,7 +485,6 @@ def check_dynamodb_tables_unused(  # pylint: disable=unused-argument
                 "ConsumedRCU": rcu_sum,
                 "ConsumedWCU": wcu_sum,
             },
-            logger=log,
         )
         log.info(f"[ddb] Wrote table no-traffic: {name}")
 
@@ -591,6 +588,5 @@ def check_dynamodb_tables_overprovisioned(  # pylint: disable=unused-argument
                 "UtilW": round(w_util, 4),
                 "LookbackDays": int(lookback_days),
             },
-            logger=log,
         )
         log.info(f"[ddb] Wrote overprovisioned table: {name}")
