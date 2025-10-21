@@ -20,7 +20,6 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-
 from aws_checkers import config
 
 
@@ -105,54 +104,3 @@ def iter_chunks(items: List[Any], n: int):
     size = max(1, n)
     for i in range(0, len(items), size):
         yield items[i : i + size]
-
-
-def _write_row(  # noqa: D401
-    *,
-    writer,
-    resource_id: str,
-    name: str,
-    resource_type: str,
-    region: str,
-    flags: List[str],
-    estimated_cost: float | str = 0.0,
-    potential_saving: float | str | None = None,
-    signals: Dict[str, object] | None = None,
-    logger: Optional[logging.Logger] = None,
-    # Optional CSV columns (safely defaulted)
-    state: str = "",
-    creation_date: str = "",
-    storage_gb: float | str = 0.0,
-    app_id: str = "NULL",
-    app: str = "NULL",
-    env: str = "NULL",
-    referenced_in: str = "",
-    object_count: int | str | None = "",
-) -> None:
-    """Unified CSV writer wrapper using config.WRITE_ROW."""
-    log = _logger(logger)
-    try:
-        # type: ignore[call-arg]
-        config.WRITE_ROW(
-            writer=writer,
-            resource_id=resource_id,
-            name=name,
-            resource_type=resource_type,
-            region=region,
-            owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-            state=state,
-            creation_date=creation_date,
-            storage_gb=storage_gb,
-            estimated_cost=estimated_cost,
-            app_id=app_id,
-            app=app,
-            env=env,
-            referenced_in=referenced_in,
-            flags=flags,
-            object_count=object_count if object_count is not None else "",
-            potential_saving=potential_saving,
-            confidence=100,
-            signals=_signals_str(signals or {}),
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        log.warning(f"[common] write_row failed for {resource_id}: {exc}")

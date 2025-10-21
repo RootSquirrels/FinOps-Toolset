@@ -23,7 +23,6 @@ from botocore.exceptions import ClientError
 from aws_checkers import config
 from aws_checkers.common import (
     _logger,
-    _write_row,
 )
 from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher
@@ -424,7 +423,7 @@ def check_s3_lifecycle_hygiene(  # pylint: disable=unused-argument
             "SizeGB": round(sum(_gb(v) for v in by_class.values()), 3) if by_class else "NULL",
             "TieringPctHeuristic": pct,
         }
-        _write_row(
+        config.WRITE_ROW(
             resource_id=bucket,
             resource_type="S3Bucket",
             writer=writer,
@@ -491,7 +490,7 @@ def check_s3_no_default_encryption(  # pylint: disable=unused-argument
 
         }
 
-        _write_row(
+        config.WRITE_ROW(
             resource_id=bucket,
             resource_type="S3Bucket",
             writer=writer,
@@ -545,7 +544,7 @@ def check_s3_public_access_block_off(  # pylint: disable=unused-argument
                 "PAB": "Missing",
             }
 
-            _write_row(
+            config.WRITE_ROW(
                 resource_id=bucket,
                 resource_type="S3Bucket",
                 writer=writer,
@@ -572,7 +571,7 @@ def check_s3_public_access_block_off(  # pylint: disable=unused-argument
             "PAB": "|".join(f"{k}={bool(cfg.get(k))}" for k in needed.keys()),
         }
 
-        _write_row(
+        config.WRITE_ROW(
             resource_id=bucket,
             resource_type="S3Bucket",
             writer=writer,
@@ -651,7 +650,7 @@ def check_s3_ia_tiering_candidates(  # pylint: disable=unused-argument
             "SizeGB": round(sum(_gb(v) for v in by_class.values()), 3) if by_class else "NULL",
             "TieringPctHeuristic": pct,
         }
-        _write_row(
+        config.WRITE_ROW(
             resource_id=bucket,
             resource_type="S3Bucket",
             writer=writer,
@@ -756,7 +755,7 @@ def check_s3_stale_multipart_uploads(  # pylint: disable=unused-argument
             "AbortIncompleteDays": abort_days if has_abort else "NULL",
             "LookbackDays": int(stale_days),
         }
-        _write_row(
+        config.WRITE_ROW(
             resource_id=bucket,
             resource_type="S3Bucket",
             writer=writer,
@@ -850,7 +849,7 @@ def check_s3_empty_buckets(  # pylint: disable=unused-argument
             "Objects": objects if objects is not None else "NULL",
             "SizeGB": round(sum(_gb(v) for v in by_class.values()), 3) if by_class else "NULL",
         }
-        _write_row(
+        config.WRITE_ROW(
             resource_id=bucket,
             resource_type="S3Bucket",
             writer=writer,

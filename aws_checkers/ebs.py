@@ -28,7 +28,6 @@ from aws_checkers.common import (
     tag_triplet,
     _safe_workers,
     iter_chunks,
-    _write_row,
 )
 from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher
@@ -272,7 +271,7 @@ def check_ebs_unattached_volumes(  # pylint: disable=unused-argument
         app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
 
-        _write_row(
+        config.WRITE_ROW(
             writer=writer,
             resource_id=str(v.get("VolumeId")),
             name=str(v.get("VolumeId")),
@@ -325,7 +324,7 @@ def check_ebs_gp2_not_gp3(  # pylint: disable=unused-argument
         est = _volume_monthly_cost(v)
         pot = _gp2_to_gp3_saving(v)
 
-        _write_row(
+        config.WRITE_ROW(
             writer=writer,
             resource_id=str(v.get("VolumeId")),
             name=str(v.get("VolumeId")),
@@ -379,7 +378,7 @@ def check_ebs_unencrypted_volumes(  # pylint: disable=unused-argument
         app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
 
-        _write_row(
+        config.WRITE_ROW(
             writer=writer,
             resource_id=str(v.get("VolumeId")),
             name=str(v.get("VolumeId")),
@@ -481,7 +480,7 @@ def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
         app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
 
-        _write_row(
+        config.WRITE_ROW(
             writer=writer,
             resource_id=vid,
             name=vid,
@@ -560,7 +559,7 @@ def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
         if is_public and "EBSSnapshotShared" in flags:
             flags = ["EBSSnapshotPublic"]
 
-        _write_row(
+        config.WRITE_ROW(
             writer=writer,
             resource_id=sid,
             name=sid,
@@ -622,7 +621,7 @@ def check_ebs_snapshot_stale(  # pylint: disable=unused-argument
         app_id, app, env = tag_triplet(tags)
         est = _snapshot_monthly_cost_guesstimate(s)
 
-        _write_row(
+        config.WRITE_ROW(
             writer=writer,
             resource_id=str(s.get("SnapshotId")),
             name=str(s.get("SnapshotId")),
@@ -677,7 +676,7 @@ def check_ebs_orphan_snapshots(  # pylint: disable=unused-argument
         app_id, app, env = tag_triplet(tags)
         est = _snapshot_monthly_cost_guesstimate(s)
 
-        _write_row(
+        config.WRITE_ROW(
             writer=writer,
             resource_id=sid,
             name=sid,

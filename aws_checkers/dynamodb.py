@@ -44,7 +44,6 @@ from aws_checkers.common import (
     tag_triplet,
     _safe_workers,
     iter_chunks,
-    _write_row,
     tags_to_dict
 )
 from core.retry import retry_with_backoff
@@ -322,7 +321,7 @@ def check_dynamodb_tables_no_pitr(  # pylint: disable=unused-argument
         tags = arn_to_tags.get(arn, {})
         app_id, app, env = tag_triplet(tags)
 
-        _write_row(
+        config.WRITE_ROW(
             writer=writer,
             resource_id=name,
             name=name,
@@ -384,7 +383,7 @@ def check_dynamodb_tables_no_ttl(  # pylint: disable=unused-argument
         tags = arn_to_tags.get(tab.get("TableArn", ""), {})
         app_id, app, env = tag_triplet(tags)
 
-        _write_row(
+        config.WRITE_ROW(
             writer=writer,
             resource_id=name,
             name=name,
@@ -463,7 +462,7 @@ def check_dynamodb_tables_unused(  # pylint: disable=unused-argument
         tags = arn_to_tags.get(tab.get("TableArn", ""), {})
         app_id, app, env = tag_triplet(tags)
 
-        _write_row(
+        config.WRITE_ROW(
             writer=writer,
             resource_id=name,
             name=name,
@@ -564,7 +563,7 @@ def check_dynamodb_tables_overprovisioned(  # pylint: disable=unused-argument
         tags = arn_to_tags.get(tab.get("TableArn", ""), {})
         app_id, app, env = tag_triplet(tags)
 
-        _write_row(
+        config.WRITE_ROW(
             writer=writer,
             resource_id=name,
             resource_type="Dynamo_DB",
