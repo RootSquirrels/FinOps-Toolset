@@ -81,6 +81,7 @@ def write_resource_to_csv(
     name: str,
     resource_type: str,
     owner_id: str = "",
+    region: str = "",
     state: str = "",
     creation_date: str = "",
     storage_gb: Union[float, str] = 0.0,
@@ -143,7 +144,7 @@ def write_resource_to_csv(
             signals_str = str(signals)
 
         writer.writerow([
-            resource_id, name, resource_type, owner_id, state, creation_date,
+            resource_id, name, resource_type, region, owner_id, state, creation_date,
             storage_gb, object_count if object_count is not None else "",
             estimated_cost, potential_saving if potential_saving is not None else "",
             app_id, app, env, referenced_in, flagged,
@@ -151,14 +152,6 @@ def write_resource_to_csv(
         ])
     except Exception as e: # pylint: disable=broad-except
         logging.error("[write_resource_to_csv] Failed to write row for {%s or %s}: %s", resource_id, name, e)
-
-
-def _fmt_dt(dt: Optional[datetime]) -> str:
-    if not dt:
-        return ""
-    # unify to ISO-8601 Z (CSV-friendly)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
 
 #endregion
 
