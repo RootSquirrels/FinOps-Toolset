@@ -532,14 +532,12 @@ def run(
     writer: Any | None = None,         
     s3_global=None,
     s3_for_region=None,
-    cw_client=None,
 ) -> None:
     ...
     for br in _iter_bucket_rows(
         regions,
         s3_global=s3_global,
         s3_for_region=s3_for_region,
-        cw_client=cw_client,
     ):
         _emit_row(writer, br.to_row()) 
 
@@ -550,12 +548,10 @@ def run_s3_checks(
     writer: Any | None = None,
     s3_global=None,
     s3_for_region=None,
-    cloudwatch=None,   # kept for parity; CW client is created inside if needed
 ) -> None:
     run(
         [region] if region else None,
         writer=writer,
         s3_global=s3_global,
         s3_for_region=s3_for_region,
-        cw_client=cloudwatch,
     )
