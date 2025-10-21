@@ -40,7 +40,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import boto3 #type: ignore
 from botocore.config import Config #type: ignore
@@ -276,7 +276,8 @@ def _s3_delete_bucket(s3, bn: str, execute: bool, verify: bool) -> bool:
         # find region (HeadBucket redirects with x-amz-bucket-region)
         try:
             _aws_call(s3.head_bucket, Bucket=bn)
-        except ClientError:
+        except ClientError as e:
+            # try to recover region hint
             pass
         # quick emptiness checks
         try:
