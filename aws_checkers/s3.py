@@ -13,7 +13,6 @@ import datetime as dt
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-
 import boto3  # type: ignore
 from botocore.exceptions import BotoCoreError, ClientError  # type: ignore
 
@@ -41,6 +40,17 @@ _ALL_SIZE_TYPES = [
     "DeepArchiveStorage",
     "ReducedRedundancyStorage",
 ]
+
+def _normalize_regions(regions: object) -> set[str]:
+    """Return a lowercase set of regions from None/str/iterable[str]; else empty set."""
+    if regions is None:
+        return set()
+    if isinstance(regions, str):
+        return {regions.lower()}
+    try:
+        return {str(r).lower() for r in regions}  # type: ignore[arg-type]
+    except TypeError:
+        return set()
 
 
 def _client(service: str, *, region: Optional[str] = None):
@@ -368,7 +378,7 @@ def _iter_bucket_rows(
     except (ClientError, BotoCoreError):
         buckets = []
 
-    regions_set: set[str] = {r.lower() for r in regions} if regions else set()
+    regions_set: set[str] = _normalize_regions(regions)
 
     # Resolve home regions; group by region for CW batch; keep creation dates
     home_map: Dict[str, str] = {}
@@ -461,6 +471,7 @@ def run_s3_checks(
     cw_client=None,
 ) -> None:
     """Emit CSV rows for all buckets using CloudWatchBatcher when available."""
+
     for br in _iter_bucket_rows(
         regions,
         s3_global=s3_global,
