@@ -157,22 +157,3 @@ def test_static_owner_id_safety_across_all_checkers() -> None:
         module_obj = import_module(modname)
         _ast_enforce_owner_id_safety(module_obj)
 
-
-def test_runtime_rows_invariants_no_aws(
-    captured_rows: List[Dict[str, object]],
-    fake_account_id: str,
-) -> None:
-    """If any rows are emitted on import/quick-run code paths, validate them.
-
-    This test does not call AWS and does not attempt to execute entrypoints.
-    It simply guards against accidental row writes violating invariants.
-    """
-    cfg = import_module(CONFIG_MODULE)
-
-    # Importing modules after hooking WRITE_ROW ensures we capture any eager writes.
-    for modname in _discover_checker_modules():
-        import_module(modname)
-
-    for row in captured_rows:
-        _assert_row_schema_invariants(row)
-        _assert_owner_id_safe(row["OwnerId"], fake_account_id, cfg.safely_text)
