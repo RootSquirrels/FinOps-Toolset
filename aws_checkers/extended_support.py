@@ -34,7 +34,7 @@ Pricebook keys used (safe defaults if absent):
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from botocore.exceptions import ClientError
 
@@ -120,12 +120,6 @@ def _rds_ext_label(engine: str, version: str) -> Optional[str]:
         return "AuroraPostgreSQL11"
 
     return None
-
-
-def _owner_id_str() -> str:
-    return str(config.ACCOUNT_ID) if config.ACCOUNT_ID is not None else ""
-
-
 # ---------------------- RDS: Extended Support candidates ----------------- #
 
 @retry_with_backoff(exceptions=(ClientError,))
