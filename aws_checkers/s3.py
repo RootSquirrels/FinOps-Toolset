@@ -500,18 +500,48 @@ def _iter_bucket_rows(
             flags=flags,
         )
 
+def _emit_row(writer: Any, row: Dict[str, Any]) -> None:
+    """
+    Call the configured WRITE_ROW with the right shape:
+    1) WRITE_ROW(writer, row)             # legacy dict + writer
+    2) WRITE_ROW(writer, **row)           # kwargs + writer
+    3) WRITE_ROW(row)                     # legacy dict, no writer
+    4) WRITE_ROW(**row)                   # kwargs, no writer
+    """
+    if writer is not None:
+        try:
+            cfg.WRITE_ROW(writer, row)       # most implementations accept dict
+            return
+        except TypeError:
+            try:
+                cfg.WRITE_ROW(writer, **row)  # kwargs variant
+                return
+            except TypeError:
+                pass
+
+    # Fallbacks when no writer was provided, or previous shapes failed
+    try:
+        cfg.WRITE_ROW(row)
+        return
+    except TypeError:
+        cfg.WRITE_ROW(**row)
 
 def run(
     regions: Optional[Iterable[str]] = None,
     *,
-    writer: Any | None = None,
+    writer: Any | None = None,         
     s3_global=None,
     s3_for_region=None,
+    cw_client=None,
 ) -> None:
+    ...
     for br in _iter_bucket_rows(
-        regions, s3_global=s3_global, s3_for_region=s3_for_region
+        regions,
+        s3_global=s3_global,
+        s3_for_region=s3_for_region,
+        cw_client=cw_client,
     ):
-        _write_row_compat(writer, br)
+        _emit_row(writer, br.to_row()) 
 
 
 def run_s3_checks(
@@ -520,12 +550,12 @@ def run_s3_checks(
     writer: Any | None = None,
     s3_global=None,
     s3_for_region=None,
-    cloudwatch=None,  # not used when leveraging core batcher (kept for compat)
+    cloudwatch=None,   # kept for parity; CW client is created inside if needed
 ) -> None:
-    del cloudwatch  # CW handled inside via core batcher
     run(
         [region] if region else None,
         writer=writer,
         s3_global=s3_global,
         s3_for_region=s3_for_region,
+        cw_client=cloudwatch,
     )
