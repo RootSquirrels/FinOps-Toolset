@@ -377,46 +377,9 @@ def main():
 
 
             run_check(
-                profiler, "check_s3_public_access_block_off", region,
-                s3_checks.check_s3_public_access_block_off,
+                profiler, "run_s3_checks", region,
+                s3_checks.run_s3_checks,
                 writer=writer, s3=s3_global, cloudwatch=cloudwatch_global,
-            )
-
-            run_check(
-                profiler, "check_s3_no_default_encryption",
-                region, s3_checks.check_s3_no_default_encryption,
-                writer=writer, s3=s3_global, cloudwatch=cloudwatch_global,
-            )
-
-            run_check(
-                profiler, "check_s3_empty_buckets",
-                region, s3_checks.check_s3_empty_buckets,
-                writer=writer, s3=s3_global,
-                cloudwatch=cloudwatch_global,
-            )
-
-            run_check(
-                profiler, "check_s3_lifecycle_hygiene",
-                region, s3_checks.check_s3_lifecycle_hygiene,
-                writer=writer, s3=s3_global,
-                cloudwatch=cloudwatch_global,
-            )
-
-            run_check(
-                profiler,
-                "check_s3_ia_tiering_candidates",
-                region, s3_checks.check_s3_ia_tiering_candidates,
-                writer=writer, s3=s3_global,
-                cloudwatch=cloudwatch_global,
-                # knobs: lookback_days=30, min_standard_gb=50, request_threshold=1000
-            )
-
-            run_check(
-                profiler, "check_s3_stale_multipart_uploads",
-                region, s3_checks.check_s3_stale_multipart_uploads,
-                writer=writer, s3=s3_global,
-                cloudwatch=cloudwatch_global,
-                # knobs: stale_days=7
             )
 
             # -------- Per-region steps
