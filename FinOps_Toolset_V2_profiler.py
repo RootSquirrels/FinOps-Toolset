@@ -379,7 +379,7 @@ def main():
             run_check(
                 profiler, "run_s3_checks", region,
                 s3_checks.run_s3_checks,
-                writer=writer, s3=s3_global, cloudwatch=cloudwatch_global,
+                writer=writer, s3_global=s3_global, cw_client=cloudwatch_global,
             )
 
             # -------- Per-region steps

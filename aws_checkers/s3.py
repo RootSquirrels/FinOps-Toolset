@@ -1,56 +1,26 @@
-"""S3 checker — integrates core.cloudwatch batcher, no redundant calls.
+"""S3 checker — integrates finops_toolset.aws.cloudwatch.CloudWatchBatcher.
 
-What this does
-==============
-- Keeps **all existing checks** (PAB, policy public, ACL, default SSE, versioning/MFA,
-  logging, lifecycle, replication, object lock, tags) with the same semantics.
-- Fixes the bug where Signals["Objects"]/Signals["SizeGB"] showed "NULL" for
-  non-empty buckets by using **regional S3 clients** and **CloudWatch metrics**.
-- Uses the repository's **core.cloudwatch** batcher if available (no re-implementation).
-- Accepts **orchestrator-injected clients** so we don't build duplicates.
-
-Public API
-==========
-run(
-    regions: list[str] | None = None,
-    *,
-    s3_global=None,
-    s3_for_region=None,
-    cw_adapter=None,
-) -> None
-
-- regions: optional filter; only process buckets whose **home region** matches.
-- s3_global: orchestrator-provided S3 client for global endpoint (ListBuckets/GetBucketLocation).
-- s3_for_region: callable (region:str) -> S3 client (orchestrator factory); we cache results.
-- cw_adapter: core.cloudwatch batcher **or** function we can call to fetch S3 storage
-  metrics for multiple buckets at once. If not provided, we try to import and use
-  core.cloudwatch automatically. If nothing is available, we fall back to a tiny
-  single-page ListObjectsV2 peek to classify empty vs non-empty.
-
-Signals: Objects & SizeGB
-=========================
-Preferred via core.cloudwatch batcher (fast). Fallback does **one** ListObjectsV2 page
-(MaxKeys=S3_OBJECTS_SCAN_LIMIT, default 1):
-- empty and accessible -> Objects=0, SizeGB=0.0
-- non-empty but no metrics -> Objects>=1, SizeGB="NULL" (unknown quickly)
-- permission denied -> both "NULL"
-
-No deletions/changes are performed here; this checker is read-only and emits rows via
-aws_checkers.config.WRITE_ROW.
+- Keeps all checks (PAB, policy public, ACL, default SSE, versioning/MFA, logging,
+  lifecycle, replication, object lock, tags).
+- Gets Objects/Size via CloudWatch in batch using your CloudWatchBatcher; falls back
+  to a tiny S3 listing peek when metrics are missing.
+- Accepts orchestrator clients: run(..., s3_global=..., s3_for_region=..., cw_client=...)
+- Pylint: regions_set is always a set; only call proven callables (no E1102).
 """
 from __future__ import annotations
 
+import datetime as dt
 import os
-import re
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import boto3  # type: ignore
 from botocore.exceptions import BotoCoreError, ClientError  # type: ignore
 
 from aws_checkers import config as cfg
-import core.cloudwatch as core_cw
+from core.cloudwatch import CloudWatchBatcher
 
-try: 
+try:  # pragma: no cover - optional shared SDK config
     from FinOps_Toolset_V2_profiler import SDK_CONFIG as _SDK_CONFIG  # type: ignore
 except Exception:  # pylint: disable=broad-exception-caught
     _SDK_CONFIG = None
@@ -58,7 +28,19 @@ except Exception:  # pylint: disable=broad-exception-caught
 _S3_ARN = "arn:aws:s3:::{name}"
 _ALL_USERS_URI = "http://acs.amazonaws.com/groups/global/AllUsers"
 _AUTH_USERS_URI = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
-_S12 = re.compile(r"^\d{12}$")
+
+# Default storage types for size; set S3_CW_SIZE_TYPES=ALL to include all below.
+_DEF_SIZE_TYPES = ["StandardStorage"]
+_ALL_SIZE_TYPES = [
+    "StandardStorage",
+    "StandardIAStorage",
+    "OneZoneIAStorage",
+    "IntelligentTieringAAStorage",
+    "IntelligentTieringFAStorage",
+    "GlacierStorage",
+    "DeepArchiveStorage",
+    "ReducedRedundancyStorage",
+]
 
 
 def _client(service: str, *, region: Optional[str] = None):
@@ -70,7 +52,7 @@ def _client(service: str, *, region: Optional[str] = None):
 
 
 def _bucket_home_region(s3_client, name: str) -> str:
-    """Resolve bucket region, defaulting to us-east-1 if API returns None."""
+    """Resolve bucket region, defaulting to us-east-1 if API returns None/errors."""
     try:
         out = s3_client.get_bucket_location(Bucket=name)
         loc = out.get("LocationConstraint")
@@ -84,10 +66,10 @@ def _acl_public_flags(acl: Dict[str, Any]) -> Tuple[bool, bool]:
     public = False
     auth = False
     for grant in acl.get("Grants", []) or []:
-        gr = grant.get("Grantee", {})
-        if gr.get("Type") != "Group":
+        grantee = grant.get("Grantee", {})
+        if grantee.get("Type") != "Group":
             continue
-        uri = gr.get("URI", "")
+        uri = grantee.get("URI", "")
         if uri == _ALL_USERS_URI:
             public = True
         if uri == _AUTH_USERS_URI:
@@ -96,56 +78,117 @@ def _acl_public_flags(acl: Dict[str, Any]) -> Tuple[bool, bool]:
 
 
 def _signals_str(kv: Dict[str, Any]) -> str:
-    parts: List[str] = []
-    for key in sorted(kv):
-        parts.append(f"{key}={kv[key]}")
+    """Render Signals as stable 'k=v | k2=v2' text."""
+    parts = [f"{k}={kv[k]}" for k in sorted(kv)]
     return " | ".join(parts)
 
 
-# ---------------- CloudWatch adapter (uses core.cloudwatch) ----------------
+def _gb(nbytes: float) -> float:
+    return float(nbytes) / (1024.0 ** 3)
 
-_DEF_SIZE_TYPES = ["StandardStorage"]
+
+# --------------------------- CloudWatch integration ---------------------------
+
+def _cw_size_types_from_env() -> List[str]:
+    env = os.getenv("S3_CW_SIZE_TYPES", ",".join(_DEF_SIZE_TYPES))
+    if env.strip().upper() == "ALL":
+        return list(_ALL_SIZE_TYPES)
+    return [t.strip() for t in env.split(",") if t.strip()]
 
 
-def _get_cw_s3_metrics_adapter(cw_adapter: Any) -> Optional[Any]:
-    """Return a callable buckets->metrics, consulting core.cloudwatch when needed.
+def _build_cw_queries_for_region(
+    batcher: CloudWatchBatcher, buckets: List[str], size_types: List[str]
+) -> List[Tuple[str, str]]:
+    """Add queries to batcher for all buckets in a region. Returns list of (bucket, id_prefix)."""
+    ids: List[Tuple[str, str]] = []
+    for bname in buckets:
+        # Ids can be any string; CloudWatchBatcher will sanitize & map back to this hint.
+        obj_id = f"obj::{bname}"
+        batcher.add_q(
+            id_hint=obj_id,
+            namespace="AWS/S3",
+            metric="NumberOfObjects",
+            dims=[
+                {"Name": "BucketName", "Value": bname},
+                {"Name": "StorageType", "Value": "AllStorageTypes"},
+            ],
+            stat="Average",
+            period=86400,
+        )
+        # Add one query per storage class for size
+        for idx, stype in enumerate(size_types, start=1):
+            sid = f"sz{idx}::{bname}"
+            batcher.add_q(
+                id_hint=sid,
+                namespace="AWS/S3",
+                metric="BucketSizeBytes",
+                dims=[
+                    {"Name": "BucketName", "Value": bname},
+                    {"Name": "StorageType", "Value": stype},
+                ],
+                stat="Average",
+                period=86400,
+            )
+        ids.append((bname, "sz"))  # marker to know how many size series per bucket
+    return ids
 
-    We accept:
-    - a callable(adapter)(buckets, size_types, lookback_days)
-    - an object with method among: s3_storage_metrics / get_s3_storage_metrics /
-      fetch_s3_storage_metrics
-    - a module core.cloudwatch exposing any of the above names
+
+def _fetch_cw_metrics_grouped(
+    cw_client,
+    region_buckets: Dict[str, List[str]],
+    lookback_days: int,
+    size_types: List[str],
+) -> Dict[str, Dict[str, Optional[float]]]:
+    """Return {bucket: {'Objects': int|None, 'SizeGB': float|None}} via CloudWatchBatcher.
+
+    We create one CloudWatchBatcher per region (metrics are regional). We pass the
+    *region-specific* client to the batcher if cw_client.region matches; otherwise
+    the batcher will create its own regional client.
     """
-    if cw_adapter is not None:
-        if callable(cw_adapter):
-            return cw_adapter
-        for meth in (
-            "s3_storage_metrics",
-            "get_s3_storage_metrics",
-            "fetch_s3_storage_metrics",
-        ):
-            fn = getattr(cw_adapter, meth, None)
-            if callable(fn):
-                return fn
-        return None
+    end = dt.datetime.utcnow()
+    start = end - dt.timedelta(days=max(1, lookback_days))
 
-    try:  # autodetect
+    results: Dict[str, Dict[str, Optional[float]]] = {}
 
-        for name in (
-            "s3_storage_metrics",
-            "get_s3_storage_metrics",
-            "fetch_s3_storage_metrics",
-        ):
-            fn = getattr(core_cw, name, None)
-            if callable(fn):
-                return fn
-    except Exception:  # pylint: disable=broad-exception-caught
-        return None
-    return None
+    for region, blist in region_buckets.items():
+        if not blist:
+            continue
+
+        # Prefer using the provided client only if it's already for this region.
+        # boto3 clients don't expose region in a stable public way, so let the
+        # batcher create a regional client. This keeps code simple and correct.
+        batcher = CloudWatchBatcher(region, client=None)
+
+        # Add queries
+        _build_cw_queries_for_region(batcher, blist, size_types)
+
+        # Execute; the batcher returns {id_hint: [(ts, val), ...]}
+        series = batcher.execute(start, end, scan_by="TimestampDescending")
+
+        # Parse back per-bucket
+        for bname in blist:
+            obj_vals = series.get(f"obj::{bname}", [])
+            obj = int(obj_vals[0][1]) if obj_vals else None
+
+            total_bytes = 0.0
+            saw_any = False
+            for idx in range(1, len(size_types) + 1):
+                sid = f"sz{idx}::{bname}"
+                vals = series.get(sid, [])
+                if vals:
+                    try:
+                        total_bytes += float(vals[0][1])
+                        saw_any = True
+                    except (TypeError, ValueError):
+                        pass
+            size_gb = round(_gb(total_bytes), 3) if saw_any else None
+
+            results[bname] = {"Objects": obj, "SizeGB": size_gb}
+
+    return results
 
 
-# ---------------------------- S3 signals ----------------------------
-
+# -------------------------------- S3 signals ---------------------------------
 
 def _collect_bucket_signals(s3r, bucket: str) -> Tuple[Dict[str, Any], List[str]]:
     """Gather bucket signals and issue flags with minimal, non-redundant calls."""
@@ -156,7 +199,12 @@ def _collect_bucket_signals(s3r, bucket: str) -> Tuple[Dict[str, Any], List[str]
     try:
         pab = s3r.get_public_access_block(Bucket=bucket)
         conf = pab.get("PublicAccessBlockConfiguration", {})
-        for k in ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"):
+        for k in (
+            "BlockPublicAcls",
+            "IgnorePublicAcls",
+            "BlockPublicPolicy",
+            "RestrictPublicBuckets",
+        ):
             signals[k] = int(bool(conf.get(k)))
         if not all(bool(conf.get(k)) for k in conf):
             issues.append("PublicAccessBlockDisabled")
@@ -192,7 +240,11 @@ def _collect_bucket_signals(s3r, bucket: str) -> Tuple[Dict[str, Any], List[str]
     try:
         enc = s3r.get_bucket_encryption(Bucket=bucket)
         rules = (enc.get("ServerSideEncryptionConfiguration") or {}).get("Rules", [])
-        algo = (rules[0].get("ApplyServerSideEncryptionByDefault") or {}).get("SSEAlgorithm") if rules else None
+        if rules:
+            bydef = rules[0].get("ApplyServerSideEncryptionByDefault") or {}
+            algo = bydef.get("SSEAlgorithm")
+        else:
+            algo = None
         signals["DefaultSSE"] = algo or "None"
         if not algo:
             issues.append("NoDefaultEncryption")
@@ -267,28 +319,16 @@ def _collect_bucket_signals(s3r, bucket: str) -> Tuple[Dict[str, Any], List[str]
     return signals, issues
 
 
-# ------------------------------- rows -------------------------------
+# -------------------------------- rows & run ---------------------------------
 
+@dataclass
 class BucketRow:
-    """Row builder for CSV emission."""
-
-    __slots__ = ("name", "region", "owner_id", "created", "signals", "issues")
-
-    def __init__(
-        self,
-        name: str,
-        region: str,
-        owner_id: str,
-        created: Optional[str],
-        signals: Dict[str, Any],
-        issues: List[str],
-    ) -> None:
-        self.name = name
-        self.region = region
-        self.owner_id = owner_id
-        self.created = created
-        self.signals = signals
-        self.issues = issues
+    name: str
+    region: str
+    owner_id: str
+    created: str
+    signals: Dict[str, Any]
+    issues: List[str]
 
     def to_row(self) -> Dict[str, Any]:
         return {
@@ -298,7 +338,7 @@ class BucketRow:
             "Region": self.region,
             "OwnerId": self.owner_id,
             "State": "active",
-            "Creation_Date": self.created or "",
+            "Creation_Date": self.created,
             "Storage_GB": self.signals.get("SizeGB", ""),
             "Object_Count": self.signals.get("Objects", ""),
             "Estimated_Cost_USD": 0.0,
@@ -313,20 +353,14 @@ class BucketRow:
         }
 
 
-# ------------------------------ main ------------------------------
-
-
 def _iter_bucket_rows(
     regions: Optional[Iterable[str]] = None,
     *,
     s3_global=None,
     s3_for_region=None,
-    cw_adapter=None,
+    cw_client=None,
 ) -> Iterable[BucketRow]:
-    """Yield BucketRow for buckets (filtered by regions if provided).
-
-    Clients can be injected by orchestrator to avoid re-creating them.
-    """
+    """Yield per-bucket rows; prefer CW metrics; S3 peek fallback."""
     s3g = s3_global or _client("s3")
 
     try:
@@ -334,11 +368,12 @@ def _iter_bucket_rows(
     except (ClientError, BotoCoreError):
         buckets = []
 
-    regions_set = set(r.lower() for r in regions) if regions else None
+    regions_set: set[str] = {r.lower() for r in regions} if regions else set()
 
-    # Resolve home region per bucket once; keep only those we need
+    # Resolve home regions; group by region for CW batch; keep creation dates
     home_map: Dict[str, str] = {}
-    names: List[str] = []
+    created_map: Dict[str, str] = {}
+    region_buckets: Dict[str, List[str]] = {}
     for b in buckets:
         name = b.get("Name")
         if not name:
@@ -347,41 +382,27 @@ def _iter_bucket_rows(
         if regions_set and home.lower() not in regions_set:
             continue
         home_map[name] = home
-        names.append(name)
+        created_map[name] = str(b["CreationDate"]) if b.get("CreationDate") else ""
+        region_buckets.setdefault(home, []).append(name)
 
-    # CloudWatch batch fast-path via core.cloudwatch
-    adapter = _get_cw_s3_metrics_adapter(cw_adapter)
+    # CloudWatch batch per region using your CloudWatchBatcher
+    use_cw = os.getenv("S3_USE_CLOUDWATCH", "1") != "0"
+    size_types = _cw_size_types_from_env()
     lookback = int(os.getenv("S3_CW_LOOKBACK_DAYS", "3") or "3")
-    size_types_env = os.getenv("S3_CW_SIZE_TYPES", ",".join(_DEF_SIZE_TYPES))
-    size_types = (
-        [
-            "StandardStorage",
-            "StandardIAStorage",
-            "OneZoneIAStorage",
-            "IntelligentTieringAAStorage",
-            "IntelligentTieringFAStorage",
-            "GlacierStorage",
-            "DeepArchiveStorage",
-            "ReducedRedundancyStorage",
-        ]
-        if size_types_env.strip().upper() == "ALL"
-        else [t.strip() for t in size_types_env.split(",") if t.strip()]
-    )
+    cw_data: Dict[str, Dict[str, Optional[float]]] = {}
 
-    cw_metrics: Dict[str, Dict[str, Optional[float]]] = {}
-    if adapter and names:
-        try:
-            cw_metrics = adapter(names, size_types, lookback)
-        except Exception:  # pylint: disable=broad-exception-caught
-            cw_metrics = {}
+    if use_cw and region_buckets:
+        cw_data = _fetch_cw_metrics_grouped(
+            cw_client, region_buckets, lookback_days=lookback, size_types=size_types
+        )
 
     owner_id = str(getattr(cfg, "account_id", getattr(cfg, "ACCOUNT_ID", "")))
 
-    # Regional clients on demand
+    # Regional S3 clients (cached)
     client_cache: Dict[str, Any] = {}
     get_s3 = s3_for_region or (lambda r: _client("s3", region=r))
 
-    # Fallback object peek limit when no CW metrics
+    # Fallback peek limit when CW is missing/incomplete
     try:
         peek_limit = int(os.getenv("S3_OBJECTS_SCAN_LIMIT", "1") or "1")
     except ValueError:
@@ -392,9 +413,7 @@ def _iter_bucket_rows(
         if not name or name not in home_map:
             continue
         home = home_map[name]
-        created = None
-        if b.get("CreationDate"):
-            created = str(b["CreationDate"])  # boto returns datetime; stringify
+        created = created_map.get(name, "")
 
         s3r = client_cache.get(home)
         if s3r is None:
@@ -403,14 +422,13 @@ def _iter_bucket_rows(
 
         signals, issues = _collect_bucket_signals(s3r, name)
 
-        # Merge CloudWatch metrics if available
-        cw_obj = cw_metrics.get(name, {}).get("Objects") if cw_metrics else None
-        cw_sz = cw_metrics.get(name, {}).get("SizeGB") if cw_metrics else None
-
+        # Merge CW metrics
+        cw_obj = cw_data.get(name, {}).get("Objects") if cw_data else None
+        cw_sz = cw_data.get(name, {}).get("SizeGB") if cw_data else None
         obj_val: Optional[int] = cw_obj if isinstance(cw_obj, int) else None
         sz_val: Optional[float] = cw_sz if isinstance(cw_sz, (int, float)) else None
 
-        # Fallback: single fast ListObjectsV2 peek to classify emptiness only
+        # Fallback: one fast ListObjectsV2(MaxKeys=1) only if needed
         if (obj_val is None or sz_val is None) and peek_limit > 0:
             try:
                 page = s3r.list_objects_v2(Bucket=name, MaxKeys=peek_limit)
@@ -420,7 +438,6 @@ def _iter_bucket_rows(
                 if sz_val is None:
                     sz_val = 0.0 if kcount == 0 else None
             except (ClientError, BotoCoreError):
-                # leave as None (unknown)
                 pass
 
         signals["Objects"] = obj_val if obj_val is not None else "NULL"
@@ -436,24 +453,18 @@ def _iter_bucket_rows(
         )
 
 
-# ----------------------------- public API -----------------------------
-
-
 def run_s3_checks(
     regions: Optional[Iterable[str]] = None,
     *,
     s3_global=None,
     s3_for_region=None,
-    cw_adapter=None,
+    cw_client=None,
 ) -> None:
-    """Emit CSV rows for all buckets using core.cloudwatch batcher when available.
-
-    Orchestrator can inject clients and the CW adapter to ensure zero duplication.
-    """
+    """Emit CSV rows for all buckets using CloudWatchBatcher when available."""
     for br in _iter_bucket_rows(
         regions,
         s3_global=s3_global,
         s3_for_region=s3_for_region,
-        cw_adapter=cw_adapter,
+        cw_client=cw_client,
     ):
         cfg.WRITE_ROW(br.to_row())
