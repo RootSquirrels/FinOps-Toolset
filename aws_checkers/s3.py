@@ -12,6 +12,7 @@ from botocore.exceptions import BotoCoreError, ClientError  # type: ignore
 
 from aws_checkers import config as cfg
 from core.cloudwatch import CloudWatchBatcher
+from finops_toolset.pricing import get_price
 
 try:  # pragma: no cover
     from FinOps_Toolset_V2_profiler import SDK_CONFIG as _SDK_CONFIG  # type: ignore
@@ -23,8 +24,7 @@ _ALL_USERS_URI = "http://acs.amazonaws.com/groups/global/AllUsers"
 _AUTH_USERS_URI = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
 
 # ---------- pricing knobs (simple, overridable) ----------
-# default: S3 Standard first tier
-_S3_PRICE_PER_GB_USD = float(os.getenv("S3_PRICE_PER_GB_USD", "0.023"))
+
 # treat tiny/empty buckets as removable savings
 _EMPTY_SIZE_GB_THRESHOLD = float(os.getenv("S3_EMPTY_SIZE_GB_THRESHOLD", "0.01"))
 _EMPTY_OBJECTS_THRESHOLD = int(os.getenv("S3_EMPTY_OBJECTS_THRESHOLD", "1"))
@@ -318,9 +318,13 @@ class BucketRow:
 
     def _estimated_cost(self) -> float:
         size_gb = self.signals.get("SizeGB")
-        if isinstance(size_gb, (int, float)):
-            return round(float(size_gb) * _S3_PRICE_PER_GB_USD, 2)
-        return 0.0
+        if not isinstance(size_gb, (int, float)):
+            return 0.0
+        try:
+            price = get_price("S3", "STANDARD_GB_MONTH", region=self.region)
+        except KeyError:
+            price = get_price("S3", "STANDARD_GB_MONTH", region=None)
+        return round(float(size_gb) * float(price), 2)
 
     def _potential_saving(self, est_cost: float) -> str:
         """Simple heuristic: if bucket effectively empty, saving ≈ current monthly cost."""
@@ -454,6 +458,7 @@ def _iter_bucket_rows(
 def run_s3_checks(
     regions: Optional[Iterable[str]] = None,
     *,
+    writer: Any | None = None,
     s3_global=None,
     s3_for_region=None,
 ) -> None:
@@ -462,4 +467,4 @@ def run_s3_checks(
         regions, s3_global=s3_global, s3_for_region=s3_for_region
     ):
         row = br.to_row()
-        cfg.WRITE_ROW(**row)
+        cfg.WRITE_ROW(writer, **row)
