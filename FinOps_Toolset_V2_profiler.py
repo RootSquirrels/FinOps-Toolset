@@ -144,7 +144,7 @@ def write_resource_to_csv(
             signals_str = str(signals)
 
         writer.writerow([
-            resource_id, name, resource_type, region, owner_id, state, creation_date,
+            resource_id, name, resource_type, region, owner_id, region, state, creation_date,
             storage_gb, object_count if object_count is not None else "",
             estimated_cost, potential_saving if potential_saving is not None else "",
             app_id, app, env, referenced_in, flagged,
@@ -351,7 +351,7 @@ def main():
             writer = csv.writer(csvfile)
             if not file_exists:
                 writer.writerow([
-                    "Resource_ID", "Name", "ResourceType", "OwnerId", "State", "Creation_Date",
+                    "Resource_ID", "Name", "ResourceType", "OwnerId", "Region", "State", "Creation_Date",
                     "Storage_GB", "Object_Count", "Estimated_Cost_USD", "Potential_Saving_USD",
                     "ApplicationID", "Application", "Environment", "ReferencedIn",
                     "FlaggedForReview", "Confidence", "Signals"

@@ -523,7 +523,7 @@ class TestWriterBackCompat(unittest.TestCase):
     """Backwards-compat checks for the CSV writer normalization rules."""
 
     HEADER = [
-        "Resource_ID", "Name", "ResourceType", "OwnerId", "State", "Creation_Date",
+        "Resource_ID", "Name", "ResourceType", "OwnerId", "Region", "State", "Creation_Date",
         "Storage_GB", "Object_Count", "Estimated_Cost_USD", "Potential_Saving_USD",
         "ApplicationID", "Application", "Environment", "ReferencedIn",
         "FlaggedForReview", "Confidence", "Signals",
@@ -578,7 +578,7 @@ class TestCSVInvariants(unittest.TestCase):
     """Focused tests for ``write_resource_to_csv`` normalization and invariants."""
 
     HEADER = [
-        "Resource_ID", "Name", "ResourceType", "OwnerId", "State", "Creation_Date",
+        "Resource_ID", "Name", "ResourceType", "OwnerId", "Region", "State", "Creation_Date",
         "Storage_GB", "Object_Count", "Estimated_Cost_USD", "Potential_Saving_USD",
         "ApplicationID", "Application", "Environment", "ReferencedIn",
         "FlaggedForReview", "Confidence", "Signals",
