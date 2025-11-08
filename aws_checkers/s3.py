@@ -500,47 +500,26 @@ def _iter_bucket_rows(
             flags=flags,
         )
 
-def _emit_row(writer: Any, row: Dict[str, Any]) -> None:
-    """
-    Call the configured WRITE_ROW with the right shape:
-    1) WRITE_ROW(writer, row)             # legacy dict + writer
-    2) WRITE_ROW(writer, **row)           # kwargs + writer
-    3) WRITE_ROW(row)                     # legacy dict, no writer
-    4) WRITE_ROW(**row)                   # kwargs, no writer
-    """
-    if writer is not None:
-        try:
-            cfg.WRITE_ROW(writer, row)       # most implementations accept dict
-            return
-        except TypeError:
-            try:
-                cfg.WRITE_ROW(writer, **row)  # kwargs variant
-                return
-            except TypeError:
-                pass
-
-    # Fallbacks when no writer was provided, or previous shapes failed
-    try:
-        cfg.WRITE_ROW(row)
-        return
-    except TypeError:
-        cfg.WRITE_ROW(**row)
-
 def run(
     regions: Optional[Iterable[str]] = None,
     *,
-    writer: Any | None = None,         
+    writer: Any | None = None,
     s3_global=None,
     s3_for_region=None,
 ) -> None:
+    """
+    High-level entrypoint used by callers that don't care about the
+    internal BucketRow shape. For each bucket we:
+      * build a BucketRow
+      * let _write_row_compat() handle how to call cfg.WRITE_ROW
+        (kwargs or legacy dict, with or without writer).
+    """
     for br in _iter_bucket_rows(
         regions,
         s3_global=s3_global,
         s3_for_region=s3_for_region,
     ):
-        print("test")
-        _emit_row(writer, br.to_row())
-
+        _write_row_compat(writer, br)
 
 def run_s3_checks(
     region: Optional[str] = None,
