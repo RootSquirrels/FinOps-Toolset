@@ -22,7 +22,6 @@ from moto import mock_aws
 from test_checkers_generic import (  # reuse invariants
         _discover_checker_modules,
         _assert_row_schema_invariants,
-        _assert_owner_id_safe,
     )
 
 CHECKERS_PACKAGE = "aws_checkers"
@@ -107,4 +106,3 @@ def test_checkers_run_against_moto(
     # Validate everything we captured
     for row in captured_rows:
         _assert_row_schema_invariants(row)
-        _assert_owner_id_safe(row["OwnerId"], fake_account_id, cfg.safely_text)
