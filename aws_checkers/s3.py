@@ -500,37 +500,25 @@ def _iter_bucket_rows(
             flags=flags,
         )
 
-def run(
-    regions: Optional[Iterable[str]] = None,
+def run_s3_checks(
+    writer: Any,
+    region: Optional[str] = None,
     *,
-    writer: Any | None = None,
     s3_global=None,
     s3_for_region=None,
 ) -> None:
     """
-    High-level entrypoint used by callers that don't care about the
-    internal BucketRow shape. For each bucket we:
-      * build a BucketRow
-      * let _write_row_compat() handle how to call cfg.WRITE_ROW
-        (kwargs or legacy dict, with or without writer).
+    Entry point used by FinOps_Toolset_V2_profiler.run_check.
+
+    The profiler calls:
+        run_check(..., s3_checks.run_s3_checks, writer, region=..., s3_global=...)
+
     """
+    regions = [region] if region else None
+
     for br in _iter_bucket_rows(
         regions,
         s3_global=s3_global,
         s3_for_region=s3_for_region,
     ):
         _write_row_compat(writer, br)
-
-def run_s3_checks(
-    region: Optional[str] = None,
-    *,
-    writer: Any | None = None,
-    s3_global=None,
-    s3_for_region=None,
-) -> None:
-    run(
-        [region] if region else None,
-        writer=writer,
-        s3_global=s3_global,
-        s3_for_region=s3_for_region,
-    )
