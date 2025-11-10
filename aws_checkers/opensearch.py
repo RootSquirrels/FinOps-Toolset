@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import concurrent.futures as futures
 import logging
+import aws_checkers.config as CONF  # type: ignore
 
 try:
     from botocore.client import BaseClient
@@ -43,14 +44,6 @@ try:  # primary import path for CloudWatch batcher
     from core.cloudwatch import CloudWatchBatcher
 except Exception as err:  # pragma: no cover - the repo is required for this module
     raise RuntimeError("Missing core.cloudwatch.CloudWatchBatcher in repository") from err
-
-try:  # get_price is the canonical price source in the repo
-    from pricing import get_price  # type: ignore
-except Exception:  # pragma: no cover - fallback to alternative path if project structure differs
-    try:
-        from core.pricing import get_price  # type: ignore
-    except Exception as err:  # pragma: no cover
-        raise RuntimeError("Missing get_price() helper in repository") from err
 
 
 LOGGER = logging.getLogger(__name__)
@@ -74,10 +67,7 @@ try:  # newest layout (orchestrator helper)
         write_resource_to_csv as WRITE_ROW,  # noqa: N816 - keep name for clarity
     )
 except Exception:  # pragma: no cover - alternate config entry point
-    try:
-        from finops_toolset.checkers.config import WRITE_ROW as WRITE_ROW  # type: ignore
-    except Exception:
-        WRITE_ROW = None  # fall back to raw writer
+    WRITE_ROW = None  # fall back to raw writer
 
 
 # ---------------------------------
@@ -262,7 +252,7 @@ def _safe_get_price(key_candidates: Sequence[str], default: float = 0.0) -> floa
     """
     for key in key_candidates:
         try:
-            val = get_price(key)  # type: ignore[call-arg]
+            val = CONF.safe_price(key, default)  # type: ignore[call-arg]
             if val is not None:
                 return float(val)
         except Exception:  # pragma: no cover - keep scanning
@@ -647,7 +637,6 @@ def check_elasticache_idle_clusters(
     Returns:
         List of row dicts that were emitted, for convenience/testing.
     """
-    rid = run_id or _now_utc().strftime("%Y%m%dT%H%M%SZ")
     start = _now_utc() - timedelta(days=lookback_days)
     end = _now_utc()
 
@@ -661,7 +650,6 @@ def check_elasticache_idle_clusters(
         cid = c.get("CacheClusterId", "")
         node_type = c.get("CacheNodeType", "")
         nodes = int(c.get("NumCacheNodes", 0))
-        engine = c.get("Engine", "")
         status = c.get("CacheClusterStatus", "")
         created = c.get("CacheClusterCreateTime")
         created_iso = created.strftime("%Y-%m-%dT%H:%M:%SZ") if hasattr(created, "strftime") else ""
@@ -749,7 +737,6 @@ def check_opensearch_idle_domains(
     Returns:
         List of row dicts that were emitted, for convenience/testing.
     """
-    rid = run_id or _now_utc().strftime("%Y%m%dT%H%M%SZ")
     start = _now_utc() - timedelta(days=lookback_days)
     end = _now_utc()
 
@@ -780,7 +767,6 @@ def check_opensearch_idle_domains(
             master_type = cfg.get("DedicatedMasterType", "") if master_count else ""
             warm_count = int(cfg.get("WarmCount", 0) or 0) if cfg.get("WarmEnabled") else 0
             warm_type = cfg.get("WarmType", "") if warm_count else ""
-            engine_version = status.get("EngineVersion", "")
             domain_arn = status.get("ARN", "") or name
             processing = status.get("Processing", False)
             state = "processing" if processing else "active"
