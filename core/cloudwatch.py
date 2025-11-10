@@ -1,12 +1,15 @@
 """CloudWatch metric batching utilities.
 
-This module provides a small wrapper around the CloudWatch `GetMetricData` API that:
+This module provides a wrapper around the CloudWatch `GetMetricData` API that:
 - Splits large query sets into API-compliant chunks (<= 500 queries/request).
 - Transparently paginates via `NextToken`.
 - Retries on throttling with exponential backoff.
-- Exposes two entry points used by the toolset:
+- Exposes two main entry points used by the toolset:
   * CloudWatchBatcher.get_metric_data(**kwargs) -> dict (matches boto3 shape)
   * CloudWatchBatcher.run(queries, start, end, ...) -> List[MetricDataResults]
+- Also exposes legacy-compatible helpers used by older checkers:
+  * CloudWatchBatcher.add_q(...)  # queue a MetricDataQuery
+  * CloudWatchBatcher.execute(start, end, ...) -> List[MetricDataResults]
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping,
 
 try:
     from botocore.client import BaseClient
-    from botocore.exceptions import ClientError
+    from botocore.exceptions import BotoCoreError, ClientError
 except Exception as exc:  # pragma: no cover - import guard only
     raise RuntimeError("botocore is required for CloudWatch batching") from exc
 
@@ -48,7 +51,7 @@ def _merge_results(pages: Iterable[Mapping[str, Any]]) -> List[Mapping[str, Any]
                 # Skip malformed entries
                 continue
             current = merged.setdefault(rid, {"Id": rid, "Label": entry.get("Label", "")})
-            # Merge values/timestamps preserving order (CloudWatch returns ascending if requested)
+            # Merge values/timestamps with order (CloudWatch can return ascending if requested)
             vals = entry.get("Values", []) or []
             ts = entry.get("Timestamps", []) or []
             if vals:
@@ -56,16 +59,22 @@ def _merge_results(pages: Iterable[Mapping[str, Any]]) -> List[Mapping[str, Any]
                 current.setdefault("Timestamps", [])  # type: ignore[assignment]
                 current["Values"].extend(vals)  # type: ignore[index]
                 current["Timestamps"].extend(ts)  # type: ignore[index]
-            # Keep status if present
             status = entry.get("StatusCode")
             if status:
                 current["StatusCode"] = status  # type: ignore[index]
     # Convert to list and ensure values/timestamps exist
     out: List[Mapping[str, Any]] = []
     for item in merged.values():
-        item.setdefault("Values", [])         # type: ignore[call-arg]
-        item.setdefault("Timestamps", [])     # type: ignore[call-arg]
+        item.setdefault("Values", [])  # type: ignore[call-arg]
+        item.setdefault("Timestamps", [])  # type: ignore[call-arg]
         out.append(item)
+    return out
+
+
+def _strip_queries(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return kwargs without `MetricDataQueries` for chunked calls."""
+    out = dict(kwargs)
+    out.pop("MetricDataQueries", None)
     return out
 
 
@@ -86,6 +95,9 @@ class CloudWatchBatcher:
 
         # 2) Simplified call, returns just the MetricDataResults list
         results = batcher.run(queries, start_dt, end_dt)
+
+        # 3) Legacy-compatible queue/execute API
+        batcher.add_q(...).add_q(...).execute(start_dt, end_dt)
     """
 
     def __init__(
@@ -108,6 +120,92 @@ class CloudWatchBatcher:
         self._chunk_size = max(1, min(int(chunk_size), _DEFAULT_CHUNK_SIZE))
         self._max_retries = max(0, int(max_retries))
         self._backoff = float(backoff_seconds)
+        # Legacy queue for add_q/execute compatibility
+        self._queue: List[Dict[str, Any]] = []
+
+    # -------------------------- legacy compatibility --------------------------
+
+    def add_q(
+        self,
+        query: Optional[Mapping[str, Any]] = None,
+        **kwargs: Any,
+    ) -> "CloudWatchBatcher":
+        """Queue a MetricDataQuery for later :meth:`execute`.
+
+        Accepts either a full MetricDataQuery dict (`query`) or common keyword
+        args to build one:
+          id=..., namespace=..., metric_name=..., dimensions=[...],
+          stat="Average", period=300, unit="Count", return_data=True,
+          or an Expression=... query.
+
+        Returns:
+            self so calls can be chained.
+        """
+        if query is not None:
+            self._queue.append(dict(query))
+            return self
+
+        mid = kwargs.pop("id", None) or kwargs.pop("Id", None)
+        namespace = kwargs.pop("namespace", None)
+        metric_name = kwargs.pop("metric_name", None)
+        dimensions = kwargs.pop("dimensions", None) or []
+        stat = kwargs.pop("stat", "Average")
+        period = int(kwargs.pop("period", 300))
+        unit = kwargs.pop("unit", None)
+        return_data = bool(kwargs.pop("return_data", True))
+        expression = kwargs.pop("Expression", None) or kwargs.pop("expression", None)
+
+        if expression:
+            q = {
+                "Id": mid or f"q{len(self._queue)}",
+                "Expression": expression,
+                "ReturnData": return_data,
+            }
+        else:
+            metric = {
+                "Namespace": namespace,
+                "MetricName": metric_name,
+                "Dimensions": dimensions,
+            }
+            metricstat: Dict[str, Any] = {
+                "Metric": metric,
+                "Period": period,
+                "Stat": stat,
+            }
+            if unit:
+                metricstat["Unit"] = unit
+            q = {
+                "Id": mid or f"q{len(self._queue)}",
+                "MetricStat": metricstat,
+                "ReturnData": return_data,
+            }
+
+        self._queue.append(q)
+        return self
+
+    def execute(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        scan_by: str = "TimestampAscending",
+        **extra: Any,
+    ) -> List[Mapping[str, Any]]:
+        """Execute queued queries and clear the queue (compatibility shim).
+
+        Older checkers use `add_q(...); execute(start, end)`. This mirrors that
+        behavior using the new `run(...)` pipeline.
+
+        Returns:
+            List of MetricDataResults.
+        """
+        if not self._queue:
+            return []
+        queries = self._queue
+        self._queue = []
+        return self.run(queries, start, end, scan_by=scan_by, **extra)
+
+    # ------------------------------ main helpers ------------------------------
 
     def get_metric_data(self, **kwargs: Any) -> Dict[str, Any]:
         """Compatibility wrapper for `client.get_metric_data(**kwargs)`.
@@ -118,7 +216,8 @@ class CloudWatchBatcher:
           - Retry on throttling up to `max_retries`.
 
         Returns:
-            dict: A dict containing `"MetricDataResults": [...]` and merged `"Messages"` if any.
+            dict: A dict containing `"MetricDataResults": [...]` and merged
+            `"Messages"` if any.
         """
         queries: List[Dict[str, Any]] = list(kwargs.get("MetricDataQueries", []) or [])
         if not queries:
@@ -127,7 +226,10 @@ class CloudWatchBatcher:
 
         all_pages: List[Mapping[str, Any]] = []
         for chunk in _chunked(queries, self._chunk_size):
-            page = self._call_with_pagination(MetricDataQueries=chunk, **_strip_queries(kwargs))
+            page = self._call_with_pagination(
+                MetricDataQueries=chunk,
+                **_strip_queries(kwargs),
+            )
             all_pages.append(page)
 
         results = _merge_results(all_pages)
@@ -159,7 +261,8 @@ class CloudWatchBatcher:
             start: StartTime (UTC).
             end: EndTime (UTC).
             scan_by: "TimestampAscending" (default) or "TimestampDescending".
-            **extra: Additional GetMetricData parameters (e.g., `LabelOptions`, `MaxDatapoints`).
+            **extra: Additional GetMetricData parameters (e.g., `LabelOptions`,
+                     `MaxDatapoints`).
 
         Returns:
             List of MetricDataResults.
@@ -173,7 +276,7 @@ class CloudWatchBatcher:
         )
         return list(resp.get("MetricDataResults", []) or [])
 
-    # ------------------------ internal helpers ------------------------
+    # ------------------------ internal call/pagination ------------------------
 
     def _call_with_pagination(self, **kwargs: Any) -> Dict[str, Any]:
         """Call `get_metric_data` handling pagination and throttling retries."""
@@ -195,7 +298,10 @@ class CloudWatchBatcher:
         # If multiple pages, merge results for consistency
         if len(pages) == 1:
             return dict(pages[0])  # return original shape
-        return {"MetricDataResults": _merge_results(pages), "Messages": self._merge_messages(pages)}
+        return {
+            "MetricDataResults": _merge_results(pages),
+            "Messages": self._merge_messages(pages),
+        }
 
     def _retrying_get_metric_data(self, params: Mapping[str, Any]) -> Dict[str, Any]:
         """Call `client.get_metric_data` with throttling retries."""
@@ -206,8 +312,12 @@ class CloudWatchBatcher:
                 return self._cw.get_metric_data(**params)  # type: ignore[call-arg]
             except ClientError as err:
                 code = (err.response or {}).get("Error", {}).get("Code", "")
-                if code not in {"Throttling", "ThrottlingException"} or attempts >= self._max_retries:
+                throttled = code in {"Throttling", "ThrottlingException"}
+                if not throttled or attempts >= self._max_retries:
                     raise
+            except BotoCoreError:
+                # Non-retryable botocore transport/serialization errors
+                raise
             attempts += 1
             sleep(delay)
             delay *= 2.0  # simple exponential backoff
@@ -220,10 +330,3 @@ class CloudWatchBatcher:
             for m in p.get("Messages", []) or []:
                 out.append(m)
         return out
-
-
-def _strip_queries(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
-    """Return kwargs without `MetricDataQueries` for chunked calls."""
-    out = dict(kwargs)
-    out.pop("MetricDataQueries", None)
-    return out
