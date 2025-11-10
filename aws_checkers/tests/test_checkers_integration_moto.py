@@ -106,3 +106,4 @@ def test_checkers_run_against_moto(
     # Validate everything we captured
     for row in captured_rows:
         _assert_row_schema_invariants(row)
+

@@ -46,7 +46,7 @@ from finops_toolset.config import (
 from finops_toolset.pricing import get_price
 from aws_checkers.eip import check_unused_elastic_ips as eip
 from aws_checkers.network_interfaces import check_detached_network_interfaces as eni
-from aws_checkers import config as checkers_config
+from aws_checkers import config as checkers_config, rds as rds_checks
 from aws_checkers.private_ca import check_private_certificate_authorities
 from aws_checkers.kms import check_kms_customer_managed_keys
 from aws_checkers.efs import check_unused_efs_filesystems
@@ -58,8 +58,7 @@ from aws_checkers import (
     fsx as fsx_checks, ec2 as ec2_checks, s3 as s3_checks,
     ami as ami_checks, kinesis as kinesis_checks, ebs as ebs_checks,
     dynamodb as ddb_checks, loggroups as lg_checks, vpc_tgw as vpc_tgw_checks,
-    lambda_svc as lambda_checks, rds_snapshots as rds_snaps, extended_support as ext_checks,
-    backup as backup_checks, ecr as ecr_checks, ssm as ssm_checks,
+    lambda_svc as lambda_checks, rds_snapshots as rds_snaps, backup as backup_checks, ecr as ecr_checks, ssm as ssm_checks,
 )
 
 #endregion
@@ -606,17 +605,54 @@ def main():
 
                 run_check(
                     profiler, "check_rds_extended_support_candidates",
-                    region, ext_checks.check_rds_extended_support_candidates,
+                    region, rds_checks.check_rds_engine_extended_support,
                     writer=writer, rds=clients["rds"],
                 )
 
                 run_check(
-                    profiler, "check_eks_extended_support_clusters", region,
-                    ext_checks.check_eks_extended_support_clusters,
-                    writer=writer, eks=clients["eks"],
-                    # knobs: ext_versions=["1.23","1.24","1.25"]
+                    profiler, "check_rds_underutilized_instances",
+                    region, rds_checks.check_rds_underutilized_instances,
+                    writer=writer, cloudwatch=clients["cloudwatch"], rds=clients["rds"],
+                    # knobs: lookback_days=30, cpu_threshold_pct=20.0, conn_threshold=5.0
                 )
 
+                # Multi-AZ on non-prod → consider single-AZ
+                run_check(
+                    profiler, "check_rds_multi_az_non_prod",
+                    region, rds_checks.check_rds_multi_az_non_prod,
+                    writer=writer, rds=clients["rds"],
+                )
+
+                # Read replicas with near-zero usage → remove
+                run_check(
+                    profiler, "check_rds_unused_read_replicas",
+                    region, rds_checks.check_rds_unused_read_replicas,
+                    writer=writer, cloudwatch=clients["cloudwatch"], rds=clients["rds"],
+                    # knobs: lookback_days=30, conn_threshold=1.0, iops_threshold=5.0
+                )
+
+                # Provisioned IOPS ≫ observed → reduce
+                run_check(
+                    profiler, "check_rds_iops_overprovisioned",
+                    region, rds_checks.check_rds_iops_overprovisioned,
+                    writer=writer, cloudwatch=clients["cloudwatch"], rds=clients["rds"],
+                    # knobs: lookback_days=30, headroom_pct=50.0
+                )
+
+                # Storage modernization: gp2 → gp3
+                run_check(
+                    profiler, "check_rds_gp2_to_gp3_candidates",
+                    region, rds_checks.check_rds_gp2_to_gp3_candidates,
+                    writer=writer, rds=clients["rds"],
+                )
+
+                # Aurora clusters with low activity → downsize/pause review
+                run_check(
+                    profiler, "check_aurora_low_activity_clusters",
+                    region, rds_checks.check_aurora_low_activity_clusters,
+                    writer=writer, cloudwatch=clients["cloudwatch"], rds=clients["rds"],
+                    # knobs: lookback_days=30, cpu_threshold_pct=10.0, conn_threshold=5.0
+                )
 
                 run_check(profiler, check_name="check_private_certificate_authorities",
                 region=region,fn=check_private_certificate_authorities,

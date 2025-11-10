@@ -14,7 +14,6 @@ from __future__ import annotations
 from importlib import import_module
 import inspect
 import pkgutil
-import re
 import ast
 from typing import Dict, List, Set, Tuple
 import pytest
@@ -59,16 +58,6 @@ def _assert_row_schema_invariants(row: Dict[str, object]) -> None:
     cost = row["Estimated_Cost_USD"]
     assert isinstance(cost, (int, float)), "Estimated_Cost_USD must be numeric"
     assert row["Resource_ID"], "Resource_ID should not be empty"
-
-
-def _assert_owner_id_safe(value: str, account_id: str, safely_text) -> None:
-    """Ensure OwnerId is spreadsheet-safe (uses safely_text for 12-digit ids)."""
-    looks_12_digits = bool(re.fullmatch(r"[0-9]{12}", str(account_id)))
-    if looks_12_digits:
-        expected = safely_text(str(account_id))
-        assert value == expected, "OwnerId must use safely_text(account_id)"
-    else:
-        assert value == str(account_id), "OwnerId must match the configured account id"
 
 
 def _ast_enforce_owner_id_safety(module_obj) -> None:
