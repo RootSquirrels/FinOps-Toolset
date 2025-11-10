@@ -58,7 +58,8 @@ from aws_checkers import (
     fsx as fsx_checks, ec2 as ec2_checks, s3 as s3_checks,
     ami as ami_checks, kinesis as kinesis_checks, ebs as ebs_checks,
     dynamodb as ddb_checks, loggroups as lg_checks, vpc_tgw as vpc_tgw_checks,
-    lambda_svc as lambda_checks, rds_snapshots as rds_snaps, backup as backup_checks, ecr as ecr_checks, ssm as ssm_checks,
+    lambda_svc as lambda_checks, rds_snapshots as rds_snaps, backup as backup_checks, 
+    ecr as ecr_checks, ssm as ssm_checks, sagemaker as sm_checks,
 )
 
 #endregion
@@ -189,6 +190,7 @@ def init_clients(region: str):
         "acm-pca": boto3.client("acm-pca", region_name=region, config=SDK_CONFIG),
         "acm": boto3.client("acm", region_name=region, config=SDK_CONFIG),
         "firehose": boto3.client("firehose", region_name=region, config=SDK_CONFIG),
+        "sagemaker": boto3.client("sagemaker", region_name=region, config=SDK_CONFIG),
     }
 
 
@@ -920,6 +922,28 @@ def main():
                     ec2=clients["ec2"],
                     # knobs: lookback_days=30
                 )
+
+                run_check(
+                    profiler, "check_sagemaker_idle_notebooks",
+                    region, sm_checks.check_sagemaker_idle_notebooks,
+                    writer=writer, client=clients["sagemaker"],
+                    # knobs: lookback_days=14, idle_grace_hours=12
+                )
+
+                run_check(
+                    profiler, "check_sagemaker_idle_endpoints",
+                    region, sm_checks.check_sagemaker_idle_endpoints,
+                    writer=writer, client=clients["sagemaker"], cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, invocation_threshold=5.0
+                )
+
+                run_check(
+                    profiler, "check_sagemaker_studio_zombies",
+                    region, sm_checks.check_sagemaker_studio_zombies,
+                    writer=writer, client=clients["sagemaker"],
+                    # knobs: lookback_days=7
+                )
+
 
         profiler.dump_csv()
         profiler.log_summary(top_n=30)
