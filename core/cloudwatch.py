@@ -1,145 +1,229 @@
-# finops_toolset/aws/cloudwatch.py
-from __future__ import annotations
-from dataclasses import dataclass
-from datetime import datetime
-import time
-from typing import Dict, List, Tuple, Union, Any
+"""CloudWatch metric batching utilities.
 
-import boto3 #type: ignore
-from botocore.config import Config #type: ignore
-from botocore.exceptions import ClientError #type: ignore
+This module provides a small wrapper around the CloudWatch `GetMetricData` API that:
+- Splits large query sets into API-compliant chunks (<= 500 queries/request).
+- Transparently paginates via `NextToken`.
+- Retries on throttling with exponential backoff.
+- Exposes two entry points used by the toolset:
+  * CloudWatchBatcher.get_metric_data(**kwargs) -> dict (matches boto3 shape)
+  * CloudWatchBatcher.run(queries, start, end, ...) -> List[MetricDataResults]
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from time import sleep
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional
 
 try:
-    from finops_toolset.config import SDK_CONFIG
-except Exception:
-    SDK_CONFIG = Config(retries={"max_attempts": 10, "mode": "standard"})
+    from botocore.client import BaseClient
+    from botocore.exceptions import ClientError
+except Exception as exc:  # pragma: no cover - import guard only
+    raise RuntimeError("botocore is required for CloudWatch batching") from exc
 
-# ---------- Retry helper ----------
-def _aws_call(fn, *args, **kwargs):
-    for attempt in range(5):
-        try:
-            return fn(*args, **kwargs)
-        except ClientError as e:
-            code = (e.response or {}).get("Error", {}).get("Code", "")
-            if code in {"Throttling","ThrottlingException","RequestLimitExceeded"} or code.startswith("5"):
 
-                time.sleep(min(2 ** attempt, 8))
+# AWS limit for GetMetricData: max 500 MetricDataQueries per call.
+_DEFAULT_CHUNK_SIZE = 500
+
+
+def _chunked(seq: Iterable[Any], size: int) -> Iterator[List[Any]]:
+    """Yield lists of up to `size` items from `seq`."""
+    bucket: List[Any] = []
+    for item in seq:
+        bucket.append(item)
+        if len(bucket) >= size:
+            yield bucket
+            bucket = []
+    if bucket:
+        yield bucket
+
+
+def _merge_results(pages: Iterable[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+    """Merge MetricDataResults across pages/chunks by Id, in timestamp order."""
+    merged: Dict[str, MutableMapping[str, Any]] = {}
+    for page in pages:
+        for entry in page.get("MetricDataResults", []) or []:
+            rid = entry.get("Id")
+            if not rid:
+                # Skip malformed entries
                 continue
-            raise
-        except Exception:
-            time.sleep(min(2 ** attempt, 8))
-    raise RuntimeError("AWS call failed after retries")
+            current = merged.setdefault(rid, {"Id": rid, "Label": entry.get("Label", "")})
+            # Merge values/timestamps preserving order (CloudWatch returns ascending if requested)
+            vals = entry.get("Values", []) or []
+            ts = entry.get("Timestamps", []) or []
+            if vals:
+                current.setdefault("Values", [])  # type: ignore[assignment]
+                current.setdefault("Timestamps", [])  # type: ignore[assignment]
+                current["Values"].extend(vals)  # type: ignore[index]
+                current["Timestamps"].extend(ts)  # type: ignore[index]
+            # Keep status if present
+            status = entry.get("StatusCode")
+            if status:
+                current["StatusCode"] = status  # type: ignore[index]
+    # Convert to list and ensure values/timestamps exist
+    out: List[Mapping[str, Any]] = []
+    for item in merged.values():
+        item.setdefault("Values", [])         # type: ignore[call-arg]
+        item.setdefault("Timestamps", [])     # type: ignore[call-arg]
+        out.append(item)
+    return out
 
-# ---------- MDQ model ----------
-@dataclass
-class MDQ:
-    id: str
-    namespace: str
-    metric: str
-    dims: List[dict]
-    stat: str
-    period: int
-
-def build_mdq(id_hint: str, namespace: str, metric: str, dims: List[dict], stat: str, period: int) -> MDQ:
-    """Factory kept for compatibility with call sites: returns an MDQ dataclass."""
-    return MDQ(id_hint, namespace, metric, dims, stat, period)
-
-MetricQuery = Union[MDQ, Dict[str, Any]]
-
-def _sanitize_id(id_hint: str) -> str:
-    s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(id_hint))
-    if not s or not s[0].isalpha():
-        s = "m_" + s
-    return s[:255]
 
 class CloudWatchBatcher:
+    """Batching wrapper for CloudWatch `GetMetricData`.
+
+    Usage:
+        cw = boto3.client("cloudwatch")
+        batcher = CloudWatchBatcher(cw)
+
+        # 1) boto3-compatible call, returns a dict with 'MetricDataResults'
+        resp = batcher.get_metric_data(
+            MetricDataQueries=[...],
+            StartTime=start_dt,
+            EndTime=end_dt,
+            ScanBy="TimestampAscending",
+        )
+
+        # 2) Simplified call, returns just the MetricDataResults list
+        results = batcher.run(queries, start_dt, end_dt)
     """
-    Batches GetMetricData queries. Accepts MDQ *or* raw dicts.
-    Now auto-sanitizes Ids internally and returns series keyed by the ORIGINAL id_hints.
-    """
-    def __init__(self, region: str, client=None):
-        self.region = region
-        self.cw = client or boto3.client("cloudwatch", region_name=region, config=SDK_CONFIG)
-        self._mdqs: List[Dict[str, Any]] = []      # always stored as dicts shaped for GetMetricData
-        self._idmap: Dict[str, str] = {}           # original_id_hint -> safe_id
-        self._idmap_rev: Dict[str, str] = {}       # safe_id -> original_id_hint
 
-    def add(self, q: Union[MDQ, Dict[str, Any]]) -> None:
-        """Add a query. If q has an invalid Id, sanitize it and keep a mapping back to the original."""
-        if isinstance(q, MDQ):
-            orig = q.id
-            safe = _sanitize_id(orig)
-            d = {
-                "Id": safe,
-                "MetricStat": {
-                    "Metric": {"Namespace": q.namespace, "MetricName": q.metric, "Dimensions": q.dims},
-                    "Period": q.period,
-                    "Stat": q.stat,
-                },
-                "ReturnData": True,
-            }
-        else:
-            orig = q.get("Id") or "m_id"
-            safe = _sanitize_id(orig)
-            d = dict(q)
-            d["Id"] = safe
+    def __init__(
+        self,
+        client: BaseClient,
+        *,
+        chunk_size: int = _DEFAULT_CHUNK_SIZE,
+        max_retries: int = 2,
+        backoff_seconds: float = 0.5,
+    ) -> None:
+        """Create a new batcher.
 
-        # record mapping only once per original id
-        if orig not in self._idmap:
-            self._idmap[orig] = safe
-            self._idmap_rev[safe] = orig
-
-        self._mdqs.append(d)
-
-    def add_q(self, *, id_hint: str, namespace: str, metric: str, 
-              dims: List[dict], stat: str, period: int) -> None:
-        self.add({
-            "Id": id_hint,  # we'll sanitize internally and map back
-            "MetricStat": {
-                "Metric": {"Namespace": namespace, "MetricName": metric, "Dimensions": dims},
-                "Period": period,
-                "Stat": stat,
-            },
-            "ReturnData": True,
-        })
-
-    def execute(self, start: datetime, end: datetime, scan_by: str = "TimestampDescending") -> Dict[str, List[Tuple[datetime, float]]]:
+        Args:
+            client: Boto3 CloudWatch client.
+            chunk_size: Max queries per request (<= 500).
+            max_retries: Retries on throttling errors per API call.
+            backoff_seconds: Initial sleep before retry; doubled each attempt.
         """
-        Executes in chunks (<=500 queries each).
-        Returns: dict keyed by the ORIGINAL id_hint you added (not the sanitized Id).
+        self._cw = client
+        self._chunk_size = max(1, min(int(chunk_size), _DEFAULT_CHUNK_SIZE))
+        self._max_retries = max(0, int(max_retries))
+        self._backoff = float(backoff_seconds)
+
+    def get_metric_data(self, **kwargs: Any) -> Dict[str, Any]:
+        """Compatibility wrapper for `client.get_metric_data(**kwargs)`.
+
+        This method accepts the same keyword args as boto3 and will:
+          - Chunk `MetricDataQueries` into API-sized requests.
+          - Paginate via `NextToken`.
+          - Retry on throttling up to `max_retries`.
+
+        Returns:
+            dict: A dict containing `"MetricDataResults": [...]` and merged `"Messages"` if any.
         """
-        if not self._mdqs:
-            return {}
+        queries: List[Dict[str, Any]] = list(kwargs.get("MetricDataQueries", []) or [])
+        if not queries:
+            # Delegate to the client if nothing to split (still supports pagination)
+            return self._call_with_pagination(**kwargs)
 
-        out: Dict[str, List[Tuple[datetime, float]]] = {}
-        for i in range(0, len(self._mdqs), 500):
-            chunk = self._mdqs[i:i+500]
+        all_pages: List[Mapping[str, Any]] = []
+        for chunk in _chunked(queries, self._chunk_size):
+            page = self._call_with_pagination(MetricDataQueries=chunk, **_strip_queries(kwargs))
+            all_pages.append(page)
 
-            next_token = None
-            while True:
-                kwargs = dict(MetricDataQueries=chunk, StartTime=start, EndTime=end, ScanBy=scan_by)
-                if next_token:
-                    kwargs["NextToken"] = next_token
-                resp = _aws_call(self.cw.get_metric_data, **kwargs)
+        results = _merge_results(all_pages)
 
-                for r in (resp.get("MetricDataResults") or []):
-                    safe_id = r["Id"]
-                    orig_id = self._idmap_rev.get(safe_id, safe_id)
-                    ts = r.get("Timestamps") or []
-                    vals = r.get("Values") or []
-                    pairs = sorted(zip(ts, vals), key=lambda x: x[0], reverse=True)
-                    out.setdefault(orig_id, []).extend(pairs)
+        # Merge Messages if present
+        messages: List[Mapping[str, Any]] = []
+        for p in all_pages:
+            for m in p.get("Messages", []) or []:
+                messages.append(m)
 
-                next_token = resp.get("NextToken")
-                if not next_token:
-                    break
-
+        out: Dict[str, Any] = {"MetricDataResults": results}
+        if messages:
+            out["Messages"] = messages
         return out
 
-    @staticmethod
-    def latest(series: List[Tuple[datetime, float]], default: float = 0.0) -> float:
-        return float(series[0][1]) if series else default
+    def run(
+        self,
+        queries: List[Dict[str, Any]],
+        start: datetime,
+        end: datetime,
+        *,
+        scan_by: str = "TimestampAscending",
+        **extra: Any,
+    ) -> List[Mapping[str, Any]]:
+        """Execute queries via `get_metric_data` and return just the results list.
+
+        Args:
+            queries: MetricDataQueries items.
+            start: StartTime (UTC).
+            end: EndTime (UTC).
+            scan_by: "TimestampAscending" (default) or "TimestampDescending".
+            **extra: Additional GetMetricData parameters (e.g., `LabelOptions`, `MaxDatapoints`).
+
+        Returns:
+            List of MetricDataResults.
+        """
+        resp = self.get_metric_data(
+            MetricDataQueries=list(queries),
+            StartTime=start,
+            EndTime=end,
+            ScanBy=scan_by,
+            **extra,
+        )
+        return list(resp.get("MetricDataResults", []) or [])
+
+    # ------------------------ internal helpers ------------------------
+
+    def _call_with_pagination(self, **kwargs: Any) -> Dict[str, Any]:
+        """Call `get_metric_data` handling pagination and throttling retries."""
+        next_token: Optional[str] = None
+        pages: List[Mapping[str, Any]] = []
+
+        while True:
+            call_kwargs = dict(kwargs)  # shallow copy per page
+            if next_token:
+                call_kwargs["NextToken"] = next_token
+
+            page = self._retrying_get_metric_data(call_kwargs)
+            pages.append(page)
+
+            next_token = page.get("NextToken")
+            if not next_token:
+                break
+
+        # If multiple pages, merge results for consistency
+        if len(pages) == 1:
+            return dict(pages[0])  # return original shape
+        return {"MetricDataResults": _merge_results(pages), "Messages": self._merge_messages(pages)}
+
+    def _retrying_get_metric_data(self, params: Mapping[str, Any]) -> Dict[str, Any]:
+        """Call `client.get_metric_data` with throttling retries."""
+        attempts = 0
+        delay = self._backoff
+        while True:
+            try:
+                return self._cw.get_metric_data(**params)  # type: ignore[call-arg]
+            except ClientError as err:
+                code = (err.response or {}).get("Error", {}).get("Code", "")
+                if code not in {"Throttling", "ThrottlingException"} or attempts >= self._max_retries:
+                    raise
+            attempts += 1
+            sleep(delay)
+            delay *= 2.0  # simple exponential backoff
 
     @staticmethod
-    def sum(series: List[Tuple[datetime, float]]) -> float:
-        return float(sum(v for _, v in series))
+    def _merge_messages(pages: Iterable[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+        """Collect Messages from multiple pages (best-effort, may be empty)."""
+        out: List[Mapping[str, Any]] = []
+        for p in pages:
+            for m in p.get("Messages", []) or []:
+                out.append(m)
+        return out
+
+
+def _strip_queries(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return kwargs without `MetricDataQueries` for chunked calls."""
+    out = dict(kwargs)
+    out.pop("MetricDataQueries", None)
+    return out
