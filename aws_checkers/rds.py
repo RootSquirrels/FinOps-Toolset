@@ -404,9 +404,9 @@ def _step_down_instance_class(inst: str) -> str:
 # ----------------------------------------------------------------------------
 
 def check_rds_underutilized_instances(
-    writer: Any,
     region: str,
     *,
+    writer: Any,
     cloudwatch: BaseClient,
     rds: BaseClient,
     lookback_days: int = 30,
@@ -493,9 +493,9 @@ def check_rds_underutilized_instances(
 
 
 def check_rds_multi_az_non_prod(
-    writer: Any,
     region: str,
     *,
+    writer: Any,
     rds: BaseClient,
     account_id: Optional[str] = None,
     run_id: Optional[str] = None,
@@ -561,9 +561,9 @@ def check_rds_multi_az_non_prod(
 
 
 def check_rds_unused_read_replicas(
-    writer: Any,
     region: str,
     *,
+    writer: Any,
     cloudwatch: BaseClient,
     rds: BaseClient,
     lookback_days: int = 30,
@@ -634,9 +634,9 @@ def check_rds_unused_read_replicas(
 
 
 def check_rds_iops_overprovisioned(
-    writer: Any,
     region: str,
     *,
+    writer: Any,
     cloudwatch: BaseClient,
     rds: BaseClient,
     lookback_days: int = 30,
@@ -717,9 +717,9 @@ def check_rds_iops_overprovisioned(
 
 
 def check_rds_gp2_to_gp3_candidates(
-    writer: Any,
     region: str,
     *,
+    writer: Any,
     rds: BaseClient,
     account_id: Optional[str] = None,
     run_id: Optional[str] = None,
@@ -766,9 +766,9 @@ def check_rds_gp2_to_gp3_candidates(
 
 
 def check_aurora_low_activity_clusters(
-    writer: Any,
     region: str,
     *,
+    writer: Any,
     cloudwatch: BaseClient,
     rds: BaseClient,
     lookback_days: int = 30,
@@ -879,9 +879,9 @@ def _needs_engine_upgrade(engine: str, version: str) -> Tuple[bool, str]:
 
 
 def check_rds_engine_extended_support(
-    writer: Any,
     region: str,
     *,
+    writer: Any,
     rds: BaseClient,
     account_id: Optional[str] = None,
     run_id: Optional[str] = None,
