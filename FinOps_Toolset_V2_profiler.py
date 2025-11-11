@@ -376,6 +376,7 @@ def main():
             # -------- Global / cross-region steps first
             try:
                 s3_global = boto3.client("s3", config=SDK_CONFIG)
+                cloudwatch_global = boto3.client("cloudwatch", config=SDK_CONFIG)
                 region="GLOBAL"
             except Exception as e: # pylint: disable=broad-except
                 logging.error("[main] Failed to create global S3 client: %s", e)
@@ -383,9 +384,19 @@ def main():
 
 
             run_check(
-                profiler, "run_s3_checks", region,
-                s3_checks.run_s3_checks,
-                writer=writer, s3_global=s3_global,
+                profiler, "check_s3_cost_and_compliance",
+                region, s3_checks.check_s3_cost_and_compliance,
+                writer=writer, client=s3_global, cloudwatch=cloudwatch_global,
+                # knobs:
+                # lookback_days=7,
+                # min_size_gb_for_lifecycle=500.0,
+                # assumed_cold_fraction=0.30,
+                # min_objects_for_versions=1_000_000,
+                # version_fraction=0.25,
+                # mpu_older_than_days=7,
+                # mpu_check_max_buckets=50,
+                # mpu_per_bucket_limit=100,
+                # mpu_per_upload_parts_limit=20,
             )
 
             # -------- Per-region steps

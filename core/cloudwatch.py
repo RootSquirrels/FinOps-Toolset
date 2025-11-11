@@ -143,4 +143,3 @@ class CloudWatchBatcher:
     @staticmethod
     def sum(series: List[Tuple[datetime, float]]) -> float:
         return float(sum(v for _, v in series))
-
