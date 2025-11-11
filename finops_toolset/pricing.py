@@ -51,6 +51,32 @@ PRICING: PriceMap = {
         # "PUT_1K": 0.005, "GET_1K": 0.0004,
     },
 
+   "OpenSearch": {
+        # Common, region-agnostic defaults
+        # t3 family
+        "INSTANCE_HOURLY.t3.small.search": 0.058,
+        "INSTANCE_HOURLY.t3.small":        0.058,
+        "INSTANCE_HOURLY.t3.medium.search":0.116,
+        "INSTANCE_HOURLY.t3.medium":       0.116,
+
+        # m5/r5/c5 (x86)
+        "INSTANCE_HOURLY.m5.large.search": 0.222,
+        "INSTANCE_HOURLY.m5.large":        0.222,
+        "INSTANCE_HOURLY.r5.large.search": 0.252,
+        "INSTANCE_HOURLY.r5.large":        0.252,
+        "INSTANCE_HOURLY.c5.large.search": 0.170,
+        "INSTANCE_HOURLY.c5.large":        0.170,
+
+        # m6g/r6g/c6g (Graviton)
+        "INSTANCE_HOURLY.m6g.large.search":0.198,
+        "INSTANCE_HOURLY.m6g.large":       0.198,
+        "INSTANCE_HOURLY.r6g.large.search":0.226,
+        "INSTANCE_HOURLY.r6g.large":       0.226,
+        "INSTANCE_HOURLY.c6g.large.search":0.156,
+        "INSTANCE_HOURLY.c6g.large":       0.156,
+
+    },
+
     "EFS": {
         "EFS_STANDARD_GB_MONTH": 0.25,
         "EFS_IA_GB_MONTH": 0.025,
@@ -60,7 +86,7 @@ PRICING: PriceMap = {
         "PROV_TPUT_MIBPS_MONTH": 6.0,
         "IA_RETRIEVAL_GB": 0.01,
     },
-    
+
     "EBS_FSR": {
         "DSU_HR": 0.75
     },
@@ -207,7 +233,7 @@ PRICING: PriceMap = {
         "NOTEBOOK_HOUR.ml.c5.large": 0.102,
         "NOTEBOOK_HOUR.ml.c5.xlarge": 0.204,
         "NOTEBOOK_HOUR.ml.g4dn.xlarge": 0.750,
-        
+
         "ENDPOINT_HOUR.ml.t3.medium": 0.050,
         "ENDPOINT_HOUR.ml.m5.large": 0.112,
         "ENDPOINT_HOUR.ml.m5.xlarge": 0.224,

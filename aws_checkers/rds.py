@@ -9,8 +9,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError
 
-# Uses your CloudWatchBatcher API:
-# CloudWatchBatcher(region, client=None).add_q(...).execute(...)
 from core.cloudwatch import CloudWatchBatcher  # noqa: E402
 from core.retry import retry_with_backoff
 
@@ -238,7 +236,6 @@ def check_rds_underutilized_instances(  # noqa: D401
     cpu_threshold_pct: float = 20.0,
     conn_threshold: float = 5.0,
     account_id: Optional[str] = None,
-    run_id: Optional[str] = None,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     """Flag RDS instances with low CPU + connections → rightsizing candidate."""
@@ -320,7 +317,6 @@ def check_rds_multi_az_non_prod(  # noqa: D401
     *args: Any,
     logger: Optional[logging.Logger] = None,
     account_id: Optional[str] = None,
-    run_id: Optional[str] = None,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     """Flag Multi-AZ instances (approx saving = one instance cost per month)."""
@@ -378,7 +374,6 @@ def check_rds_unused_read_replicas(  # noqa: D401
     conn_threshold: float = 1.0,
     iops_threshold: float = 5.0,
     account_id: Optional[str] = None,
-    run_id: Optional[str] = None,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     """Flag read replicas with near-zero connections/IOPS → remove."""
@@ -455,7 +450,6 @@ def check_rds_iops_overprovisioned(  # noqa: D401
     lookback_days: int = 30,
     headroom_pct: float = 50.0,
     account_id: Optional[str] = None,
-    run_id: Optional[str] = None,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     """Flag instances with provisioned IOPS >> observed IOPS → reduce IOPS."""
@@ -536,7 +530,6 @@ def check_rds_gp2_to_gp3_candidates(  # noqa: D401
     *args: Any,
     logger: Optional[logging.Logger] = None,
     account_id: Optional[str] = None,
-    run_id: Optional[str] = None,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     """Flag RDS instances using gp2 → recommend gp3 (delta per GB-month)."""
@@ -595,7 +588,6 @@ def check_aurora_low_activity_clusters(  # noqa: D401
     cpu_threshold_pct: float = 10.0,
     conn_threshold: float = 5.0,
     account_id: Optional[str] = None,
-    run_id: Optional[str] = None,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     """Flag Aurora clusters with low activity → downsize/pause review."""
@@ -700,7 +692,6 @@ def check_rds_engine_extended_support(  # noqa: D401
     *args: Any,
     logger: Optional[logging.Logger] = None,
     account_id: Optional[str] = None,
-    run_id: Optional[str] = None,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     """Flag RDS/Aurora engines on legacy/extended support versions → upgrade."""

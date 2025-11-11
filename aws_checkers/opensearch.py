@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import concurrent.futures as futures
 import logging
-import aws_checkers.config as CONF  # type: ignore
+from aws_checkers import config
 
 try:
     from botocore.client import BaseClient
@@ -244,54 +244,28 @@ def _paginate(
             break
 
 
-def _safe_get_price(key_candidates: Sequence[str], default: float = 0.0) -> float:
-    """Resolve a price using the repo's :func:`get_price` with safe fallbacks.
+def _hourly_price_for_instance(instance_type: str) -> float:
+    """Return hourly price for an OpenSearch node via config.safe_price.
 
-    The helper tries each key in order and returns the first non-None value.
-    A float default is returned if nothing resolves.
+    Tries, in order (first > 0 wins):
+      - ("OpenSearch", "INSTANCE_HOURLY.<instance>.search")
+      - ("OpenSearch", "INSTANCE_HOURLY.<instance>")
     """
-    for key in key_candidates:
-        try:
-            val = CONF.safe_price(key, default)  # type: ignore[call-arg]
-            if val is not None:
-                return float(val)
-        except Exception:  # pragma: no cover - keep scanning
-            continue
-    return float(default)
-
-
-def _hourly_price_for_instance(service_prefix: str, instance_type: str) -> float:
-    """Return hourly price for an instance/node type via :func:`get_price`.
-
-    Tries common key patterns used in cost maps. Example candidates:
-    - `elasticache.instance_hourly.cache.r6g.large`
-    - `elasticache.node_hourly.cache.r6g.large`
-    - `opensearch.instance_hourly.r6g.large.search`
-    - `es.instance_hourly.r6g.large`
-    - `aws.es.r6g.large.hourly`
-    Defaults to 0.0 if unknown (savings will then be zeroed, conservative).
-    """
-    inst = instance_type.strip()
+    inst = (instance_type or "").strip()
     candidates = [
-        f"{service_prefix}.instance_hourly.{inst}",
-        f"{service_prefix}.node_hourly.{inst}",
-        f"aws.{service_prefix}.{inst}.hourly",
-        f"{service_prefix}.{inst}.hourly",
-        f"{service_prefix}.hourly.{inst}",
+        f"INSTANCE_HOURLY.{inst if inst.endswith('.search') else inst + '.search'}",
+        f"INSTANCE_HOURLY.{inst.replace('.search', '')}",
     ]
-    if service_prefix == "opensearch":  # also try legacy ES keys
-        candidates.extend(
-            [
-                f"es.instance_hourly.{inst}",
-                f"aws.es.{inst}.hourly",
-            ]
-        )
-    return _safe_get_price(candidates, default=0.0)
+    for key in candidates:
+        price = float(config.safe_price("OpenSearch", key, 0.0))  # type: ignore[arg-type]
+        if price > 0.0:
+            return price
+    return 0.0
 
 
-def _monthly_cost_from_nodes(service_prefix: str, instance_type: str, count: int) -> float:
+def _monthly_cost_from_nodes(instance_type: str, count: int) -> float:
     """Compute conservative monthly cost based on hourly * 730 * count."""
-    hourly = _hourly_price_for_instance(service_prefix, instance_type)
+    hourly = _hourly_price_for_instance(instance_type)
     return round(hourly * 730.0 * float(max(count, 0)), 2)
 
 
@@ -618,7 +592,6 @@ def check_elasticache_idle_clusters(
     elasticache: BaseClient,
     account_id: Optional[str] = None,
     lookback_days: int = 30,
-    run_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Checker for **idle ElastiCache clusters** with savings estimates.
 
@@ -661,7 +634,7 @@ def check_elasticache_idle_clusters(
         net_total = float(s["net_sum"])  # bytes over lookback
 
         is_idle = (cpu < 2.0) and (conn < 1.0) and (net_total < 10_000_000.0)
-        monthly_cost = _monthly_cost_from_nodes("elasticache", node_type, nodes)
+        monthly_cost = _monthly_cost_from_nodes(node_type, nodes)
         savings = monthly_cost if is_idle else 0.0
 
         flags = []
@@ -716,7 +689,6 @@ def check_opensearch_idle_domains(
     account_id: Optional[str] = None,
     lookback_days: int = 30,
     max_workers: int = 16,
-    run_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Checker for **idle OpenSearch/ES domains** with savings estimates.
 
@@ -778,13 +750,11 @@ def check_opensearch_idle_domains(
             is_idle = (cpu < 2.0) and (index_sum < 1.0)
 
             monthly_cost = 0.0
-            monthly_cost += _monthly_cost_from_nodes("opensearch", data_type, data_count)
+            monthly_cost += _monthly_cost_from_nodes(data_type, data_count)
             if master_count and master_type:
-                monthly_cost += _monthly_cost_from_nodes(
-                    "opensearch", master_type, master_count
-                )
+                monthly_cost += _monthly_cost_from_nodes(master_type, master_count)
             if warm_count and warm_type:
-                monthly_cost += _monthly_cost_from_nodes("opensearch", warm_type, warm_count)
+                monthly_cost += _monthly_cost_from_nodes(warm_type, warm_count)
 
             savings = monthly_cost if is_idle else 0.0
 
