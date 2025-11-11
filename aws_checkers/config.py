@@ -4,10 +4,11 @@ from __future__ import annotations
 from typing import Callable, Optional
 import logging
 from decimal import Decimal
+from finops_toolset import pricing
 
 ACCOUNT_ID: Optional[str] = None
 WRITE_ROW: Optional[Callable[..., None]] = None
-GET_PRICE: Optional[Callable[[str, str], float]] = None
+GET_PRICE: Optional[Callable[[str, str], float]] = getattr(pricing, "get_price", None)
 LOGGER: Optional[logging.Logger] = None
 
 
