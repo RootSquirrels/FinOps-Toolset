@@ -111,6 +111,18 @@ PRICING: PriceMap = {
     "RDS": {
         # Automated backup storage (beyond free quota ~= size of DB)
         "SNAPSHOT_GB_MONTH": 0.095,
+        "GP2_GB_MONTH": 0.10,
+        "GP3_GB_MONTH": 0.08,
+        "IOPS_PROV_MONTH": 0.10,  # io1/io2 provisioned IOPS per IOPS-month
+
+        # Instance hourly
+        "INSTANCE_HOURLY.db.t3.micro": 0.017,
+        "INSTANCE_HOURLY.db.t3.small": 0.034,
+        "INSTANCE_HOURLY.db.t3.medium": 0.068,
+        "INSTANCE_HOURLY.db.m5.large": 0.192,
+        "INSTANCE_HOURLY.db.m5.xlarge": 0.384,
+        "INSTANCE_HOURLY.db.r5.large": 0.252,
+        "INSTANCE_HOURLY.db.r6g.large": 0.226,
     },
 
     "EKS": {
@@ -187,14 +199,33 @@ PRICING: PriceMap = {
         "PRIVATE_ZONE_MONTH": 0.10,
         "HEALTH_CHECK_MONTH": 0.50
     },
-    "RDS_EXT": {
-        "MySQL57_INSTANCE_HR": 0.0,
-        "PostgreSQL11_INSTANCE_HR": 0.0,
-        "AuroraMySQL57_INSTANCE_HR": 0.0,
-        "AuroraPostgreSQL11_INSTANCE_HR": 0.0
+    "SageMaker": {
+        "NOTEBOOK_HOUR.ml.t3.medium": 0.058,
+        "NOTEBOOK_HOUR.ml.t3.large": 0.116,
+        "NOTEBOOK_HOUR.ml.m5.large": 0.115,
+        "NOTEBOOK_HOUR.ml.m5.xlarge": 0.230,
+        "NOTEBOOK_HOUR.ml.c5.large": 0.102,
+        "NOTEBOOK_HOUR.ml.c5.xlarge": 0.204,
+        "NOTEBOOK_HOUR.ml.g4dn.xlarge": 0.750,
+        
+        "ENDPOINT_HOUR.ml.t3.medium": 0.050,
+        "ENDPOINT_HOUR.ml.m5.large": 0.112,
+        "ENDPOINT_HOUR.ml.m5.xlarge": 0.224,
+        "ENDPOINT_HOUR.ml.c5.large": 0.102,
+        "ENDPOINT_HOUR.ml.c5.xlarge": 0.204,
+        "ENDPOINT_HOUR.ml.g4dn.xlarge": 0.752,
+
+        "STUDIO_APP_HOUR": 0.050,
     },
-    "EKS_EXT": {
-        "CLUSTER_HR": 0.0
+    "APIGW": {
+        "CACHE_HR.0.5": 0.020,
+        "CACHE_HR.1.6": 0.036,
+        "CACHE_HR.6.1": 0.120,
+        "CACHE_HR.13.5": 0.270,
+        "CACHE_HR.28.4": 0.580,
+        "CACHE_HR.58.2": 1.210,
+        "CACHE_HR.118": 2.640,
+        "CACHE_HR.237": 5.460,
     },
 }
 

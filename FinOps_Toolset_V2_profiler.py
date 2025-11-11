@@ -59,7 +59,7 @@ from aws_checkers import (
     ami as ami_checks, kinesis as kinesis_checks, ebs as ebs_checks,
     dynamodb as ddb_checks, loggroups as lg_checks, vpc_tgw as vpc_tgw_checks,
     lambda_svc as lambda_checks, rds_snapshots as rds_snaps, backup as backup_checks, 
-    ecr as ecr_checks, ssm as ssm_checks, sagemaker as sm_checks,
+    ecr as ecr_checks, ssm as ssm_checks, sagemaker as sm_checks, apigateway as apigw_checks
 )
 
 #endregion
@@ -943,6 +943,28 @@ def main():
                     writer=writer, client=clients["sagemaker"],
                     # knobs: lookback_days=7
                 )
+
+                run_check(
+                    profiler, "check_apigw_low_cache_hit_ratio",
+                    region, apigw_checks.check_apigw_low_cache_hit_ratio,
+                    writer=writer, client=clients["apigateway"], cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, hit_ratio_threshold=0.2, min_requests_sum=100
+                )
+
+                run_check(
+                    profiler, "check_apigw_idle_rest_apis",
+                    region, apigw_checks.check_apigw_idle_rest_apis,
+                    writer=writer, client=clients["apigateway"], cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, requests_threshold=50
+                )
+
+                run_check(
+                    profiler, "check_apigw_idle_http_apis",
+                    region, apigw_checks.check_apigw_idle_http_apis,
+                    writer=writer, client=clients["apigatewayv2"], cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, requests_threshold=50
+                )
+
 
 
         profiler.dump_csv()
