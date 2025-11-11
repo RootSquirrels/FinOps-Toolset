@@ -32,12 +32,15 @@ import inspect
 import unittest
 import copy
 import logging
+import ast
+import pathlib
 from contextlib import contextmanager
 from inspect import Parameter
 from typing import Dict, Iterable, Iterator, List, Mapping, Tuple
 
 import FinOps_Toolset_V2_profiler as finops
 import finops_toolset.pricing as pricing
+from aws_checkers import config
 
 
 __all__ = [
@@ -55,6 +58,7 @@ __all__ = [
     "TestWriterBackCompat",
     "TestCSVInvariants",
     "TestPricingLookup",
+    "TestPricingKeysCoverage",
 ]
 
 
@@ -193,6 +197,47 @@ class NullAWSClient:
 
             return {}
         return _f
+
+
+def _scan_repo_safe_price_keys() -> List[str]:
+    """Scan Python sources for literal usages of config.safe_price('...')."""
+    roots = [
+        pathlib.Path("aws_checkers"),
+        pathlib.Path("finops_toolset"),
+    ]
+    keys: List[str] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*.py"):
+            try:
+                src = path.read_text(encoding="utf-8")
+            except Exception:  # pylint: disable=broad-except
+                continue
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, (ast.Name, ast.Attribute))
+                    and (getattr(node.func, "attr", None) == "safe_price"
+                         or getattr(node.func, "id", None) == "safe_price")
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                ):
+                    keys.append(node.args[0].value)
+
+    # Deduplicate, preserve order
+    seen = set()
+    out: List[str] = []
+    for k in keys:
+        if k not in seen:
+            out.append(k)
+            seen.add(k)
+    return out
 
 
 def _signals_ok(cell: str) -> bool:
@@ -429,6 +474,74 @@ class TestGetPriceResolution(unittest.TestCase):
         self.assertEqual(finops.get_price("ALB", "HOUR", region="eu-west-1"), 0.0225)
         self.assertEqual(finops.get_price("ALB", "HOUR", region="us-east-8"), 0.02)
         self.assertEqual(finops.get_price("ALB", "LCU_HOUR", region="eu-west-1"), 0.008)
+
+
+class TestPricingKeysCoverage(unittest.TestCase):
+    """Ensure every literal 'safe_price' key resolves and core keys are sane."""
+
+    def test_all_safe_price_literals_resolve(self) -> None:
+        """
+        For every literal key used in config.safe_price('...'), assert that
+        config.safe_price returns something other than a unique sentinel.
+
+        This catches missing pricing keys early, without hard-coding the
+        normalization logic in tests.
+        """
+        keys = _scan_repo_safe_price_keys()
+        self.assertTrue(keys, "No safe_price(...) keys found to validate")
+
+        _SENTINEL = object()
+        missing: List[str] = []
+        for key in keys:
+            try:
+                val = config.safe_price(key, _SENTINEL)  # type: ignore[arg-type]
+            except Exception:  # pylint: disable=broad-except
+                missing.append(key)
+                continue
+            if val is _SENTINEL:
+                missing.append(key)
+
+        if missing:
+            details = "\n".join(f"- {k}" for k in missing)
+            self.fail(f"Missing pricing for the following safe_price keys:\n{details}")
+
+    def test_core_price_sanity_for_new_checkers(self) -> None:
+        """
+        Sanity-check a few core keys used by the newest checkers; values must be > 0.
+        Adjust/add keys here as the toolset evolves.
+        """
+        # RDS storage deltas & IOPS price
+        rds_gp2 = config.safe_price("rds.gp2_gb_month", 0.0)  # type: ignore[arg-type]
+        rds_gp3 = config.safe_price("rds.gp3_gb_month", 0.0)  # type: ignore[arg-type]
+        rds_iops = config.safe_price("rds.iops_prov_month", 0.0)  # type: ignore[arg-type]
+        self.assertIsInstance(rds_gp2, (int, float))
+        self.assertIsInstance(rds_gp3, (int, float))
+        self.assertIsInstance(rds_iops, (int, float))
+        self.assertGreater(rds_gp2, 0.0)
+        self.assertGreater(rds_gp3, 0.0)
+        self.assertGreater(rds_iops, 0.0)
+        self.assertGreaterEqual(rds_gp2 - rds_gp3, 0.0)
+
+        # RDS instance hourly example
+        rds_inst = config.safe_price("rds.instance_hourly.db.m5.large", 0.0)  # type: ignore[arg-type]
+        self.assertIsInstance(rds_inst, (int, float))
+        self.assertGreater(rds_inst, 0.0)
+
+        # SageMaker notebook / endpoint / studio app
+        nb = config.safe_price("sagemaker.notebook_hour.ml.t3.medium", 0.0)  # type: ignore[arg-type]
+        ep = config.safe_price("sagemaker.endpoint_hour.ml.m5.large", 0.0)  # type: ignore[arg-type]
+        studio = config.safe_price("sagemaker.studio_app_hour", 0.0)  # type: ignore[arg-type]
+        self.assertIsInstance(nb, (int, float))
+        self.assertIsInstance(ep, (int, float))
+        self.assertIsInstance(studio, (int, float))
+        self.assertGreater(nb, 0.0)
+        self.assertGreater(ep, 0.0)
+        self.assertGreater(studio, 0.0)
+
+        # API Gateway cache hourly (commonly used size)
+        cache_135 = config.safe_price("APIGW.CACHE_HR.13.5", 0.0)  # type: ignore[arg-type]
+        self.assertIsInstance(cache_135, (int, float))
+        self.assertGreater(cache_135, 0.0)
 
 
 class TestCheckerDeterminism(unittest.TestCase):
