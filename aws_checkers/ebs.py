@@ -1,14 +1,4 @@
-"""AWS Checkers: EBS — volumes & snapshots (fast, cached, pylint-friendly).
-
-Goals
-- Keep all existing checks; no feature additions.
-- Make 'public/shared snapshots' fast via bounded, adaptive concurrency.
-- Avoid redundant AWS calls with per-client inventories cached by id(client).
-- Write tags into CSV columns (app_id/app/env), not into signals.
-- Use lazy logger formatting (no f-strings in logs) to satisfy pylint.
-- Lines kept ≤100 chars.
-
-Relies on shared helpers from aws_checkers.common to avoid duplication.
+"""AWS Checkers: EBS — volumes & snapshots.
 """
 
 from __future__ import annotations

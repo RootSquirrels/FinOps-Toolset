@@ -58,8 +58,9 @@ from aws_checkers import (
     fsx as fsx_checks, ec2 as ec2_checks, s3 as s3_checks,
     ami as ami_checks, kinesis as kinesis_checks, ebs as ebs_checks,
     dynamodb as ddb_checks, loggroups as lg_checks, vpc_tgw as vpc_tgw_checks,
-    lambda_svc as lambda_checks, rds_snapshots as rds_snaps, backup as backup_checks, 
-    ecr as ecr_checks, ssm as ssm_checks, sagemaker as sm_checks, apigateway as apigw_checks
+    lambda_svc as lambda_checks, rds_snapshots as rds_snaps, backup as backup_checks,
+    ecr as ecr_checks, ssm as ssm_checks, sagemaker as sm_checks, apigateway as apigw_checks,
+    msk as msk_checks, cloudtrail as ct_checks,
 )
 
 #endregion
@@ -191,6 +192,7 @@ def init_clients(region: str):
         "acm": boto3.client("acm", region_name=region, config=SDK_CONFIG),
         "firehose": boto3.client("firehose", region_name=region, config=SDK_CONFIG),
         "sagemaker": boto3.client("sagemaker", region_name=region, config=SDK_CONFIG),
+        "kafka": boto3.client("kafka", region_name=region, config=SDK_CONFIG),
     }
 
 
@@ -965,7 +967,32 @@ def main():
                     # knobs: lookback_days=14, requests_threshold=50
                 )
 
+                run_check(
+                    profiler, "check_msk_idle_clusters",
+                    region, msk_checks.check_msk_idle_clusters,
+                    writer=writer, client=clients["kafka"], cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, bytes_threshold_gb=1.0, min_brokers_for_saving=1
+                )
 
+                run_check(
+                    profiler, "check_msk_overprovisioned_brokers",
+                    region, msk_checks.check_msk_overprovisioned_brokers,
+                    writer=writer, client=clients["kafka"], cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, low_traffic_gb=10.0,
+                    # min_brokers=3, scale_down_factor=0.5
+                )
+
+                run_check(
+                    profiler, "check_cloudtrail_redundant_trails",
+                    region, ct_checks.check_cloudtrail_redundant_trails,
+                    writer=writer, client=clients["cloudtrail"],
+                )
+
+                run_check(
+                    profiler, "check_cloudtrail_s3_cwlogs_duplication",
+                    region, ct_checks.check_cloudtrail_s3_cwlogs_duplication,
+                    writer=writer, client=clients["cloudtrail"],
+                )
 
         profiler.dump_csv()
         profiler.log_summary(top_n=30)
