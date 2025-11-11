@@ -195,6 +195,8 @@ def init_clients(region: str):
         "stepfunctions": boto3.client("stepfunctions", region_name=region, config=SDK_CONFIG),
         "glue": boto3.client("glue", region_name=region, config=SDK_CONFIG),
         "ecs": boto3.client("ecs", region_name=region, config=SDK_CONFIG),
+        "apigatewayv2": boto3.client("apigatewayv2", region_name=region, config=SDK_CONFIG),
+        "apigateway": boto3.client("apigateway", region_name=region, config=SDK_CONFIG),
     }
 
 
