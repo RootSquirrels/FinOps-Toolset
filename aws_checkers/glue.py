@@ -24,9 +24,9 @@ def _extract_writer_client(
 ) -> Tuple[Any, BaseClient]:
     """Extract (writer, client) from args/kwargs; raise if missing."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    client = kwargs.get("client", args[1] if len(args) >= 2 else None)
+    client = kwargs.get("glue", args[1] if len(args) >= 2 else None)
     if writer is None or client is None:
-        raise TypeError("Expected 'writer' and 'client'")
+        raise TypeError("Expected 'writer' and 'glue'")
     return writer, client
 
 

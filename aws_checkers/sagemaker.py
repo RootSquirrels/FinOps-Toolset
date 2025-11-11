@@ -22,9 +22,9 @@ def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
 def _extract_writer_client(args: Tuple[Any, ...], kwargs: Dict[str, Any]):
     """Extract (writer, sagemaker_client) from args/kwargs, else raise TypeError."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    client = kwargs.get("client", args[1] if len(args) >= 2 else None)
+    client = kwargs.get("sagemaker", args[1] if len(args) >= 2 else None)
     if writer is None or client is None:
-        raise TypeError("Expected 'writer' and 'client'")
+        raise TypeError("Expected 'writer' and 'sagemaker'")
     return writer, client
 
 

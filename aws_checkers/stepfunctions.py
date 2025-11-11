@@ -26,9 +26,9 @@ def _extract_writer_cw_client(
     """Extract (writer, cloudwatch, stepfunctions) from args/kwargs; raise if missing."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
     cloudwatch = kwargs.get("cloudwatch", args[1] if len(args) >= 2 else None)
-    sfn = kwargs.get("client", args[2] if len(args) >= 3 else None)
+    sfn = kwargs.get("stepfunctions", args[2] if len(args) >= 3 else None)
     if writer is None or cloudwatch is None or sfn is None:
-        raise TypeError("Expected 'writer', 'cloudwatch' and 'client'")
+        raise TypeError("Expected 'writer', 'cloudwatch' and 'stepfunctions'")
     return writer, cloudwatch, sfn
 
 

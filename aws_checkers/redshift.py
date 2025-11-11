@@ -25,9 +25,9 @@ def _extract_writer_client(
 ) -> Tuple[Any, BaseClient]:
     """Extract (writer, client) from args/kwargs; raise if missing."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    client = kwargs.get("client", args[1] if len(args) >= 2 else None)
+    client = kwargs.get("redshift", args[1] if len(args) >= 2 else None)
     if writer is None or client is None:
-        raise TypeError("Expected 'writer' and 'client'")
+        raise TypeError("Expected 'writer' and 'redshift'")
     return writer, client
 
 
@@ -37,9 +37,9 @@ def _extract_writer_cw_client(
     """Extract (writer, cloudwatch, redshift) from args/kwargs; raise if missing."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
     cloudwatch = kwargs.get("cloudwatch", args[1] if len(args) >= 2 else None)
-    redshift = kwargs.get("client", args[2] if len(args) >= 3 else None)
+    redshift = kwargs.get("redshift", args[2] if len(args) >= 3 else None)
     if writer is None or cloudwatch is None or redshift is None:
-        raise TypeError("Expected 'writer', 'cloudwatch' and 'client'")
+        raise TypeError("Expected 'writer', 'cloudwatch' and 'redshift'")
     return writer, cloudwatch, redshift
 
 

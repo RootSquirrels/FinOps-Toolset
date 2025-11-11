@@ -27,9 +27,9 @@ def _extract_writer_cw_client(
     """Extract (writer, cloudwatch, client) from args/kwargs; raise if missing."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
     cloudwatch = kwargs.get("cloudwatch", args[1] if len(args) >= 2 else None)
-    client = kwargs.get("client", args[2] if len(args) >= 3 else None)
+    client = kwargs.get("kafka", args[2] if len(args) >= 3 else None)
     if writer is None or cloudwatch is None or client is None:
-        raise TypeError("Expected 'writer', 'cloudwatch' and 'client'")
+        raise TypeError("Expected 'writer', 'cloudwatch' and 'kafka'")
     return writer, cloudwatch, client
 
 
