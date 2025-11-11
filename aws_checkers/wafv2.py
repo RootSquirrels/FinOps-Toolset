@@ -200,6 +200,7 @@ def check_wafv2_unassociated_web_acls(  # pylint: disable=unused-argument
     include_cloudfront: bool = False,
     **kwargs,
 ) -> None:
+    """Checks for unassociated web acls"""
     log = _logger(kwargs.get("logger") or logger)
 
     try:
@@ -267,6 +268,7 @@ def check_wafv2_logging_disabled(  # pylint: disable=unused-argument
     include_cloudfront: bool = False,
     **kwargs,
 ) -> None:
+    """Checks for logging disabled"""
     log = _logger(kwargs.get("logger") or logger)
 
     try:
@@ -327,6 +329,7 @@ def check_wafv2_rules_no_matches(  # pylint: disable=unused-argument
     include_cloudfront: bool = False,
     **kwargs,
 ) -> None:
+    """Checks rules with no matches"""
     log = _logger(kwargs.get("logger") or logger)
 
     try:
@@ -474,6 +477,7 @@ def check_wafv2_empty_acl_associated(  # pylint: disable=unused-argument
     include_cloudfront: bool = False,
     **kwargs,
 ) -> None:
+    """Checks for ACL with zero rules"""
     log = _logger(kwargs.get("logger") or logger)
 
     try:

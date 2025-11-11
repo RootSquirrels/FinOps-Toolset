@@ -596,9 +596,6 @@ def check_elasticache_idle_clusters(
 ) -> List[Dict[str, Any]]:
     """Checker for **idle ElastiCache clusters** with savings estimates.
 
-    This function is designed to be called by the orchestrator via
-    `run_check(…, region, check_elasticache_idle_clusters, writer=…, cloudwatch=…, elasticache=…, …)`.
-
     Args:
         region: AWS region for the check.
         writer: Writer object used by the toolset to emit rows.
@@ -692,9 +689,6 @@ def check_opensearch_idle_domains(
     max_workers: int = 16,
 ) -> List[Dict[str, Any]]:
     """Checker for **idle OpenSearch/ES domains** with savings estimates.
-
-    Designed for orchestrator usage:
-    `run_check(…, region, check_opensearch_idle_domains, writer=…, cloudwatch=…, opensearch=…|es=…, …)`.
 
     Args:
         region: AWS region for the check.

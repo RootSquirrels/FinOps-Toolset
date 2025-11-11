@@ -13,7 +13,6 @@ from botocore.exceptions import BotoCoreError, ClientError  # type: ignore
 
 from aws_checkers import config as cfg
 from core.cloudwatch import CloudWatchBatcher
-from finops_toolset.pricing import get_price
 
 try:  # pragma: no cover
     from FinOps_Toolset_V2_profiler import SDK_CONFIG as _SDK_CONFIG  # type: ignore
@@ -318,9 +317,9 @@ class BucketRow:
         if not isinstance(size_gb, (int, float)):
             return 0.0
         try:
-            price = get_price("S3", "STANDARD_GB_MONTH", region=self.region)
+            price = cfg.safe_price("S3", "STANDARD_GB_MONTH")
         except KeyError:
-            price = get_price("S3", "STANDARD_GB_MONTH", region=None)
+            price = cfg.safe_price("S3", "STANDARD_GB_MONTH", 0.0)
         return round(float(size_gb) * float(price), 2)
 
     def _potential_saving(self, est_cost: float) -> str:

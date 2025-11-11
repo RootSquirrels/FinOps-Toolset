@@ -139,7 +139,8 @@ def _volume_monthly_cost(vol: Dict[str, Any]) -> float:
     return base + add
 
 
-def _describe_volumes_map(ec2, vol_ids: List[str], log: logging.Logger) -> Dict[str, Dict[str, Any]]:
+def _describe_volumes_map(ec2, vol_ids: List[str],
+                          log: logging.Logger) -> Dict[str, Dict[str, Any]]:
     info: Dict[str, Dict[str, Any]] = {}
     if not vol_ids:
         return info
@@ -183,6 +184,7 @@ def check_ec2_underutilized_instances(  # pylint: disable=unused-argument
     net_avg_bps_threshold: float = 100_000.0,
     **kwargs,
 ) -> None:
+    """Check for ec2 instances with low usage"""
     log = _logger(kwargs.get("logger") or logger)
     try:
         writer, ec2, cloudwatch = _extract_writer_ec2_cw(args, kwargs)
