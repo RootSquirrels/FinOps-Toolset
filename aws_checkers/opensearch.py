@@ -30,6 +30,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import concurrent.futures as futures
 import logging
 from aws_checkers import config
+from finops_toolset import config as const
 
 try:
     from botocore.client import BaseClient
@@ -266,7 +267,7 @@ def _hourly_price_for_instance(instance_type: str) -> float:
 def _monthly_cost_from_nodes(instance_type: str, count: int) -> float:
     """Compute conservative monthly cost based on hourly * 730 * count."""
     hourly = _hourly_price_for_instance(instance_type)
-    return round(hourly * 730.0 * float(max(count, 0)), 2)
+    return round(hourly * const.HOURS_PER_MONTH * float(max(count, 0)), 2)
 
 
 def _run_cw_queries(

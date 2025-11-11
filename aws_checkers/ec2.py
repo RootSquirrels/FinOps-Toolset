@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from botocore.exceptions import ClientError
+from finops_toolset import config as const
 
 from aws_checkers import config
 from aws_checkers.common import (
@@ -300,7 +301,7 @@ def check_ec2_underutilized_instances(  # pylint: disable=unused-argument
             continue
 
         hr_price = _instance_hour_price(itype)
-        est = 730.0 * hr_price
+        est = const.HOURS_PER_MONTH * hr_price
         potential = est
 
         flags = ["EC2InstanceUnderutilized"]

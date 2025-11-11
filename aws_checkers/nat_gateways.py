@@ -191,7 +191,7 @@ def check_nat_gateways(  # pylint: disable=unused-argument
         metrics_ok = False
 
     # --- Pricing (heuristic) ---
-    nat_fixed_month = config.safe_price("NATGateway", "NATGW_MONTH", default=32.85)  # ~$0.045/h * 730
+    nat_fixed_month = config.safe_price("NATGateway", "NATGW_MONTH", default=32.85)
     nat_per_gb = config.safe_price("NATGateway", "NATGW_DATA_GB", default=0.045)
 
     # --- Emit rows ---

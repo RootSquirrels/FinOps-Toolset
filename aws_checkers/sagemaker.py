@@ -11,7 +11,7 @@ from botocore.exceptions import ClientError
 from aws_checkers import config
 from core.retry import retry_with_backoff
 
-HOURS_PER_MONTH = 730.0
+from finops_toolset import config as const
 
 
 def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
@@ -106,7 +106,7 @@ def check_sagemaker_idle_notebooks(  # noqa: D401
             last_mod = mod_time if isinstance(mod_time, datetime) else None
 
             hourly = _safe_price("SAGEMAKER", f"NOTEBOOK_HR.{inst_type}", 0.0)
-            monthly = hourly * HOURS_PER_MONTH if hourly > 0.0 else 0.0
+            monthly = hourly * const.HOURS_PER_MONTH if hourly > 0.0 else 0.0
             idle = bool(last_mod and last_mod < cutoff)
 
             potential = monthly if idle else 0.0
@@ -236,7 +236,7 @@ def check_sagemaker_idle_endpoints(  # noqa: D401
                 hourly = _safe_price("SAGEMAKER", f"ENDPOINT_HOUR.{v_type}", 0.0)
                 total_hourly += hourly * float(max(0, v_count))
 
-            monthly = total_hourly * HOURS_PER_MONTH if total_hourly > 0.0 else 0.0
+            monthly = total_hourly * const.HOURS_PER_MONTH if total_hourly > 0.0 else 0.0
             is_idle = invocations < float(invocation_threshold)
             potential = monthly if is_idle else 0.0
 
@@ -303,7 +303,7 @@ def check_sagemaker_studio_zombies(  # noqa: D401
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     next_token: Optional[str] = None
     price_app_hr = _safe_price("SAGEMAKER", "STUDIO_APP_HOUR", 0.0)
-    monthly = price_app_hr * HOURS_PER_MONTH if price_app_hr > 0.0 else 0.0
+    monthly = price_app_hr * const.HOURS_PER_MONTH if price_app_hr > 0.0 else 0.0
 
     while True:
         try:

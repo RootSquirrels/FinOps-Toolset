@@ -37,6 +37,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
+from finops_toolset import config as const
 
 from aws_checkers import config
 from aws_checkers.common import (
@@ -150,7 +151,7 @@ def check_eks_empty_clusters(  # pylint: disable=unused-argument
         return
 
     hr = _price_cluster_hr()
-    monthly = 730.0 * hr
+    monthly = const.HOURS_PER_MONTH * hr
 
     for name in names:
         try:

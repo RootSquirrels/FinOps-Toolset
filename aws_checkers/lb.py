@@ -34,6 +34,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
+from finops_toolset import config as const
 
 from aws_checkers import config
 from aws_checkers.common import (
@@ -229,7 +230,7 @@ def check_elbv2_idle_load_balancers(  # pylint: disable=unused-argument
             continue
 
         hr = _hour_price(lb_type)
-        est = 730.0 * hr
+        est = const.HOURS_PER_MONTH * hr
         potential = est
 
         signals = _signals_str(

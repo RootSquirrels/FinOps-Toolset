@@ -13,9 +13,7 @@ from core.cloudwatch import CloudWatchBatcher  # noqa: E402
 from core.retry import retry_with_backoff
 
 from aws_checkers import config
-
-
-HOURS_PER_MONTH = 730.0
+from finops_toolset import config as const
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +273,7 @@ def check_rds_underutilized_instances(  # noqa: D401
         price_now = _hourly_price_instance(cls)
         price_small = _hourly_price_instance(smaller)
         delta_hr = max(0.0, price_now - price_small) if smaller != cls else 0.0
-        potential = HOURS_PER_MONTH * delta_hr if (cpu < cpu_threshold_pct and conn < conn_threshold) else 0.0
+        potential = const.HOURS_PER_MONTH * delta_hr if (cpu < cpu_threshold_pct and conn < conn_threshold) else 0.0
 
         flags: List[str] = []
         if cpu < cpu_threshold_pct:
@@ -297,7 +295,7 @@ def check_rds_underutilized_instances(  # noqa: D401
                 state=status,
                 creation_date=created_iso,
                 storage_gb=inst.get("AllocatedStorage", 0),
-                estimated_cost=round(price_now * HOURS_PER_MONTH, 2) if price_now else 0.0,
+                estimated_cost=round(price_now * const.HOURS_PER_MONTH, 2) if price_now else 0.0,
                 potential_saving=round(potential, 2) if potential > 0.0 else None,
                 flags=flags,
                 confidence=75 if potential > 0.0 else 60,
@@ -338,7 +336,7 @@ def check_rds_multi_az_non_prod(  # noqa: D401
         arn = inst.get("DBInstanceArn", inst_id)
         cls = inst.get("DBInstanceClass", "")
         price_hourly = _hourly_price_instance(cls)
-        potential = HOURS_PER_MONTH * price_hourly if price_hourly > 0.0 else 0.0
+        potential = const.HOURS_PER_MONTH * price_hourly if price_hourly > 0.0 else 0.0
 
         try:
             # type: ignore[call-arg]
@@ -352,7 +350,7 @@ def check_rds_multi_az_non_prod(  # noqa: D401
                 state=inst.get("DBInstanceStatus", ""),
                 creation_date=_iso(inst.get("InstanceCreateTime")),
                 storage_gb=inst.get("AllocatedStorage", 0),
-                estimated_cost=round(price_hourly * HOURS_PER_MONTH * 2.0, 2) if price_hourly else 0.0,
+                estimated_cost=round(price_hourly * const.HOURS_PER_MONTH * 2.0, 2) if price_hourly else 0.0,
                 potential_saving=round(potential, 2) if potential else None,
                 flags=["MultiAZ", "NonProd"],
                 confidence=80,
@@ -411,7 +409,7 @@ def check_rds_unused_read_replicas(  # noqa: D401
         iops = float(m.get("riops_avg", 0.0)) + float(m.get("wiops_avg", 0.0))
 
         is_idle = conn < conn_threshold and iops < iops_threshold
-        potential = HOURS_PER_MONTH * price_hourly if (is_idle and price_hourly > 0.0) else 0.0
+        potential = const.HOURS_PER_MONTH * price_hourly if (is_idle and price_hourly > 0.0) else 0.0
 
         flags = ["ReadReplica"]
         if is_idle:
@@ -429,7 +427,7 @@ def check_rds_unused_read_replicas(  # noqa: D401
                 state=inst.get("DBInstanceStatus", ""),
                 creation_date=_iso(inst.get("InstanceCreateTime")),
                 storage_gb=inst.get("AllocatedStorage", 0),
-                estimated_cost=round(price_hourly * HOURS_PER_MONTH, 2) if price_hourly else 0.0,
+                estimated_cost=round(price_hourly * const.HOURS_PER_MONTH, 2) if price_hourly else 0.0,
                 potential_saving=round(potential, 2) if potential > 0.0 else None,
                 flags=flags,
                 confidence=85 if is_idle else 60,

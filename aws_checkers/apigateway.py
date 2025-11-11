@@ -12,8 +12,7 @@ from botocore.client import BaseClient
 from aws_checkers import config
 from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher
-
-HOURS_PER_MONTH = 730.0
+from finops_toolset import config as const
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +273,7 @@ def check_apigw_low_cache_hit_ratio(  # noqa: D401
         # Hourly cache price for the size, monthly and potential
         price_key = f"CACHE_HR.{cache_size_gb:g}"
         hourly = _safe_price("APIGW", price_key, 0.0)
-        monthly = hourly * HOURS_PER_MONTH if hourly > 0.0 else 0.0
+        monthly = hourly * const.HOURS_PER_MONTH if hourly > 0.0 else 0.0
         potential = monthly if monthly > 0.0 else None
 
         resource_id = f"apigw:{api_id}:{stage_name}"

@@ -35,6 +35,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
+from finops_toolset import config as const
 
 from aws_checkers import config
 from aws_checkers.common import (
@@ -495,7 +496,7 @@ def check_tgw_attachments_low_traffic(  # pylint: disable=unused-argument
         return
 
     hr = _price_tgw_attachment_hr()
-    monthly = 730.0 * hr
+    monthly = const.HOURS_PER_MONTH * hr
 
     for a in attaches:
         aid, tid = a["aid"], a["tid"]

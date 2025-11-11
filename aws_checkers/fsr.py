@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
+from finops_toolset import config as const
 
 from aws_checkers import config
 from aws_checkers.common import (
@@ -182,7 +183,7 @@ def check_ebs_fsr_enabled_snapshots(  # pylint: disable=unused-argument
         if used_count == 0:
             flags.append("EBSFSRNoRecentUse")
 
-        est = 730.0 * dsu_hr * az_count
+        est = const.HOURS_PER_MONTH * dsu_hr * az_count
         potential = est
 
         signals = _signals_str(

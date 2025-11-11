@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
+from finops_toolset import config as const
 
 from aws_checkers import config
 from aws_checkers.common import (
@@ -131,7 +132,7 @@ def _pc_monthly_cost(memory_mb: int, pc_units: int) -> float:
     """Provisioned Concurrency monthly cost (heuristic)."""
     gb = max(0.0, float(memory_mb) / 1024.0)
     gb_sec_price = config.safe_price("Lambda", "PC_GB_SEC", 0.0000041667)
-    seconds = 730.0 * 3600.0
+    seconds = const.HOURS_PER_MONTH * 3600.0
     return gb * float(pc_units) * seconds * gb_sec_price
 
 

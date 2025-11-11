@@ -37,6 +37,7 @@ from math import ceil
 from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
+from finops_toolset import config as const
 
 from aws_checkers import config
 from aws_checkers.common import (
@@ -60,9 +61,7 @@ def _p(service: str, key: str, default: float) -> float:
 # Provisioned capacity ($/unit-hour)
 _DDB_RCU_HR = _p("DDB", "RCU_PER_HOUR", 0.000065)   # ~ $0.065 per 1000 hours
 _DDB_WCU_HR = _p("DDB", "WCU_PER_HOUR", 0.00013)
-# On-demand ($/million requests)
-_DDB_OD_RCU_M = _p("DDB", "OD_RCU_PER_MILLION", 0.25)
-_DDB_OD_WCU_M = _p("DDB", "OD_WCU_PER_MILLION", 1.25)
+
 # Storage ($/GB-month)
 _DDB_STORAGE_GB_MO = _p("DDB", "STORAGE_GB_MONTH", 0.25)
 
@@ -258,14 +257,7 @@ def _monthly_storage_cost(bytes_val: int | float) -> float:
 
 
 def _monthly_provisioned_cost(rcu: int, wcu: int) -> float:
-    # 730 hours/month approximation
-    return float(rcu) * _DDB_RCU_HR * 730.0 + float(wcu) * _DDB_WCU_HR * 730.0
-
-
-def _monthly_ondemand_cost(rcu_sum: float, wcu_sum: float) -> float:
-    # sums are measured in capacity units; convert to "per million requests" pricing
-    return (rcu_sum / 1_000_000.0) * _DDB_OD_RCU_M + (wcu_sum / 1_000_000.0) * _DDB_OD_WCU_M
-
+    return float(rcu) * _DDB_RCU_HR * const.HOURS_PER_MONTH + float(wcu) * _DDB_WCU_HR * const.HOURS_PER_MONTH
 
 # ------------------------------- extract args ------------------------------ #
 
