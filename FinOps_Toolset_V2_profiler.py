@@ -61,7 +61,7 @@ from aws_checkers import (
     lambda_svc as lambda_checks, rds_snapshots as rds_snaps, backup as backup_checks,
     ecr as ecr_checks, ssm as ssm_checks, sagemaker as sm_checks, apigateway as apigw_checks,
     msk as msk_checks, cloudtrail as ct_checks, stepfunctions as sfn_checks,
-    redshift as rs_checks,
+    redshift as rs_checks, glue as glue_checks,
 )
 
 #endregion
@@ -1016,6 +1016,19 @@ def main():
                     profiler, "check_redshift_stale_snapshots",
                     region, rs_checks.check_redshift_stale_snapshots,
                     writer=writer, client=clients["redshift"],
+                    # knobs: older_than_days=30
+                )
+                run_check(
+                    profiler, "check_glue_idle_dev_endpoints",
+                    region, glue_checks.check_glue_idle_dev_endpoints,
+                    writer=writer, client=clients["glue"],
+                    # knobs: lookback_days=14
+                )
+
+                run_check(
+                    profiler, "check_glue_zombie_crawlers",
+                    region, glue_checks.check_glue_zombie_crawlers,
+                    writer=writer, client=clients["glue"],
                     # knobs: older_than_days=30
                 )
 
