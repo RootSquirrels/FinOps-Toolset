@@ -56,14 +56,10 @@ def _extract_writer_cw_rds(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _safe_price(key: str, default: float = 0.0) -> float:
-    """Get price from config.safe_price with a default on any error."""
+def _safe_price(service: str, key: str, default: float = 0.0) -> float:
+    """Resolve a price via config.safe_price(service, key, default)."""
     try:
-        try:
-            val = config.safe_price(key, default)  # type: ignore[attr-defined]
-        except TypeError:
-            val = config.safe_price(key, default)  # type: ignore[attr-defined]
-        return float(default if val is None else val)
+        return float(config.safe_price(service, key, default))  # type: ignore[arg-type]
     except Exception:  # pylint: disable=broad-except
         return float(default)
 
@@ -81,13 +77,11 @@ def _hourly_price_instance(instance_class: str) -> float:
     """Resolve hourly price for an RDS instance class via pricing keys."""
     ic = instance_class.strip()
     candidates = [
-        f"rds.instance_hourly.{ic}",
-        f"rds.instance_hourly.{ic.replace('db.', '')}",
-        f"aws.rds.{ic}.hourly",
-        f"aws.rds.{ic.replace('db.', '')}.hourly",
+        f"INSTANCE_HOURLY.{ic}",
+        f"INSTANCE_HOURLY.{ic.replace('db.', '')}",
     ]
     for key in candidates:
-        p = _safe_price(key, 0.0)
+        p = _safe_price("RDS", key, 0.0)
         if p > 0.0:
             return p
     return 0.0
@@ -95,14 +89,14 @@ def _hourly_price_instance(instance_class: str) -> float:
 
 def _gp_price_delta_per_gb_month() -> float:
     """Return gp2→gp3 price delta per GB-month (>= 0.0)."""
-    p_gp2 = _safe_price("rds.gp2_gb_month", 0.10)
-    p_gp3 = _safe_price("rds.gp3_gb_month", 0.08)
+    p_gp2 = _safe_price("RDS", "GP2_GB_MONTH", 0.10)
+    p_gp3 = _safe_price("RDS", "GP3_GB_MONTH", 0.08)
     return max(0.0, p_gp2 - p_gp3)
 
 
 def _iops_price_per_month() -> float:
     """Return provisioned IOPS monthly price per IOPS (io1/io2)."""
-    return _safe_price("rds.iops_prov_month", 0.10)
+    return _safe_price("RDS", "IOPS_PROV_MONTH", 0.10)
 
 
 def _paginate(fetch_fn, *, page_key: str, next_key: str = "Marker", **kwargs: Any):

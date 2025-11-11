@@ -28,14 +28,10 @@ def _extract_writer_client(args: Tuple[Any, ...], kwargs: Dict[str, Any]):
     return writer, client
 
 
-def _safe_price(key: str, default: float = 0.0) -> float:
-    """Get price from config.safe_price with a default on any error."""
+def _safe_price(service: str, key: str, default: float = 0.0) -> float:
+    """Resolve a price via config.safe_price(service, key, default)."""
     try:
-        try:
-            val = config.safe_price(key, default)  # type: ignore[attr-defined]
-        except TypeError:
-            val = config.safe_price(key, default)  # type: ignore[attr-defined]
-        return float(default if val is None else val)
+        return float(config.safe_price(service, key, default))  # type: ignore[arg-type]
     except Exception:  # pylint: disable=broad-except
         return float(default)
 
@@ -109,7 +105,7 @@ def check_sagemaker_idle_notebooks(  # noqa: D401
             mod_time = item.get("LastModifiedTime") or item.get("CreationTime")
             last_mod = mod_time if isinstance(mod_time, datetime) else None
 
-            hourly = _safe_price(f"sagemaker.notebook_hour.{inst_type}", 0.0)
+            hourly = _safe_price("SAGEMAKER", f"NOTEBOOK_HR.{inst_type}", 0.0)
             monthly = hourly * HOURS_PER_MONTH if hourly > 0.0 else 0.0
             idle = bool(last_mod and last_mod < cutoff)
 
@@ -237,7 +233,7 @@ def check_sagemaker_idle_endpoints(  # noqa: D401
             for v in variants:
                 v_type = v.get("InstanceType", "")
                 v_count = int(v.get("InitialInstanceCount", 0) or 0)
-                hourly = _safe_price(f"sagemaker.endpoint_hour.{v_type}", 0.0)
+                hourly = _safe_price("SAGEMAKER", f"ENDPOINT_HOUR.{v_type}", 0.0)
                 total_hourly += hourly * float(max(0, v_count))
 
             monthly = total_hourly * HOURS_PER_MONTH if total_hourly > 0.0 else 0.0
@@ -306,7 +302,7 @@ def check_sagemaker_studio_zombies(  # noqa: D401
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     next_token: Optional[str] = None
-    price_app_hr = _safe_price("sagemaker.studio_app_hour", 0.0)
+    price_app_hr = _safe_price("SAGEMAKER", "STUDIO_APP_HOUR", 0.0)
     monthly = price_app_hr * HOURS_PER_MONTH if price_app_hr > 0.0 else 0.0
 
     while True:

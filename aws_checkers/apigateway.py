@@ -52,14 +52,10 @@ def _extract_writer_cw_client(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _safe_price(key: str, default: float = 0.0) -> float:
-    """Resolve a price via config.safe_price, returning default on any error."""
+def _safe_price(service: str, key: str, default: float = 0.0) -> float:
+    """Resolve a price via config.safe_price(service, key, default)."""
     try:
-        try:
-            val = config.safe_price(key, default)  # type: ignore[attr-defined]
-        except TypeError:
-            val = config.safe_price(key, default)  # type: ignore[attr-defined]
-        return float(default if val is None else val)
+        return float(config.safe_price(service, key, default))  # type: ignore[arg-type]
     except Exception:  # pylint: disable=broad-except
         return float(default)
 
@@ -276,8 +272,8 @@ def check_apigw_low_cache_hit_ratio(  # noqa: D401
             continue
 
         # Hourly cache price for the size, monthly and potential
-        price_key = f"APIGW.CACHE_HR.{cache_size_gb:g}"
-        hourly = _safe_price(price_key, 0.0)
+        price_key = f"CACHE_HR.{cache_size_gb:g}"
+        hourly = _safe_price("APIGW", price_key, 0.0)
         monthly = hourly * HOURS_PER_MONTH if hourly > 0.0 else 0.0
         potential = monthly if monthly > 0.0 else None
 

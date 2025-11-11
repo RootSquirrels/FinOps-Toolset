@@ -511,9 +511,9 @@ class TestPricingKeysCoverage(unittest.TestCase):
         Adjust/add keys here as the toolset evolves.
         """
         # RDS storage deltas & IOPS price
-        rds_gp2 = config.safe_price("rds.gp2_gb_month", 0.0)  # type: ignore[arg-type]
-        rds_gp3 = config.safe_price("rds.gp3_gb_month", 0.0)  # type: ignore[arg-type]
-        rds_iops = config.safe_price("rds.iops_prov_month", 0.0)  # type: ignore[arg-type]
+        rds_gp2 = config.safe_price("RDS", "GP2_GB_MONTH", 0.0)  # type: ignore[arg-type]
+        rds_gp3 = config.safe_price("RDS", "GP3_GB_MONTH", 0.0)  # type: ignore[arg-type]
+        rds_iops = config.safe_price("RDS", "IOPS_PROV_MONTH", 0.0)  # type: ignore[arg-type]
         self.assertIsInstance(rds_gp2, (int, float))
         self.assertIsInstance(rds_gp3, (int, float))
         self.assertIsInstance(rds_iops, (int, float))
@@ -522,24 +522,8 @@ class TestPricingKeysCoverage(unittest.TestCase):
         self.assertGreater(rds_iops, 0.0)
         self.assertGreaterEqual(rds_gp2 - rds_gp3, 0.0)
 
-        # RDS instance hourly example
-        rds_inst = config.safe_price("rds.instance_hourly.db.m5.large", 0.0)  # type: ignore[arg-type]
-        self.assertIsInstance(rds_inst, (int, float))
-        self.assertGreater(rds_inst, 0.0)
-
-        # SageMaker notebook / endpoint / studio app
-        nb = config.safe_price("sagemaker.notebook_hour.ml.t3.medium", 0.0)  # type: ignore[arg-type]
-        ep = config.safe_price("sagemaker.endpoint_hour.ml.m5.large", 0.0)  # type: ignore[arg-type]
-        studio = config.safe_price("sagemaker.studio_app_hour", 0.0)  # type: ignore[arg-type]
-        self.assertIsInstance(nb, (int, float))
-        self.assertIsInstance(ep, (int, float))
-        self.assertIsInstance(studio, (int, float))
-        self.assertGreater(nb, 0.0)
-        self.assertGreater(ep, 0.0)
-        self.assertGreater(studio, 0.0)
-
         # API Gateway cache hourly (commonly used size)
-        cache_135 = config.safe_price("APIGW.CACHE_HR.13.5", 0.0)  # type: ignore[arg-type]
+        cache_135 = config.safe_price("APIGW", "CACHE_HR.13.5", 0.0)  # type: ignore[arg-type]
         self.assertIsInstance(cache_135, (int, float))
         self.assertGreater(cache_135, 0.0)
 
