@@ -257,6 +257,11 @@ PRICING: PriceMap = {
     "BROKER_HOURLY.m5.large": 0.21,
     "STORAGE_GB_MONTH": 0.10,
     },
+    "SFN": {
+    "STANDARD_REQUEST_1K": 0.025,
+    "EXPRESS_REQUEST_1M": 1.00,
+    "EXPRESS_DUR_GB_SECOND": 0.00001667,
+    },
 }
 
 # --------------------------------------------------------------------------------------

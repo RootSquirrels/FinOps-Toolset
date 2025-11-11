@@ -60,7 +60,7 @@ from aws_checkers import (
     dynamodb as ddb_checks, loggroups as lg_checks, vpc_tgw as vpc_tgw_checks,
     lambda_svc as lambda_checks, rds_snapshots as rds_snaps, backup as backup_checks,
     ecr as ecr_checks, ssm as ssm_checks, sagemaker as sm_checks, apigateway as apigw_checks,
-    msk as msk_checks, cloudtrail as ct_checks,
+    msk as msk_checks, cloudtrail as ct_checks, stepfunctions as sfn_checks,
 )
 
 #endregion
@@ -193,6 +193,7 @@ def init_clients(region: str):
         "firehose": boto3.client("firehose", region_name=region, config=SDK_CONFIG),
         "sagemaker": boto3.client("sagemaker", region_name=region, config=SDK_CONFIG),
         "kafka": boto3.client("kafka", region_name=region, config=SDK_CONFIG),
+        "stepfunctions": boto3.client("stepfunctions", region_name=region, config=SDK_CONFIG),
     }
 
 
@@ -994,6 +995,14 @@ def main():
                     writer=writer, client=clients["cloudtrail"],
                 )
 
+                run_check(
+                    profiler, "check_sfn_standard_vs_express_mismatch",
+                    region, sfn_checks.check_sfn_standard_vs_express_mismatch,
+                    writer=writer, client=clients["stepfunctions"],
+                    cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, states_per_execution=5.0,
+                    #        assumed_payload_kb=64.0, min_monthly_execs=1000
+                )
         profiler.dump_csv()
         profiler.log_summary(top_n=30)
         logging.info("CSV export complete: %s", OUTPUT_FILE)
