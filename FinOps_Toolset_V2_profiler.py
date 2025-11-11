@@ -197,6 +197,7 @@ def init_clients(region: str):
         "ecs": boto3.client("ecs", region_name=region, config=SDK_CONFIG),
         "apigatewayv2": boto3.client("apigatewayv2", region_name=region, config=SDK_CONFIG),
         "apigateway": boto3.client("apigateway", region_name=region, config=SDK_CONFIG),
+        "redshift": boto3.client("redshift", region_name=region, config=SDK_CONFIG),
     }
 
 

@@ -105,7 +105,7 @@ def _latest_job_run_time(glue: BaseClient) -> Optional[datetime]:
         # quick probe: fetch only 1 most recent run per job
         for name in names:
             try:
-                runs = glue.get_job_runs(JobName=name, MaxResults=1).get("JobRuns", [])  # type: ignore[call-arg]
+                runs = glue.get_job_runs(JobName=name, MaxResults=1).get("JobRuns", [])
             except ClientError:
                 continue
             if not runs:

@@ -17,7 +17,8 @@ def retry_with_backoff(
     logger: Optional[Any] = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """
-    Decorator to retry a function with exponential backoff and optional jitter. -> Used of jitter to avoid thundering herd 
+    Decorator to retry a function with exponential backoff 
+    and optional jitter. -> Used of jitter to avoid thundering herd 
     
     Args:
         max_retries (int): Maximum number of retries.
