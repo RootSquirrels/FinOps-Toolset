@@ -61,6 +61,7 @@ from aws_checkers import (
     lambda_svc as lambda_checks, rds_snapshots as rds_snaps, backup as backup_checks,
     ecr as ecr_checks, ssm as ssm_checks, sagemaker as sm_checks, apigateway as apigw_checks,
     msk as msk_checks, cloudtrail as ct_checks, stepfunctions as sfn_checks,
+    redshift as rs_checks,
 )
 
 #endregion
@@ -1003,6 +1004,21 @@ def main():
                     # knobs: lookback_days=14, states_per_execution=5.0,
                     #        assumed_payload_kb=64.0, min_monthly_execs=1000
                 )
+
+                run_check(
+                    profiler, "check_redshift_idle_clusters",
+                    region, rs_checks.check_redshift_idle_clusters,
+                    writer=writer, client=clients["redshift"], cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, min_queries_sum=10, cpu_threshold=5.0
+                )
+
+                run_check(
+                    profiler, "check_redshift_stale_snapshots",
+                    region, rs_checks.check_redshift_stale_snapshots,
+                    writer=writer, client=clients["redshift"],
+                    # knobs: older_than_days=30
+                )
+
         profiler.dump_csv()
         profiler.log_summary(top_n=30)
         logging.info("CSV export complete: %s", OUTPUT_FILE)
