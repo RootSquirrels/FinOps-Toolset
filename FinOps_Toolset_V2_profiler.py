@@ -61,7 +61,7 @@ from aws_checkers import (
     lambda_svc as lambda_checks, rds_snapshots as rds_snaps, backup as backup_checks,
     ecr as ecr_checks, ssm as ssm_checks, sagemaker as sm_checks, apigateway as apigw_checks,
     msk as msk_checks, cloudtrail as ct_checks, stepfunctions as sfn_checks,
-    redshift as rs_checks, glue as glue_checks,
+    redshift as rs_checks, glue as glue_checks, ecs as ecs_checks,
 )
 
 #endregion
@@ -72,8 +72,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-
-#logger = logging.getLogger("aws-finops")  # base logger for your script
 
 #region CSV Helpers
 
@@ -195,6 +193,8 @@ def init_clients(region: str):
         "sagemaker": boto3.client("sagemaker", region_name=region, config=SDK_CONFIG),
         "kafka": boto3.client("kafka", region_name=region, config=SDK_CONFIG),
         "stepfunctions": boto3.client("stepfunctions", region_name=region, config=SDK_CONFIG),
+        "glue": boto3.client("glue", region_name=region, config=SDK_CONFIG),
+        "ecs": boto3.client("ecs", region_name=region, config=SDK_CONFIG),
     }
 
 
@@ -1030,6 +1030,26 @@ def main():
                     region, glue_checks.check_glue_zombie_crawlers,
                     writer=writer, client=clients["glue"],
                     # knobs: older_than_days=30
+                )
+
+                run_check(
+                    profiler, "check_ecs_idle_services",
+                    region, ecs_checks.check_ecs_idle_services,
+                    writer=writer, client=clients["ecs"], cloudwatch=clients["cloudwatch"],
+                    # knobs: lookback_days=14, cpu_threshold_pct=1.0, net_total_mb_threshold=5.0
+                )
+
+                run_check(
+                    profiler, "check_ecs_services_zero_tasks",
+                    region, ecs_checks.check_ecs_services_zero_tasks,
+                    writer=writer, client=clients["ecs"],
+                )
+
+                run_check(
+                    profiler, "check_ecs_old_task_definitions",
+                    region, ecs_checks.check_ecs_old_task_definitions,
+                    writer=writer, client=clients["ecs"],
+                    # knobs: older_than_days=90, max_task_defs=200
                 )
 
         profiler.dump_csv()
