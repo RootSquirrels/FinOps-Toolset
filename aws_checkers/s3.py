@@ -370,9 +370,9 @@ def _extract_writer_cw_s3(
     """Extract (writer, cloudwatch, s3) from args/kwargs; raise if missing."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
     cloudwatch = kwargs.get("cloudwatch", args[1] if len(args) >= 2 else None)
-    s3 = kwargs.get("client", args[2] if len(args) >= 3 else None)
+    s3 = kwargs.get("s3", args[2] if len(args) >= 3 else None)
     if writer is None or cloudwatch is None or s3 is None:
-        raise TypeError("Expected 'writer', 'cloudwatch' and 'client'")
+        raise TypeError("Expected 'writer', 'cloudwatch' and 's3'")
     return writer, cloudwatch, s3
 
 
