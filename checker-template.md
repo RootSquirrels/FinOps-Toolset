@@ -12,6 +12,7 @@ Goals: **reliability**, **consistency**, **performance** in the orchestrator.
 - First positional arg: `region: str`
 - Everything else via kwargs (extracted with the standard helpers)
 - One checker per saving/finding (small, composable functions)
+- demo
 
 2) **Use the shared helpers**
 ```python
