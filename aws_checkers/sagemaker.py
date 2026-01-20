@@ -6,11 +6,11 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
+from botocore.client import BaseClient
 from botocore.exceptions import ClientError
 
 from aws_checkers import config
 from core.retry import retry_with_backoff
-
 from finops_toolset import config as const
 
 
@@ -19,12 +19,27 @@ def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
 
 
+def _infer_region(client: Optional[BaseClient], kwargs: Dict[str, Any]) -> str:
+    """Infer region from kwargs or boto3 client meta; fallback to empty string."""
+    kw_region = kwargs.get("region")
+    if kw_region:
+        return str(kw_region)
+    if client is None:
+        return ""
+    return str(getattr(getattr(client, "meta", None), "region_name", "") or "")
+
+
 def _extract_writer_client(args: Tuple[Any, ...], kwargs: Dict[str, Any]):
-    """Extract (writer, sagemaker_client) from args/kwargs, else raise TypeError."""
+    """Extract (writer, sagemaker_client) from args/kwargs, else raise TypeError.
+
+    Supports:
+      - Orchestrator: writer positional args[0], client in kwargs['client']
+      - Legacy: client in kwargs['sagemaker'] or positional args[1]
+    """
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    client = kwargs.get("sagemaker", args[1] if len(args) >= 2 else None)
+    client = kwargs.get("client", kwargs.get("sagemaker", args[1] if len(args) >= 2 else None))
     if writer is None or client is None:
-        raise TypeError("Expected 'writer' and 'sagemaker'")
+        raise TypeError("Expected 'writer' and SageMaker client as 'client' (or legacy 'sagemaker')")
     return writer, client
 
 
@@ -66,13 +81,7 @@ def check_sagemaker_idle_notebooks(  # noqa: D401
     Heuristic:
       - Instance status is 'InService'
       - LastModifiedTime is older than `lookback_days` (plus `idle_grace_hours`)
-    Potential saving ~= (instance_hourly * 730).
-
-    Args:
-        writer: CSV writer (positional 1 or kwarg)
-        client: SageMaker boto3 client (positional 2 or kwarg)
-        lookback_days: days with no changes/activity to consider idle
-        idle_grace_hours: extra hours buffer before flagging
+    Potential saving ~= (instance_hourly * HOURS_PER_MONTH).
     """
     log = _logger(kwargs.get("logger") or logger)
     try:
@@ -84,14 +93,22 @@ def check_sagemaker_idle_notebooks(  # noqa: D401
         log.warning("[check_sagemaker_idle_notebooks] Skipping: checker config not provided.")
         return
 
+    region = _infer_region(sm, kwargs)
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days, hours=idle_grace_hours)
     next_token: Optional[str] = None
 
     while True:
         try:
-            page = sm.list_notebook_instances(NextToken=next_token) if next_token else sm.list_notebook_instances()
+            page = (
+                sm.list_notebook_instances(NextToken=next_token)
+                if next_token
+                else sm.list_notebook_instances()
+            )
         except ClientError as exc:
-            log.warning("[check_sagemaker_idle_notebooks] list_notebook_instances failed: %s", exc)
+            log.warning(
+                "[check_sagemaker_idle_notebooks] list_notebook_instances failed: %s",
+                exc,
+            )
             return
 
         for item in page.get("NotebookInstances", []) or []:
@@ -124,7 +141,7 @@ def check_sagemaker_idle_notebooks(  # noqa: D401
                     name=name,
                     owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                     resource_type="SageMakerNotebook",
-                    region=item.get("Region", ""),  # often not present, keep blank if missing
+                    region=region,
                     state=status,
                     creation_date=_iso(item.get("CreationTime")),
                     estimated_cost=round(monthly, 2),
@@ -183,12 +200,7 @@ def check_sagemaker_idle_endpoints(  # noqa: D401
 ) -> None:
     """Flag SageMaker endpoints with near-zero Invocations over the lookback window.
 
-    Savings ~= sum(variant.instance_count * hourly(instance_type)) * 730.
-    Args:
-        writer: CSV writer (positional 1 or kwarg)
-        client: SageMaker boto3 client (positional 2 or kwarg)
-        cloudwatch: (kwarg) CloudWatch boto3 client for metrics (optional)
-        invocation_threshold: minimum total invocations to consider active
+    Savings ~= sum(variant.instance_count * hourly(instance_type)) * HOURS_PER_MONTH.
     """
     log = _logger(kwargs.get("logger") or logger)
     try:
@@ -200,6 +212,7 @@ def check_sagemaker_idle_endpoints(  # noqa: D401
         log.warning("[check_sagemaker_idle_endpoints] Skipping: checker config not provided.")
         return
 
+    region = _infer_region(sm, kwargs)
     cw = kwargs.get("cloudwatch")
     start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     end = datetime.now(timezone.utc)
@@ -219,7 +232,6 @@ def check_sagemaker_idle_endpoints(  # noqa: D401
             if status != "InService":
                 continue
 
-            # Describe to get production variants
             try:
                 desc = sm.describe_endpoint(EndpointName=name)
             except ClientError:
@@ -228,7 +240,6 @@ def check_sagemaker_idle_endpoints(  # noqa: D401
             variants = desc.get("ProductionVariants", []) or []
             invocations = _sum_endpoint_invocations(cw, name, start, end)
 
-            # Compute per-variant monthly cost (hourly * instance_count * 730)
             total_hourly = 0.0
             for v in variants:
                 v_type = v.get("InstanceType", "")
@@ -252,7 +263,7 @@ def check_sagemaker_idle_endpoints(  # noqa: D401
                     name=name,
                     owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                     resource_type="SageMakerEndpoint",
-                    region=ep.get("Region", ""),
+                    region=region,
                     state=status,
                     creation_date=_iso(ep.get("CreationTime")),
                     estimated_cost=round(monthly, 2),
@@ -282,14 +293,7 @@ def check_sagemaker_studio_zombies(  # noqa: D401
     lookback_days: int = 7,
     **kwargs,
 ) -> None:
-    """Flag SageMaker Studio apps that have been left running for days.
-
-    Savings ~= studio_app_hour * 730 per running app (if pricing key present).
-    Args:
-        writer: CSV writer (positional 1 or kwarg)
-        client: SageMaker boto3 client (positional 2 or kwarg)
-        lookback_days: number of days an app can be running before flagged
-    """
+    """Flag SageMaker Studio apps that have been left running for days."""
     log = _logger(kwargs.get("logger") or logger)
     try:
         writer, sm = _extract_writer_client(args, kwargs)
@@ -300,6 +304,7 @@ def check_sagemaker_studio_zombies(  # noqa: D401
         log.warning("[check_sagemaker_studio_zombies] Skipping: checker config not provided.")
         return
 
+    region = _infer_region(sm, kwargs)
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     next_token: Optional[str] = None
     price_app_hr = _safe_price("SAGEMAKER", "STUDIO_APP_HOUR", 0.0)
@@ -307,9 +312,7 @@ def check_sagemaker_studio_zombies(  # noqa: D401
 
     while True:
         try:
-            page = (
-                sm.list_apps(NextToken=next_token) if next_token else sm.list_apps()
-            )
+            page = sm.list_apps(NextToken=next_token) if next_token else sm.list_apps()
         except ClientError as exc:
             log.warning("[check_sagemaker_studio_zombies] list_apps failed: %s", exc)
             return
@@ -323,7 +326,6 @@ def check_sagemaker_studio_zombies(  # noqa: D401
             created_dt = created if isinstance(created, datetime) else None
             stale = bool(created_dt and created_dt < cutoff)
             if not stale and status != "InService":
-                # Give non-InService apps benefit of the doubt unless very old
                 continue
 
             app_name = app.get("AppName", "")
@@ -343,7 +345,7 @@ def check_sagemaker_studio_zombies(  # noqa: D401
                     name=app_name,
                     owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                     resource_type="SageMakerStudioApp",
-                    region=app.get("Region", ""),
+                    region=region,
                     state=status,
                     creation_date=_iso(created_dt),
                     estimated_cost=round(monthly, 2) if monthly else 0.0,
