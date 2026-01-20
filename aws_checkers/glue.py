@@ -11,22 +11,57 @@ from botocore.exceptions import ClientError
 
 from aws_checkers.common import _logger, _signals_str, _to_utc_iso
 from aws_checkers import config as chk
-from finops_toolset import config as const
 from core.retry import retry_with_backoff
+from finops_toolset import config as const
 
 
 # ---------------------------------------------------------------------------
-# Extractors
+# Call normalization & Extractors
 # ---------------------------------------------------------------------------
+
+def _split_region_from_args(
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Tuple[Optional[str], Tuple[Any, ...]]:
+    """Normalize region + remaining args for orchestrator and legacy calls.
+
+    Returns (region, remaining_args).
+
+    Accepted patterns:
+      - Orchestrator: fn(writer, **kwargs) -> region may be in kwargs (optional)
+      - Legacy: fn(region, writer, ...) -> first arg is region str
+    """
+    region_kw = kwargs.get("region")
+    if isinstance(region_kw, str) and region_kw:
+        return region_kw, args
+
+    if args and isinstance(args[0], str) and len(args) >= 2:
+        return str(args[0]), args[1:]
+
+    return None, args
+
+
+def _infer_region_from_client(client: Optional[BaseClient]) -> str:
+    """Infer region from boto3 client meta; fallback to 'GLOBAL'."""
+    if client is None:
+        return "GLOBAL"
+    region = getattr(getattr(client, "meta", None), "region_name", None)
+    return str(region) if region else "GLOBAL"
+
 
 def _extract_writer_client(
     args: Tuple[Any, ...], kwargs: Dict[str, Any]
 ) -> Tuple[Any, BaseClient]:
-    """Extract (writer, client) from args/kwargs; raise if missing."""
+    """Extract (writer, glue_client) from args/kwargs; raise if missing.
+
+    Supports:
+      - Orchestrator: writer in args[0], glue client in kwargs['client']
+      - Legacy: glue client in kwargs['glue'] or args[1]
+    """
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    client = kwargs.get("glue", args[1] if len(args) >= 2 else None)
+    client = kwargs.get("client", kwargs.get("glue", args[1] if len(args) >= 2 else None))
     if writer is None or client is None:
-        raise TypeError("Expected 'writer' and 'glue'")
+        raise TypeError("Expected 'writer' and Glue client as 'client' (or legacy 'glue')")
     return writer, client
 
 
@@ -97,7 +132,6 @@ def _latest_job_run_time(glue: BaseClient) -> Optional[datetime]:
     """Return the latest job run start/stop time across all jobs (or None)."""
     latest: Optional[datetime] = None
     try:
-        # names
         names: List[str] = []
         for page in _paginate(glue.list_jobs, page_key="JobNames", token_key="NextToken"):
             names.extend(page if isinstance(page, list) else [page])
@@ -122,8 +156,7 @@ def _list_dev_endpoints(glue: BaseClient) -> List[Dict[str, Any]]:
     # Preferred: get_dev_endpoints (already returns endpoint dicts)
     try:
         out: List[Dict[str, Any]] = []
-        for ep in _paginate(glue.get_dev_endpoints,
-                            page_key="DevEndpoints", token_key="NextToken"):
+        for ep in _paginate(glue.get_dev_endpoints, page_key="DevEndpoints", token_key="NextToken"):
             out.append(ep)
         if out:
             return out
@@ -134,8 +167,9 @@ def _list_dev_endpoints(glue: BaseClient) -> List[Dict[str, Any]]:
     eps: List[Dict[str, Any]] = []
     try:
         names: List[str] = []
-        for page in _paginate(glue.list_dev_endpoints,
-                              page_key="DevEndpointNames", token_key="NextToken"):
+        for page in _paginate(
+            glue.list_dev_endpoints, page_key="DevEndpointNames", token_key="NextToken"
+        ):
             names.extend(page if isinstance(page, list) else [page])
         for n in names:
             try:
@@ -163,7 +197,7 @@ def _get_crawlers(glue: BaseClient, names: List[str]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     step = 25
     for i in range(0, len(names), step):
-        batch = names[i : i + step]
+        batch = names[i: i + step]
         try:
             resp = glue.batch_get_crawlers(CrawlerNames=batch)  # type: ignore[call-arg]
             out.extend(resp.get("Crawlers", []) or [])
@@ -177,7 +211,7 @@ def _get_crawler_metrics(glue: BaseClient, names: List[str]) -> Dict[str, Dict[s
     step = 50
     metrics: Dict[str, Dict[str, Any]] = {}
     for i in range(0, len(names), step):
-        batch = names[i : i + step]
+        batch = names[i: i + step]
         try:
             resp = glue.get_crawler_metrics(CrawlerNameList=batch)  # type: ignore[call-arg]
         except ClientError:
@@ -195,7 +229,6 @@ def _get_crawler_metrics(glue: BaseClient, names: List[str]) -> Dict[str, Dict[s
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_glue_idle_dev_endpoints(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 14,
@@ -207,11 +240,15 @@ def check_glue_idle_dev_endpoints(  # noqa: D401
     """
     log = _logger(kwargs.get("logger") or logger)
 
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, glue = _extract_writer_client(args, kwargs)
+        writer, glue = _extract_writer_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_glue_idle_dev_endpoints] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_client(glue)
 
     owner = str(kwargs.get("account_id") or chk.ACCOUNT_ID or "")
     if not (owner and chk.WRITE_ROW):
@@ -289,7 +326,6 @@ def check_glue_idle_dev_endpoints(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_glue_zombie_crawlers(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     older_than_days: int = 30,
@@ -302,11 +338,15 @@ def check_glue_zombie_crawlers(  # noqa: D401
     """
     log = _logger(kwargs.get("logger") or logger)
 
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, glue = _extract_writer_client(args, kwargs)
+        writer, glue = _extract_writer_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_glue_zombie_crawlers] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_client(glue)
 
     owner = str(kwargs.get("account_id") or chk.ACCOUNT_ID or "")
     if not (owner and chk.WRITE_ROW):
@@ -321,7 +361,6 @@ def check_glue_zombie_crawlers(  # noqa: D401
     metrics_by_name = _get_crawler_metrics(glue, names)
 
     cutoff = _now_utc() - timedelta(days=int(older_than_days))
-    rows: List[Dict[str, Any]] = []
 
     for c in crawlers:
         name = str(c.get("Name") or "crawler")
@@ -378,7 +417,3 @@ def check_glue_zombie_crawlers(  # noqa: D401
             )
         except Exception as exc:  # pylint: disable=broad-except
             log.warning("[glue] write_row(crawler) failed: %s", exc)
-
-        rows.append({"name": name, "potential": 0.0})
-
-    return rows
