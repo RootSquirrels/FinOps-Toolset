@@ -723,7 +723,7 @@ def main():
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
 
                 run_check(
-                            profiler, "check_ami_old_images",
+                            profiler, "checks_ami",
                             region, ami_checks.run_check,
                             writer=writer, ec2=clients["ec2"], autoscaling=clients["autoscaling"]
                             # knobs: age_days=180

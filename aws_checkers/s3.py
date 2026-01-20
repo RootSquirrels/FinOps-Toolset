@@ -12,6 +12,7 @@ from botocore.exceptions import ClientError
 from aws_checkers.common import _logger, _signals_str, _to_utc_iso
 from aws_checkers import config as chk
 from core.cloudwatch import CloudWatchBatcher
+from core.retry import retry_with_backoff
 
 
 # ---------------------------------------------------------------------------
@@ -364,24 +365,36 @@ def _estimate_stale_mpu_gib(
 # Single consolidated checker (one CSV row per bucket)
 # ---------------------------------------------------------------------------
 
+
+def _extract_region_and_shift_args(
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Tuple[str, Tuple[Any, ...]]:
+    """Extract region and return (region, remaining_args).
+
+    Supports both calling styles:
+      - Orchestrator: fn(writer, **kwargs)  (region not passed positionally)
+      - Template/legacy: fn(region, writer, ...)
+    """
+    if args and isinstance(args[0], str):
+        return str(args[0]), tuple(args[1:])
+    return str(kwargs.get("region") or "GLOBAL"), tuple(args)
 def _extract_writer_cw_s3(
     args: Tuple[Any, ...], kwargs: Dict[str, Any]
-) -> Tuple[Any, BaseClient, BaseClient, str]:
-    """Extract (writer, cloudwatch, s3, region) from args/kwargs; raise if missing.
+) -> Tuple[Any, BaseClient, BaseClient]:
+    """Extract (writer, cloudwatch, s3) from args/kwargs; raise if missing.
 
-    Orchestrator passes writer as first positional and does NOT pass region positionally.
-    It also passes the S3 client as 'client', not 's3'.
+    Orchestrator compatibility:
+      - writer is passed as the first positional arg
+      - CloudWatch client is passed as kwarg 'cloudwatch'
+      - S3 client is passed as kwarg 'client' (alias accepted: 's3')
     """
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    cloudwatch = kwargs.get("cloudwatch", kwargs.get("cw", None))
-    s3 = kwargs.get("s3", kwargs.get("client", None))
-
-    # Region is usually provided by orchestrator as a kwarg; default to 'GLOBAL'
-    region = str(kwargs.get("region", "GLOBAL"))
-
+    cloudwatch = kwargs.get("cloudwatch", args[1] if len(args) >= 2 else None)
+    s3 = kwargs.get("client", kwargs.get("s3", args[2] if len(args) >= 3 else None))
     if writer is None or cloudwatch is None or s3 is None:
         raise TypeError("Expected 'writer', 'cloudwatch' and 'client'/'s3'")
-    return writer, cloudwatch, s3, region
+    return writer, cloudwatch, s3
 
 
 def _savings_candidates(
@@ -445,10 +458,11 @@ def _savings_candidates(
     return (round(best, 2) if best > 0.0 else None), breakdown, flags, conf
 
 
+@retry_with_backoff(exceptions=(ClientError,))
 def check_s3_cost_and_compliance(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
+    region: Optional[str] = None,
     lookback_days: int = 7,
     # Heuristic knobs
     min_size_gb_for_lifecycle: float = 500.0,
@@ -461,10 +475,18 @@ def check_s3_cost_and_compliance(  # noqa: D401
     mpu_per_upload_parts_limit: int = 20,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
-    """Single-pass S3 checker that writes exactly one CSV row per bucket."""
+    """Single-pass S3 checker that writes exactly one CSV row per bucket.
+
+    It merges compliance (public access, encryption, logging, lifecycle, etc.) with
+    savings heuristics (tiering, excess versions, abandoned MPUs).
+    """
     log = _logger(kwargs.get("logger") or logger)
+    target_region, shifted_args = _extract_region_and_shift_args(args, kwargs)
+    if region:
+        target_region = str(region)
+
     try:
-        writer, cloudwatch, s3, region = _extract_writer_cw_s3(args, kwargs)
+        writer, cloudwatch, s3 = _extract_writer_cw_s3(shifted_args, kwargs)
     except TypeError as exc:
         log.warning("[check_s3_cost_and_compliance] Skipping: %s", exc)
         return []
@@ -481,98 +503,107 @@ def check_s3_cost_and_compliance(  # noqa: D401
     cheaper = p_ia if (p_ia > 0.0) else (p_it if p_it > 0.0 else 0.0)
 
     # Partition buckets by region, filter to the target region
+    # Partition buckets by region. If target_region == 'GLOBAL', scan all regions.
     buckets_by_region = _group_buckets_by_region(s3)
-    region_buckets = buckets_by_region.get(region, [])
-    if not region_buckets:
-        return []
-
-    names = [n for (n, _c) in region_buckets]
-    size_gb_map, objects_map = _fetch_sizes_and_counts(region, cloudwatch, names, lookback_days)
-
-    # Sort buckets by size desc to bound MPU work to largest ones
-    names_sorted = sorted(names, key=lambda n: size_gb_map.get(n, 0.0), reverse=True)
-    mpu_sample_set = set(names_sorted[: int(mpu_check_max_buckets)])
+    if target_region and target_region != "GLOBAL":
+        buckets_by_region = {target_region: buckets_by_region.get(target_region, [])}
 
     rows: List[Dict[str, Any]] = []
 
-    for name, created_iso in region_buckets:
-        size_gb = float(size_gb_map.get(name, 0.0))
-        objects = int(objects_map.get(name, 0))
+    for bucket_region, region_buckets in buckets_by_region.items():
+        if not region_buckets:
+            continue
 
-        # Collect compliance metadata
-        signals, flags = _collect_bucket_metadata(s3, name)
-
-        # Add universal cost signals
-        signals["SizeGB"] = int(size_gb) if size_gb > 0 else 0
-        signals["Objects"] = objects
-
-        # Optional MPU sampling for largest buckets
-        mpu_count = 0
-        mpu_reclaim_gb = 0.0
-        if name in mpu_sample_set and mpu_older_than_days > 0:
-            mpu_count, mpu_reclaim_gb = _estimate_stale_mpu_gib(
-                s3,
-                bucket=name,
-                older_than_days=int(mpu_older_than_days),
-                per_bucket_limit=int(mpu_per_bucket_limit),
-                per_upload_parts_limit=int(mpu_per_upload_parts_limit),
-            )
-            signals["MPUStaleCount"] = mpu_count
-            signals["MPUReclaimGB"] = mpu_reclaim_gb
-
-        # Savings candidates (take the best one to avoid double-counting)
-        best_saving, breakdown, add_flags, conf = _savings_candidates(
-            size_gb=size_gb,
-            std_gb_mo=p_std,
-            cheap_gb_mo=cheaper,
-            has_lifecycle=bool(signals.get("LifecycleRules", 0)),
-            versioning=str(signals.get("Versioning", "Disabled")),
-            has_noncurrent_cleanup=bool(signals.get("HasNoncurrentCleanup", 0)),
-            objects=objects,
-            mpu_reclaim_gb=mpu_reclaim_gb,
-            assumed_cold_fraction=assumed_cold_fraction,
-            version_fraction=version_fraction,
-            min_size_gb_for_lifecycle=min_size_gb_for_lifecycle,
-            min_objects_for_versions=min_objects_for_versions,
+        names = [n for (n, _c) in region_buckets]
+        size_gb_map, objects_map = _fetch_sizes_and_counts(
+            bucket_region, cloudwatch, names, lookback_days
         )
-        if breakdown:
-            signals["SavingsBreakdown"] = breakdown
 
-        # Merge flags (dedup)
-        flags = sorted(set(flags) | set(add_flags))
-
-        # Estimated bucket monthly cost
-        estimated_cost = round(size_gb * p_std, 2) if p_std > 0.0 else 0.0
-
-        try:
-            # type: ignore[call-arg]
-            chk.WRITE_ROW(
-                writer=writer,
-                resource_id=f"arn:aws:s3:::{name}",
-                name=name,
-                owner_id=owner,  # type: ignore[arg-type]
-                resource_type="S3Bucket",
-                region=region,
-                state="Active",
-                creation_date=created_iso,
-                storage_gb=size_gb,
-                object_count=objects,
-                estimated_cost=estimated_cost,
-                potential_saving=best_saving,
-                flags=flags,
-                confidence=conf,
-                signals=_signals_str(signals),
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[s3] write_row failed for %s: %s", name, exc)
-
-        rows.append(
-            {
-                "bucket": name,
-                "size_gb": size_gb,
-                "objects": objects,
-                "potential": float(best_saving or 0.0),
-            }
+        # Sort buckets by size desc to bound MPU work to largest ones
+        names_sorted = sorted(
+            names, key=lambda n: size_gb_map.get(n, 0.0), reverse=True
         )
+        mpu_sample_set = set(names_sorted[: int(mpu_check_max_buckets)])
+
+        for name, created_iso in region_buckets:
+            size_gb = float(size_gb_map.get(name, 0.0))
+            objects = int(objects_map.get(name, 0))
+
+            # Collect compliance metadata
+            signals, flags = _collect_bucket_metadata(s3, name)
+
+            # Add universal cost signals
+            signals["SizeGB"] = int(size_gb) if size_gb > 0 else 0
+            signals["Objects"] = objects
+
+            # Optional MPU sampling for largest buckets
+            mpu_count = 0
+            mpu_reclaim_gb = 0.0
+            if name in mpu_sample_set and mpu_older_than_days > 0:
+                mpu_count, mpu_reclaim_gb = _estimate_stale_mpu_gib(
+                    s3,
+                    bucket=name,
+                    older_than_days=int(mpu_older_than_days),
+                    per_bucket_limit=int(mpu_per_bucket_limit),
+                    per_upload_parts_limit=int(mpu_per_upload_parts_limit),
+                )
+                signals["MPUStaleCount"] = mpu_count
+                signals["MPUReclaimGB"] = mpu_reclaim_gb
+
+            # Savings candidates (take the best one to avoid double-counting)
+            best_saving, breakdown, add_flags, conf = _savings_candidates(
+                size_gb=size_gb,
+                std_gb_mo=p_std,
+                cheap_gb_mo=cheaper,
+                has_lifecycle=bool(signals.get("LifecycleRules", 0)),
+                versioning=str(signals.get("Versioning", "Disabled")),
+                has_noncurrent_cleanup=bool(signals.get("HasNoncurrentCleanup", 0)),
+                objects=objects,
+                mpu_reclaim_gb=mpu_reclaim_gb,
+                assumed_cold_fraction=assumed_cold_fraction,
+                version_fraction=version_fraction,
+                min_size_gb_for_lifecycle=min_size_gb_for_lifecycle,
+                min_objects_for_versions=min_objects_for_versions,
+            )
+            if breakdown:
+                signals["SavingsBreakdown"] = breakdown
+
+            # Merge flags (dedup)
+            flags = sorted(set(flags) | set(add_flags))
+
+            # Estimated bucket monthly cost (Standard baseline)
+            estimated_cost = round(size_gb * p_std, 2) if p_std > 0.0 else 0.0
+
+            try:
+                # type: ignore[call-arg]
+                chk.WRITE_ROW(
+                    writer=writer,
+                    resource_id=f"arn:aws:s3:::{name}",
+                    name=name,
+                    owner_id=owner,  # type: ignore[arg-type]
+                    resource_type="S3Bucket",
+                    region=bucket_region,
+                    state="Active",
+                    creation_date=created_iso,
+                    storage_gb=size_gb,
+                    object_count=objects,
+                    estimated_cost=estimated_cost,
+                    potential_saving=best_saving,
+                    flags=flags,
+                    confidence=conf,
+                    signals=_signals_str(signals),
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                log.warning("[s3] write_row failed for %s: %s", name, exc)
+
+            rows.append(
+                {
+                    "bucket": name,
+                    "region": bucket_region,
+                    "size_gb": size_gb,
+                    "objects": objects,
+                    "potential": float(best_saving or 0.0),
+                }
+            )
 
     return rows
