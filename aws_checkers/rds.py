@@ -17,7 +17,7 @@ from finops_toolset import config as const
 
 
 # ---------------------------------------------------------------------------
-# Logger & extractors (template-consistent)
+# Logger & call normalization
 # ---------------------------------------------------------------------------
 
 def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
@@ -25,26 +25,84 @@ def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     return fallback or config.LOGGER or logging.getLogger(__name__)
 
 
+def _split_region_from_args(
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Tuple[Optional[str], Tuple[Any, ...]]:
+    """Normalize region+args for both call styles.
+
+    Returns (region, remaining_args).
+
+    Accepted patterns:
+      - Orchestrator: fn(writer, **kwargs) -> region in kwargs (optional) or inferred.
+      - Legacy: fn(region, writer, ...) -> first arg is region str.
+    """
+    region = kwargs.get("region")
+    if region:
+        return str(region), args
+
+    if args and isinstance(args[0], str) and len(args) >= 2:
+        # Legacy: (region, writer, ...)
+        return str(args[0]), args[1:]
+
+    return None, args
+
+
+def _infer_region_from_clients(cloudwatch: Optional[BaseClient], rds: Optional[BaseClient]) -> str:
+    """Infer region from cloudwatch/rds client; fallback to 'GLOBAL'."""
+    for client in (cloudwatch, rds):
+        if client is None:
+            continue
+        region = getattr(getattr(client, "meta", None), "region_name", None)
+        if region:
+            return str(region)
+    return "GLOBAL"
+
+
+# ---------------------------------------------------------------------------
+# Extractors (orchestrator-compatible)
+# ---------------------------------------------------------------------------
+
 def _extract_writer_rds(
-    args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
 ) -> Tuple[Any, BaseClient]:
-    """Extract (writer, rds) from args/kwargs; raise on missing."""
+    """Extract (writer, rds) from args/kwargs; raise on missing.
+
+    Orchestrator style:
+      writer is positional args[0]
+      rds client is passed as kwargs['client']
+    Legacy style:
+      (writer, rds) may be passed positionally.
+    """
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    rds = kwargs.get("rds", args[1] if len(args) >= 2 else None)
+
+    # Accept 'client' (orchestrator), or legacy 'rds', or positional
+    rds = kwargs.get("client", kwargs.get("rds", args[1] if len(args) >= 2 else None))
     if writer is None or rds is None:
-        raise TypeError("Expected 'writer' and 'rds'")
+        raise TypeError("Expected 'writer' and RDS client as 'client' (or legacy 'rds')")
     return writer, rds
 
 
 def _extract_writer_cw_rds(
-    args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
 ) -> Tuple[Any, BaseClient, BaseClient]:
-    """Extract (writer, cloudwatch, rds) from args/kwargs; raise on missing."""
+    """Extract (writer, cloudwatch, rds) from args/kwargs; raise on missing.
+
+    Orchestrator style:
+      writer is positional args[0]
+      cloudwatch is kwargs['cloudwatch']
+      rds is kwargs['client']
+    Legacy style:
+      (writer, cloudwatch, rds) may be passed positionally.
+    """
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    cloudwatch = kwargs.get("cloudwatch", args[1] if len(args) >= 2 else None)
-    rds = kwargs.get("rds", args[2] if len(args) >= 3 else None)
+    cloudwatch = kwargs.get("cloudwatch", kwargs.get("cw", args[1] if len(args) >= 2 else None))
+    rds = kwargs.get("client", kwargs.get("rds", args[2] if len(args) >= 3 else None))
+
     if writer is None or cloudwatch is None or rds is None:
-        raise TypeError("Expected 'writer', 'cloudwatch' and 'rds'")
+        raise TypeError("Expected 'writer', 'cloudwatch' and RDS client as 'client' (or 'rds')")
     return writer, cloudwatch, rds
 
 
@@ -112,16 +170,12 @@ def _paginate(fetch_fn, *, page_key: str, next_key: str = "Marker", **kwargs: An
 
 def _list_db_instances(rds: BaseClient) -> List[Mapping[str, Any]]:
     """Return all DB instances in the region."""
-    return list(
-        _paginate(rds.describe_db_instances, page_key="DBInstances", next_key="Marker")
-    )
+    return list(_paginate(rds.describe_db_instances, page_key="DBInstances", next_key="Marker"))
 
 
 def _list_db_clusters(rds: BaseClient) -> List[Mapping[str, Any]]:
     """Return all DB clusters (Aurora) in the region."""
-    return list(
-        _paginate(rds.describe_db_clusters, page_key="DBClusters", next_key="Marker")
-    )
+    return list(_paginate(rds.describe_db_clusters, page_key="DBClusters", next_key="Marker"))
 
 
 def _build_rds_metric_queries(inst_ids: Sequence[str]) -> List[Dict[str, Any]]:
@@ -227,7 +281,6 @@ def _step_down_instance_class(inst: str) -> str:
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_rds_underutilized_instances(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 30,
@@ -238,18 +291,27 @@ def check_rds_underutilized_instances(  # noqa: D401
 ) -> List[Dict[str, Any]]:
     """Flag RDS instances with low CPU + connections → rightsizing candidate."""
     log = _logger(kwargs.get("logger") or logger)
+
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, cloudwatch, rds = _extract_writer_cw_rds(args, kwargs)
+        writer, cloudwatch, rds = _extract_writer_cw_rds(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_rds_underutilized_instances] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_clients(cloudwatch, rds)
 
     start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     end = datetime.now(timezone.utc)
     owner = str(account_id or config.ACCOUNT_ID or "")
 
     instances = _list_db_instances(rds)
-    inst_ids = [i.get("DBInstanceIdentifier", "") for i in instances if i.get("DBInstanceIdentifier")]
+    inst_ids = [
+        i.get("DBInstanceIdentifier", "")
+        for i in instances
+        if i.get("DBInstanceIdentifier")
+    ]
     if not inst_ids:
         return []
 
@@ -273,7 +335,11 @@ def check_rds_underutilized_instances(  # noqa: D401
         price_now = _hourly_price_instance(cls)
         price_small = _hourly_price_instance(smaller)
         delta_hr = max(0.0, price_now - price_small) if smaller != cls else 0.0
-        potential = const.HOURS_PER_MONTH * delta_hr if (cpu < cpu_threshold_pct and conn < conn_threshold) else 0.0
+        potential = (
+            const.HOURS_PER_MONTH * delta_hr
+            if (cpu < cpu_threshold_pct and conn < conn_threshold)
+            else 0.0
+        )
 
         flags: List[str] = []
         if cpu < cpu_threshold_pct:
@@ -299,8 +365,10 @@ def check_rds_underutilized_instances(  # noqa: D401
                 potential_saving=round(potential, 2) if potential > 0.0 else None,
                 flags=flags,
                 confidence=75 if potential > 0.0 else 60,
-                signals=f"class={cls}|suggested={smaller if smaller != cls else ''}|"
-                        f"cpu_avg={round(cpu,1)}|conn_max={round(conn,1)}",
+                signals=(
+                    f"class={cls}|suggested={smaller if smaller != cls else ''}|"
+                    f"cpu_avg={round(cpu,1)}|conn_max={round(conn,1)}"
+                ),
             )
         except Exception as exc:  # pylint: disable=broad-except
             log.warning("[rds] write_row(rightsize) failed: %s", exc)
@@ -311,7 +379,6 @@ def check_rds_underutilized_instances(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_rds_multi_az_non_prod(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     account_id: Optional[str] = None,
@@ -319,11 +386,16 @@ def check_rds_multi_az_non_prod(  # noqa: D401
 ) -> List[Dict[str, Any]]:
     """Flag Multi-AZ instances (approx saving = one instance cost per month)."""
     log = _logger(kwargs.get("logger") or logger)
+
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, rds = _extract_writer_rds(args, kwargs)
+        writer, rds = _extract_writer_rds(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_rds_multi_az_non_prod] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_clients(None, rds)
 
     owner = str(account_id or config.ACCOUNT_ID or "")
     instances = _list_db_instances(rds)
@@ -350,7 +422,9 @@ def check_rds_multi_az_non_prod(  # noqa: D401
                 state=inst.get("DBInstanceStatus", ""),
                 creation_date=_iso(inst.get("InstanceCreateTime")),
                 storage_gb=inst.get("AllocatedStorage", 0),
-                estimated_cost=round(price_hourly * const.HOURS_PER_MONTH * 2.0, 2) if price_hourly else 0.0,
+                estimated_cost=(
+                    round(price_hourly * const.HOURS_PER_MONTH * 2.0, 2) if price_hourly else 0.0
+                ),
                 potential_saving=round(potential, 2) if potential else None,
                 flags=["MultiAZ", "NonProd"],
                 confidence=80,
@@ -365,7 +439,6 @@ def check_rds_multi_az_non_prod(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_rds_unused_read_replicas(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 30,
@@ -376,11 +449,16 @@ def check_rds_unused_read_replicas(  # noqa: D401
 ) -> List[Dict[str, Any]]:
     """Flag read replicas with near-zero connections/IOPS → remove."""
     log = _logger(kwargs.get("logger") or logger)
+
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, cloudwatch, rds = _extract_writer_cw_rds(args, kwargs)
+        writer, cloudwatch, rds = _extract_writer_cw_rds(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_rds_unused_read_replicas] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_clients(cloudwatch, rds)
 
     owner = str(account_id or config.ACCOUNT_ID or "")
     start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
@@ -390,7 +468,11 @@ def check_rds_unused_read_replicas(  # noqa: D401
         i for i in _list_db_instances(rds)
         if i.get("ReadReplicaSourceDBInstanceIdentifier")
     ]
-    inst_ids = [i.get("DBInstanceIdentifier", "") for i in instances if i.get("DBInstanceIdentifier")]
+    inst_ids = [
+        i.get("DBInstanceIdentifier", "")
+        for i in instances
+        if i.get("DBInstanceIdentifier")
+    ]
     if not inst_ids:
         return []
 
@@ -442,7 +524,6 @@ def check_rds_unused_read_replicas(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_rds_iops_overprovisioned(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 30,
@@ -452,11 +533,16 @@ def check_rds_iops_overprovisioned(  # noqa: D401
 ) -> List[Dict[str, Any]]:
     """Flag instances with provisioned IOPS >> observed IOPS → reduce IOPS."""
     log = _logger(kwargs.get("logger") or logger)
+
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, cloudwatch, rds = _extract_writer_cw_rds(args, kwargs)
+        writer, cloudwatch, rds = _extract_writer_cw_rds(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_rds_iops_overprovisioned] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_clients(cloudwatch, rds)
 
     owner = str(account_id or config.ACCOUNT_ID or "")
     start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
@@ -467,7 +553,11 @@ def check_rds_iops_overprovisioned(  # noqa: D401
         i for i in instances
         if str(i.get("StorageType", "")).lower() in {"io1", "io2", "gp3"}
     ]
-    inst_ids = [i.get("DBInstanceIdentifier", "") for i in instances if i.get("DBInstanceIdentifier")]
+    inst_ids = [
+        i.get("DBInstanceIdentifier", "")
+        for i in instances
+        if i.get("DBInstanceIdentifier")
+    ]
     if not inst_ids:
         return []
 
@@ -524,7 +614,6 @@ def check_rds_iops_overprovisioned(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_rds_gp2_to_gp3_candidates(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     account_id: Optional[str] = None,
@@ -532,11 +621,16 @@ def check_rds_gp2_to_gp3_candidates(  # noqa: D401
 ) -> List[Dict[str, Any]]:
     """Flag RDS instances using gp2 → recommend gp3 (delta per GB-month)."""
     log = _logger(kwargs.get("logger") or logger)
+
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, rds = _extract_writer_rds(args, kwargs)
+        writer, rds = _extract_writer_rds(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_rds_gp2_to_gp3_candidates] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_clients(None, rds)
 
     owner = str(account_id or config.ACCOUNT_ID or "")
     delta = _gp_price_delta_per_gb_month()
@@ -579,7 +673,6 @@ def check_rds_gp2_to_gp3_candidates(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_aurora_low_activity_clusters(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 30,
@@ -590,11 +683,16 @@ def check_aurora_low_activity_clusters(  # noqa: D401
 ) -> List[Dict[str, Any]]:
     """Flag Aurora clusters with low activity → downsize/pause review."""
     log = _logger(kwargs.get("logger") or logger)
+
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, cloudwatch, rds = _extract_writer_cw_rds(args, kwargs)
+        writer, cloudwatch, rds = _extract_writer_cw_rds(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_aurora_low_activity_clusters] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_clients(cloudwatch, rds)
 
     owner = str(account_id or config.ACCOUNT_ID or "")
     start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
@@ -616,9 +714,7 @@ def check_aurora_low_activity_clusters(  # noqa: D401
         cluster_members[cid] = members
 
     all_inst_ids = sorted({i for ids in cluster_members.values() for i in ids if i})
-    series = _run_cw_queries(
-        region, cloudwatch, _build_rds_metric_queries(all_inst_ids), start, end
-    )
+    series = _run_cw_queries(region, cloudwatch, _build_rds_metric_queries(all_inst_ids), start, end)
     metrics = _summarize_rds_series(all_inst_ids, series)
 
     rows: List[Dict[str, Any]] = []
@@ -657,8 +753,10 @@ def check_aurora_low_activity_clusters(  # noqa: D401
                 potential_saving=None,
                 flags=flags,
                 confidence=70 if low else 50,
-                signals=f"engine_mode={engine_mode}|avg_cpu={round(avg_cpu,1)}|"
-                        f"max_conn={round(max_conn,1)}|members={len(inst_ids)}",
+                signals=(
+                    f"engine_mode={engine_mode}|avg_cpu={round(avg_cpu,1)}|"
+                    f"max_conn={round(max_conn,1)}|members={len(inst_ids)}"
+                ),
             )
         except Exception as exc:  # pylint: disable=broad-except
             log.warning("[aurora] write_row(low activity) failed: %s", exc)
@@ -686,7 +784,6 @@ def _needs_engine_upgrade(engine: str, version: str) -> Tuple[bool, str]:
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_rds_engine_extended_support(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     account_id: Optional[str] = None,
@@ -694,14 +791,18 @@ def check_rds_engine_extended_support(  # noqa: D401
 ) -> List[Dict[str, Any]]:
     """Flag RDS/Aurora engines on legacy/extended support versions → upgrade."""
     log = _logger(kwargs.get("logger") or logger)
+
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, rds = _extract_writer_rds(args, kwargs)
+        writer, rds = _extract_writer_rds(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_rds_engine_extended_support] Skipping: %s", exc)
         return []
 
+    if not region:
+        region = _infer_region_from_clients(None, rds)
+
     owner = str(account_id or config.ACCOUNT_ID or "")
-    rows: List[Dict[str, Any]] = []
 
     # Instances
     for inst in _list_db_instances(rds):
@@ -732,14 +833,13 @@ def check_rds_engine_extended_support(  # noqa: D401
             )
         except Exception as exc:  # pylint: disable=broad-except
             log.warning("[rds] write_row(engine support) failed: %s", exc)
-        rows.append({"id": inst_id, "need": need})
 
     # Clusters (Aurora)
-    for c in _list_db_clusters(rds):
-        cid = c.get("DBClusterIdentifier", "")
-        arn = c.get("DBClusterArn", cid)
-        engine = c.get("Engine", "")
-        version = c.get("EngineVersion", "")
+    for cl in _list_db_clusters(rds):
+        cid = cl.get("DBClusterIdentifier", "")
+        arn = cl.get("DBClusterArn", cid)
+        engine = cl.get("Engine", "")
+        version = cl.get("EngineVersion", "")
         need, target = _needs_engine_upgrade(engine, version)
         if not need:
             continue
@@ -752,8 +852,8 @@ def check_rds_engine_extended_support(  # noqa: D401
                 owner_id=owner,  # type: ignore[arg-type]
                 resource_type="AuroraCluster",
                 region=region,
-                state=c.get("Status", ""),
-                creation_date=_iso(c.get("EarliestRestorableTime")),
+                state=cl.get("Status", ""),
+                creation_date=_iso(cl.get("EarliestRestorableTime")),
                 estimated_cost="",
                 potential_saving=None,
                 flags=["LegacyEngineVersion"],
@@ -762,6 +862,3 @@ def check_rds_engine_extended_support(  # noqa: D401
             )
         except Exception as exc:  # pylint: disable=broad-except
             log.warning("[aurora] write_row(engine support) failed: %s", exc)
-        rows.append({"id": cid, "need": need})
-
-    return rows
