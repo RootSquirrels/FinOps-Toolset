@@ -9,11 +9,47 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError
 
-from aws_checkers.common import _logger, _signals_str, _to_utc_iso
 from aws_checkers import config as chk
-from finops_toolset import config as const
-from core.retry import retry_with_backoff
+from aws_checkers.common import _logger, _signals_str, _to_utc_iso
 from core.cloudwatch import CloudWatchBatcher
+from core.retry import retry_with_backoff
+from finops_toolset import config as const
+
+
+# ---------------------------------------------------------------------------
+# Call normalization (region / args compatibility)
+# ---------------------------------------------------------------------------
+
+def _split_region_from_args(
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Tuple[Optional[str], Tuple[Any, ...]]:
+    """
+    Normalize region + args for both call styles.
+
+    Returns:
+      (region, remaining_args)
+
+    Accepted patterns:
+      - Orchestrator: fn(writer, **kwargs) -> region is optional kw or derived
+      - Legacy: fn(region, writer, ...) -> first arg is region str
+    """
+    region = kwargs.get("region")
+    if region:
+        return str(region), args
+
+    if args and isinstance(args[0], str) and len(args) >= 2:
+        # Legacy signature: (region, writer, ...)
+        return str(args[0]), args[1:]
+
+    return None, args
+
+
+def _infer_region_from_client(client: Optional[BaseClient]) -> str:
+    """Infer AWS region from a boto3/botocore client; fallback to 'GLOBAL'."""
+    if client is None:
+        return "GLOBAL"
+    return str(getattr(getattr(client, "meta", None), "region_name", None) or "GLOBAL")
 
 
 # ---------------------------------------------------------------------------
@@ -21,25 +57,27 @@ from core.cloudwatch import CloudWatchBatcher
 # ---------------------------------------------------------------------------
 
 def _extract_writer_client(
-    args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
 ) -> Tuple[Any, BaseClient]:
     """Extract (writer, ecs client) from args/kwargs; raise if missing."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    ecs = kwargs.get("client", args[1] if len(args) >= 2 else None)
+    ecs = kwargs.get("client", kwargs.get("ecs", args[1] if len(args) >= 2 else None))
     if writer is None or ecs is None:
-        raise TypeError("Expected 'writer' and 'client'")
+        raise TypeError("Expected 'writer' and 'client' (or 'ecs')")
     return writer, ecs
 
 
 def _extract_writer_cw_client(
-    args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
 ) -> Tuple[Any, BaseClient, BaseClient]:
     """Extract (writer, cloudwatch, ecs) from args/kwargs; raise if missing."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    cloudwatch = kwargs.get("cloudwatch", args[1] if len(args) >= 2 else None)
-    ecs = kwargs.get("ecs", args[2] if len(args) >= 3 else None)
+    cloudwatch = kwargs.get("cloudwatch", kwargs.get("cw", args[1] if len(args) >= 2 else None))
+    ecs = kwargs.get("client", kwargs.get("ecs", args[2] if len(args) >= 3 else None))
     if writer is None or cloudwatch is None or ecs is None:
-        raise TypeError("Expected 'writer', 'cloudwatch' and 'ecs'")
+        raise TypeError("Expected 'writer', 'cloudwatch' and 'client' (or 'ecs')")
     return writer, cloudwatch, ecs
 
 
@@ -96,7 +134,9 @@ def _is_fargate_service(svc: Dict[str, Any]) -> bool:
 def _taskdef_cpu_memory(ecs: BaseClient, taskdef_arn: str) -> Tuple[float, float]:
     """Return (vCPU, GiB) defined at the task level, best-effort for Fargate."""
     try:
-        td = ecs.describe_task_definition(taskDefinition=taskdef_arn).get("taskDefinition", {})  # type: ignore[call-arg]
+        td = ecs.describe_task_definition(
+            taskDefinition=taskdef_arn
+        ).get("taskDefinition", {})  # type: ignore[call-arg]
     except ClientError:
         return 0.0, 0.0
 
@@ -140,7 +180,6 @@ def _bytes_to_mb(num: float) -> float:
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ecs_idle_services(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 14,
@@ -154,37 +193,48 @@ def check_ecs_idle_services(  # noqa: D401
     """
     log = _logger(kwargs.get("logger") or logger)
 
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, cloudwatch, ecs = _extract_writer_cw_client(args, kwargs)
+        writer, cloudwatch, ecs = _extract_writer_cw_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_ecs_idle_services] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_client(cloudwatch) or _infer_region_from_client(ecs)
 
     owner = str(kwargs.get("account_id") or chk.ACCOUNT_ID or "")
     if not (owner and chk.WRITE_ROW):
         log.warning("[check_ecs_idle_services] Skipping: missing config.")
         return []
 
-    # Enumerate clusters
-    clusters_arns = [c for c in _paginate(ecs.list_clusters, page_key="clusterArns", token_key="nextToken")]  # type: ignore[arg-type]
+    clusters_arns = [
+        c for c in _paginate(
+            ecs.list_clusters, page_key="clusterArns", token_key="nextToken"
+        )
+    ]  # type: ignore[arg-type]
     if not clusters_arns:
         return []
 
-    # Enumerate services by cluster
     services: List[Dict[str, Any]] = []
     for cluster_arn in clusters_arns:
         svc_arns: List[str] = []
         for page in _paginate(
-            ecs.list_services, page_key="serviceArns", token_key="nextToken", cluster=cluster_arn
+            ecs.list_services,
+            page_key="serviceArns",
+            token_key="nextToken",
+            cluster=cluster_arn,
         ):
             svc_arns.extend(page if isinstance(page, list) else [page])
         if not svc_arns:
             continue
-        # Describe in chunks
+
         for i in range(0, len(svc_arns), 10):
-            chunk = svc_arns[i : i + 10]
+            chunk = svc_arns[i: i + 10]
             try:
-                resp = ecs.describe_services(cluster=cluster_arn, services=chunk)  # type: ignore[call-arg]
+                resp = ecs.describe_services(
+                    cluster=cluster_arn, services=chunk
+                )  # type: ignore[call-arg]
             except ClientError:
                 continue
             services.extend(resp.get("services", []) or [])
@@ -192,19 +242,18 @@ def check_ecs_idle_services(  # noqa: D401
     if not services:
         return []
 
-    # CW batch
     start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     end = datetime.now(timezone.utc)
     batch = CloudWatchBatcher(region, client=cloudwatch)
 
-    idx_map: List[Tuple[str, str, str]] = []  # (svc_arn, svc_name, cluster_name)
+    idx_map: List[Tuple[str, str, str]] = []
     for idx, svc in enumerate(services):
         if not _is_fargate_service(svc):
             continue
         desired = int(svc.get("desiredCount") or 0)
         running = int(svc.get("runningCount") or 0)
         if desired <= 0 and running <= 0:
-            continue  # zero tasks handled by another checker
+            continue
 
         svc_name = str(svc.get("serviceName") or "")
         cluster_arn = str(svc.get("clusterArn") or "")
@@ -222,7 +271,6 @@ def check_ecs_idle_services(  # noqa: D401
             stat="Average",
             period=3600,
         )
-        # Network metrics may not exist everywhere; we attempt both
         batch.add_q(
             id_hint=f"netin_{idx}",
             namespace="AWS/ECS",
@@ -250,7 +298,6 @@ def check_ecs_idle_services(  # noqa: D401
     rows: List[Dict[str, Any]] = []
 
     for idx, (svc_arn, svc_name, cluster_name) in enumerate(idx_map):
-        # Find service object again (for counts and taskdef)
         svc = next((s for s in services if s.get("serviceArn") == svc_arn), None)
         if not svc:
             continue
@@ -261,16 +308,15 @@ def check_ecs_idle_services(  # noqa: D401
 
         cpu_avg = _avg_series(series.get(f"cpu_{idx}", []))
         net_mb = _bytes_to_mb(
-            _sum_series(series.get(f"netin_{idx}", [])) + _sum_series(series.get(f"netout_{idx}", []))
+            _sum_series(series.get(f"netin_{idx}", []))
+            + _sum_series(series.get(f"netout_{idx}", []))
         )
 
-        # Idle heuristic
         if cpu_avg > float(cpu_threshold_pct):
             continue
         if net_mb > float(net_total_mb_threshold):
             continue
 
-        # Compute per-task hourly for Fargate
         taskdef_arn = str(svc.get("taskDefinition") or "")
         vcpu, mem_gib = _taskdef_cpu_memory(ecs, taskdef_arn)
         hourly_per_task = _fargate_hourly(vcpu, mem_gib)
@@ -292,8 +338,7 @@ def check_ecs_idle_services(  # noqa: D401
         )
 
         try:
-            # type: ignore[call-arg]
-            chk.WRITE_ROW(
+            chk.WRITE_ROW(  # type: ignore[call-arg]
                 writer=writer,
                 resource_id=svc_arn,
                 name=svc_name,
@@ -322,29 +367,35 @@ def check_ecs_idle_services(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ecs_services_zero_tasks(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     """Flag services where desired==0 and running==0 but still configured.
-
     We surface attached load balancers or service registries as signals.
     """
     log = _logger(kwargs.get("logger") or logger)
 
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, ecs = _extract_writer_client(args, kwargs)
+        writer, ecs = _extract_writer_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_ecs_services_zero_tasks] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_client(ecs)
 
     owner = str(kwargs.get("account_id") or chk.ACCOUNT_ID or "")
     if not (owner and chk.WRITE_ROW):
         log.warning("[check_ecs_services_zero_tasks] Skipping: missing config.")
         return []
 
-    clusters_arns = [c for c in _paginate(ecs.list_clusters, page_key="clusterArns", token_key="nextToken")]  # type: ignore[arg-type]
+    clusters_arns = [
+        c for c in _paginate(
+            ecs.list_clusters, page_key="clusterArns", token_key="nextToken"
+        )
+    ]  # type: ignore[arg-type]
     if not clusters_arns:
         return []
 
@@ -353,18 +404,24 @@ def check_ecs_services_zero_tasks(  # noqa: D401
     for cluster_arn in clusters_arns:
         svc_arns: List[str] = []
         for page in _paginate(
-            ecs.list_services, page_key="serviceArns", token_key="nextToken", cluster=cluster_arn
+            ecs.list_services,
+            page_key="serviceArns",
+            token_key="nextToken",
+            cluster=cluster_arn,
         ):
             svc_arns.extend(page if isinstance(page, list) else [page])
         if not svc_arns:
             continue
 
         for i in range(0, len(svc_arns), 10):
-            chunk = svc_arns[i : i + 10]
+            chunk = svc_arns[i: i + 10]
             try:
-                resp = ecs.describe_services(cluster=cluster_arn, services=chunk)  # type: ignore[call-arg]
+                resp = ecs.describe_services(
+                    cluster=cluster_arn, services=chunk
+                )  # type: ignore[call-arg]
             except ClientError:
                 continue
+
             for svc in resp.get("services", []) or []:
                 desired = int(svc.get("desiredCount") or 0)
                 running = int(svc.get("runningCount") or 0)
@@ -377,8 +434,12 @@ def check_ecs_services_zero_tasks(  # noqa: D401
 
                 lbs = svc.get("loadBalancers") or []
                 regs = svc.get("serviceRegistries") or []
-                lb_targets = [lb.get("targetGroupArn") for lb in lbs if lb.get("targetGroupArn")]
-                ns_arns = [r.get("registryArn") for r in regs if r.get("registryArn")]
+                lb_targets = [
+                    lb.get("targetGroupArn") for lb in lbs if lb.get("targetGroupArn")
+                ]
+                ns_arns = [
+                    r.get("registryArn") for r in regs if r.get("registryArn")
+                ]
 
                 flags = ["ZombieService"]
                 signals = _signals_str(
@@ -391,8 +452,7 @@ def check_ecs_services_zero_tasks(  # noqa: D401
                 created_iso = _to_utc_iso(svc.get("createdAt"))
 
                 try:
-                    # type: ignore[call-arg]
-                    chk.WRITE_ROW(
+                    chk.WRITE_ROW(  # type: ignore[call-arg]
                         writer=writer,
                         resource_id=svc_arn,
                         name=svc_name,
@@ -421,43 +481,52 @@ def check_ecs_services_zero_tasks(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ecs_old_task_definitions(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     older_than_days: int = 90,
     max_task_defs: int = 200,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
-    """Flag task definitions registered more than N days ago and not in use.
-
-    This is hygiene (not direct cost), but reduces drift and accidental launches.
-    """
+    """Flag task definitions registered more than N days ago and not in use."""
     log = _logger(kwargs.get("logger") or logger)
 
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, ecs = _extract_writer_client(args, kwargs)
+        writer, ecs = _extract_writer_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_ecs_old_task_definitions] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_client(ecs)
 
     owner = str(kwargs.get("account_id") or chk.ACCOUNT_ID or "")
     if not (owner and chk.WRITE_ROW):
         log.warning("[check_ecs_old_task_definitions] Skipping: missing config.")
         return []
 
-    # Gather services' task definitions (in-use set)
     in_use: set[str] = set()
-    clusters_arns = [c for c in _paginate(ecs.list_clusters, page_key="clusterArns", token_key="nextToken")]  # type: ignore[arg-type]
+    clusters_arns = [
+        c for c in _paginate(
+            ecs.list_clusters, page_key="clusterArns", token_key="nextToken"
+        )
+    ]  # type: ignore[arg-type]
+
     for cluster_arn in clusters_arns:
         svc_arns: List[str] = []
         for page in _paginate(
-            ecs.list_services, page_key="serviceArns", token_key="nextToken", cluster=cluster_arn
+            ecs.list_services,
+            page_key="serviceArns",
+            token_key="nextToken",
+            cluster=cluster_arn,
         ):
             svc_arns.extend(page if isinstance(page, list) else [page])
         for i in range(0, len(svc_arns), 10):
-            chunk = svc_arns[i : i + 10]
+            chunk = svc_arns[i: i + 10]
             try:
-                resp = ecs.describe_services(cluster=cluster_arn, services=chunk)  # type: ignore[call-arg]
+                resp = ecs.describe_services(
+                    cluster=cluster_arn, services=chunk
+                )  # type: ignore[call-arg]
             except ClientError:
                 continue
             for svc in resp.get("services", []) or []:
@@ -465,24 +534,28 @@ def check_ecs_old_task_definitions(  # noqa: D401
                 if isinstance(td, str):
                     in_use.add(td)
 
-    # List task def ARNs (DESC) and limit
     arns: List[str] = []
     for page in _paginate(
-        ecs.list_task_definitions, page_key="taskDefinitionArns", token_key="nextToken", sort="DESC"
+        ecs.list_task_definitions,
+        page_key="taskDefinitionArns",
+        token_key="nextToken",
+        sort="DESC",
     ):
         arns.extend(page if isinstance(page, list) else [page])
         if len(arns) >= int(max_task_defs):
             break
     arns = arns[: int(max_task_defs)]
 
-    rows: List[Dict[str, Any]] = []
     cutoff = datetime.now(timezone.utc) - timedelta(days=int(older_than_days))
 
     for arn in arns:
         try:
-            td = ecs.describe_task_definition(taskDefinition=arn).get("taskDefinition", {})  # type: ignore[call-arg]
+            td = ecs.describe_task_definition(
+                taskDefinition=arn
+            ).get("taskDefinition", {})  # type: ignore[call-arg]
         except ClientError:
             continue
+
         reg_at = td.get("registeredAt")
         if not isinstance(reg_at, datetime):
             continue
@@ -499,8 +572,7 @@ def check_ecs_old_task_definitions(  # noqa: D401
         signals = _signals_str({"status": str(td.get("status") or "ACTIVE")})
 
         try:
-            # type: ignore[call-arg]
-            chk.WRITE_ROW(
+            chk.WRITE_ROW(  # type: ignore[call-arg]
                 writer=writer,
                 resource_id=arn,
                 name=name,
@@ -517,7 +589,3 @@ def check_ecs_old_task_definitions(  # noqa: D401
             )
         except Exception as exc:  # pylint: disable=broad-except
             log.warning("[ecs] write_row(task-def) failed: %s", exc)
-
-        rows.append({"taskdef": arn, "potential": 0.0})
-
-    return rows
