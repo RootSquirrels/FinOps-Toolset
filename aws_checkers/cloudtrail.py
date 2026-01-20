@@ -64,12 +64,22 @@ def _extract_writer_client(
 # ---------------------------------------------------------------------------
 
 def _list_trails(ct: BaseClient) -> List[Dict[str, Any]]:
-    """List all trails (include shadow trails) with pagination."""
+    """List all trails, including shadow trails when the client supports it."""
     trails: List[Dict[str, Any]] = []
     token: Optional[str] = None
 
+    # Detect whether this botocore model supports IncludeShadowTrails
+    include_shadow_supported = False
+    try:
+        op_model = ct.meta.service_model.operation_model("ListTrails")
+        include_shadow_supported = "IncludeShadowTrails" in op_model.input_shape.members
+    except Exception:  # pylint: disable=broad-except
+        include_shadow_supported = False
+
     while True:
-        params: Dict[str, Any] = {"IncludeShadowTrails": True}
+        params: Dict[str, Any] = {}
+        if include_shadow_supported:
+            params["IncludeShadowTrails"] = True
         if token:
             params["NextToken"] = token
 
@@ -81,6 +91,7 @@ def _list_trails(ct: BaseClient) -> List[Dict[str, Any]]:
             break
 
     return trails
+
 
 
 def _get_trail(ct: BaseClient, arn: str) -> Dict[str, Any]:
