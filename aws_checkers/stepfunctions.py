@@ -17,23 +17,62 @@ from core.cloudwatch import CloudWatchBatcher
 
 
 # ---------------------------------------------------------------------------
-# Extractors
+# Call normalization & Extractors
 # ---------------------------------------------------------------------------
+
+def _split_region_from_args(
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Tuple[Optional[str], Tuple[Any, ...]]:
+    """Normalize region + remaining args for orchestrator and legacy calls.
+
+    Returns (region, remaining_args).
+
+    Accepted patterns:
+      - Orchestrator: fn(writer, **kwargs) -> region may be in kwargs (optional)
+      - Legacy: fn(region, writer, ...) -> first arg is region str
+    """
+    region_kw = kwargs.get("region")
+    if isinstance(region_kw, str) and region_kw:
+        return region_kw, args
+
+    if args and isinstance(args[0], str) and len(args) >= 2:
+        return str(args[0]), args[1:]
+
+    return None, args
+
+
+def _infer_region_from_clients(cloudwatch: Optional[BaseClient], sfn: Optional[BaseClient]) -> str:
+    """Infer region from boto3 client meta; fallback to 'GLOBAL'."""
+    for client in (cloudwatch, sfn):
+        if client is None:
+            continue
+        r = getattr(getattr(client, "meta", None), "region_name", None)
+        if r:
+            return str(r)
+    return "GLOBAL"
+
 
 def _extract_writer_cw_client(
     args: Tuple[Any, ...], kwargs: Dict[str, Any]
 ) -> Tuple[Any, BaseClient, BaseClient]:
-    """Extract (writer, cloudwatch, stepfunctions) from args/kwargs; raise if missing."""
+    """Extract (writer, cloudwatch, stepfunctions) from args/kwargs; raise if missing.
+
+    Supports:
+      - Orchestrator: writer positional args[0], cloudwatch=..., client=... (SFN)
+      - Legacy: fn(region, writer, cloudwatch, stepfunctions)
+      - Back-compat: sfn may also be provided as 'stepfunctions='
+    """
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
     cloudwatch = kwargs.get("cloudwatch", args[1] if len(args) >= 2 else None)
-    sfn = kwargs.get("stepfunctions", args[2] if len(args) >= 3 else None)
+    sfn = kwargs.get("client", kwargs.get("stepfunctions", args[2] if len(args) >= 3 else None))
     if writer is None or cloudwatch is None or sfn is None:
-        raise TypeError("Expected 'writer', 'cloudwatch' and 'stepfunctions'")
+        raise TypeError("Expected 'writer', 'cloudwatch' and Step Functions client as 'client'")
     return writer, cloudwatch, sfn
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (unchanged)
 # ---------------------------------------------------------------------------
 
 def _paginate(
@@ -113,7 +152,6 @@ def _express_monthly_cost(
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_sfn_standard_vs_express_mismatch(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 14,
@@ -133,11 +171,16 @@ def check_sfn_standard_vs_express_mismatch(  # noqa: D401
     """
     log = _logger(kwargs.get("logger") or logger)
 
+    region, norm_args = _split_region_from_args(args, kwargs)
+
     try:
-        writer, cloudwatch, sfn = _extract_writer_cw_client(args, kwargs)
+        writer, cloudwatch, sfn = _extract_writer_cw_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_sfn_standard_vs_express_mismatch] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_clients(cloudwatch, sfn)
 
     owner = str(kwargs.get("account_id") or chk.ACCOUNT_ID or "")
     if not (owner and chk.WRITE_ROW):
@@ -162,32 +205,31 @@ def check_sfn_standard_vs_express_mismatch(  # noqa: D401
     scale = _scale_to_month(start, end)
 
     batch = CloudWatchBatcher(region, client=cloudwatch)
-    items: List[Tuple[str, str, str, datetime]] = []
+    items: List[Tuple[str, str, str]] = []
 
-    for idx, sm in enumerate(sms):
+    # Use a dense index for queries so IDs match the enumerate in the second pass
+    qidx = 0
+    for sm in sms:
         arn = str(sm.get("stateMachineArn") or "")
         name = str(sm.get("name") or arn)
         sm_type = str(sm.get("type") or "STANDARD").upper()
-        created = sm.get("creationDate")
-        created_iso = _to_utc_iso(created)
+        created_iso = _to_utc_iso(sm.get("creationDate"))
 
         # Only evaluate Standard state machines for migration
-        if sm_type != "STANDARD":
+        if sm_type != "STANDARD" or not arn:
             continue
 
         dims = [{"Name": "StateMachineArn", "Value": arn}]
-        # ExecutionsStarted (Sum)
         batch.add_q(
-            id_hint=f"exec_{idx}",
+            id_hint=f"exec_{qidx}",
             namespace="AWS/States",
             metric="ExecutionsStarted",
             dims=dims,
             stat="Sum",
             period=3600,
         )
-        # ExecutionTime (Average, ms)
         batch.add_q(
-            id_hint=f"dur_{idx}",
+            id_hint=f"dur_{qidx}",
             namespace="AWS/States",
             metric="ExecutionTime",
             dims=dims,
@@ -195,15 +237,15 @@ def check_sfn_standard_vs_express_mismatch(  # noqa: D401
             period=3600,
         )
 
-        items.append((arn, name, created_iso, sm_type))
+        items.append((arn, name, created_iso))
+        qidx += 1
 
     if not items:
         return []
 
     series = batch.execute(start, end)
 
-    rows: List[Dict[str, Any]] = []
-    for idx, (arn, name, created_iso, sm_type) in enumerate(items):
+    for idx, (arn, name, created_iso) in enumerate(items):
         exec_sum = _sum_series(series.get(f"exec_{idx}", []))
         dur_avg_ms = _avg_series(series.get(f"dur_{idx}", []))
         monthly_execs = exec_sum * scale
@@ -218,7 +260,6 @@ def check_sfn_standard_vs_express_mismatch(  # noqa: D401
             monthly_execs, dur_avg_ms, assumed_payload_kb, p_exp_1m, p_exp_gbs
         )
         saving = max(0.0, std_cost - exp_cost)
-
         if saving <= 0.0:
             continue
 
@@ -253,16 +294,3 @@ def check_sfn_standard_vs_express_mismatch(  # noqa: D401
             )
         except Exception as exc:  # pylint: disable=broad-except
             log.warning("[sfn] write_row mismatch failed for %s: %s", arn, exc)
-
-        rows.append(
-            {
-                "arn": arn,
-                "name": name,
-                "monthly_execs": int(monthly_execs),
-                "std_cost": std_cost,
-                "exp_cost": exp_cost,
-                "saving": saving,
-            }
-        )
-
-    return rows
