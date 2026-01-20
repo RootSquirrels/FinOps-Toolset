@@ -14,8 +14,39 @@ from core.retry import retry_with_backoff
 
 
 # ---------------------------------------------------------------------------
-# Extractors
+# Call normalization & Extractors
 # ---------------------------------------------------------------------------
+
+def _split_region_from_args(
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Tuple[Optional[str], Tuple[Any, ...]]:
+    """Normalize region + remaining args for orchestrator and legacy calls.
+
+    Returns:
+      (region, remaining_args)
+
+    Accepted patterns:
+      - Orchestrator: fn(writer, **kwargs) -> region may be in kwargs (optional)
+      - Legacy: fn(region, writer, ...) -> first arg is region str
+    """
+    region_kw = kwargs.get("region")
+    if isinstance(region_kw, str) and region_kw:
+        return region_kw, args
+
+    if args and isinstance(args[0], str) and len(args) >= 2:
+        return str(args[0]), args[1:]
+
+    return None, args
+
+
+def _infer_region_from_client(client: Optional[BaseClient]) -> str:
+    """Infer region from boto3 client meta; fallback to 'GLOBAL'."""
+    if client is None:
+        return "GLOBAL"
+    region = getattr(getattr(client, "meta", None), "region_name", None)
+    return str(region) if region else "GLOBAL"
+
 
 def _extract_writer_client(
     args: Tuple[Any, ...], kwargs: Dict[str, Any]
@@ -72,7 +103,6 @@ def _resolve_owner_id(account_id: Optional[str]) -> str:
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_cloudtrail_redundant_trails(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     account_id: Optional[str] = None,
@@ -81,11 +111,16 @@ def check_cloudtrail_redundant_trails(  # noqa: D401
     """Flag redundant trails covering the same scope (org & multi-region)."""
     log = _logger(kwargs.get("logger") or logger)
 
+    region, norm_args = _split_region_from_args(args, kwargs)
+
     try:
-        writer, ct = _extract_writer_client(args, kwargs)
+        writer, ct = _extract_writer_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_cloudtrail_redundant_trails] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_client(ct)
 
     owner = _resolve_owner_id(account_id)
     if not (owner and chk.WRITE_ROW):
@@ -149,8 +184,7 @@ def check_cloudtrail_redundant_trails(  # noqa: D401
                 }
             )
             try:
-                # type: ignore[call-arg]
-                chk.WRITE_ROW(
+                chk.WRITE_ROW(  # type: ignore[call-arg]
                     writer=writer,
                     resource_id=arn,
                     name=name,
@@ -187,8 +221,7 @@ def check_cloudtrail_redundant_trails(  # noqa: D401
                 }
             )
             try:
-                # type: ignore[call-arg]
-                chk.WRITE_ROW(
+                chk.WRITE_ROW(  # type: ignore[call-arg]
                     writer=writer,
                     resource_id=arn,
                     name=name,
@@ -217,7 +250,6 @@ def check_cloudtrail_redundant_trails(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_cloudtrail_s3_cwlogs_duplication(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     account_id: Optional[str] = None,
@@ -230,11 +262,16 @@ def check_cloudtrail_s3_cwlogs_duplication(  # noqa: D401
     """
     log = _logger(kwargs.get("logger") or logger)
 
+    region, norm_args = _split_region_from_args(args, kwargs)
+
     try:
-        writer, ct = _extract_writer_client(args, kwargs)
+        writer, ct = _extract_writer_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_cloudtrail_s3_cwlogs_duplication] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_client(ct)
 
     owner = _resolve_owner_id(account_id)
     if not (owner and chk.WRITE_ROW):
@@ -296,8 +333,7 @@ def check_cloudtrail_s3_cwlogs_duplication(  # noqa: D401
             )
 
             try:
-                # type: ignore[call-arg]
-                chk.WRITE_ROW(
+                chk.WRITE_ROW(  # type: ignore[call-arg]
                     writer=writer,
                     resource_id=arn,
                     name=name,
