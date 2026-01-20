@@ -366,14 +366,22 @@ def _estimate_stale_mpu_gib(
 
 def _extract_writer_cw_s3(
     args: Tuple[Any, ...], kwargs: Dict[str, Any]
-) -> Tuple[Any, BaseClient, BaseClient]:
-    """Extract (writer, cloudwatch, s3) from args/kwargs; raise if missing."""
+) -> Tuple[Any, BaseClient, BaseClient, str]:
+    """Extract (writer, cloudwatch, s3, region) from args/kwargs; raise if missing.
+
+    Orchestrator passes writer as first positional and does NOT pass region positionally.
+    It also passes the S3 client as 'client', not 's3'.
+    """
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    cloudwatch = kwargs.get("cloudwatch", args[1] if len(args) >= 2 else None)
-    s3 = kwargs.get("s3", args[2] if len(args) >= 3 else None)
+    cloudwatch = kwargs.get("cloudwatch", kwargs.get("cw", None))
+    s3 = kwargs.get("s3", kwargs.get("client", None))
+
+    # Region is usually provided by orchestrator as a kwarg; default to 'GLOBAL'
+    region = str(kwargs.get("region", "GLOBAL"))
+
     if writer is None or cloudwatch is None or s3 is None:
-        raise TypeError("Expected 'writer', 'cloudwatch' and 's3'")
-    return writer, cloudwatch, s3
+        raise TypeError("Expected 'writer', 'cloudwatch' and 'client'/'s3'")
+    return writer, cloudwatch, s3, region
 
 
 def _savings_candidates(
@@ -453,14 +461,10 @@ def check_s3_cost_and_compliance(  # noqa: D401
     mpu_per_upload_parts_limit: int = 20,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
-    """Single-pass S3 checker that writes exactly one CSV row per bucket.
-
-    It merges compliance (public access, encryption, logging, lifecycle, etc.) with
-    savings heuristics (tiering, excess versions, abandoned MPUs).
-    """
+    """Single-pass S3 checker that writes exactly one CSV row per bucket."""
     log = _logger(kwargs.get("logger") or logger)
     try:
-        writer, cloudwatch, s3 = _extract_writer_cw_s3(args, kwargs)
+        writer, cloudwatch, s3, region = _extract_writer_cw_s3(args, kwargs)
     except TypeError as exc:
         log.warning("[check_s3_cost_and_compliance] Skipping: %s", exc)
         return []

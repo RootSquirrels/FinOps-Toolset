@@ -723,28 +723,12 @@ def main():
                           dynamodb=clients["dynamodb"], cloudwatch=clients["cloudwatch"])
 
                 run_check(
-                            profiler, "check_ami_public_or_shared",
-                            region, ami_checks.check_ami_public_or_shared,
-                            writer=writer, ec2=clients["ec2"],)
-
-                run_check(
-                            profiler, "check_ami_unused_and_snapshot_cost",
-                            region, ami_checks.check_ami_unused_and_snapshot_cost,
-                            writer=writer, ec2=clients["ec2"],
-                            autoscaling=clients.get("autoscaling"),  # optional
-                            # knobs: min_age_days=14
-                        )
-
-                run_check(
                             profiler, "check_ami_old_images",
-                            region, ami_checks.check_ami_old_images,
-                            writer=writer, ec2=clients["ec2"],
+                            region, ami_checks.run_check,
+                            writer=writer, ec2=clients["ec2"], autoscaling=clients["autoscaling"]
                             # knobs: age_days=180
                         )
 
-                run_check(profiler, "check_ami_unencrypted_snapshots",
-                          region, ami_checks.check_ami_unencrypted_snapshots,
-                          writer=writer, ec2=clients["ec2"],)
 
                 run_check(
                     profiler, "check_loggroups_no_retention", region,

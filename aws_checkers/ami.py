@@ -1,532 +1,449 @@
-"""Checkers: Amazon Machine Images (AMIs).
+"""
+AMI checker.
 
-Checks included:
+This checker runs multiple tests against AMIs and writes at most one CSV row per AMI.
+If an AMI matches multiple tests (e.g., unused and old), its flags are merged into a
+single row and potential savings are not duplicated.
 
-  - check_ami_public_or_shared
-      Flags public AMIs or AMIs shared outside the account (hygiene/security).
-
-  - check_ami_unused_and_snapshot_cost
-      AMIs not referenced by any instance or launch template/config.
-      Estimates monthly snapshot storage cost tied to the AMI.
-
-  - check_ami_old_images
-      Very old AMIs (age threshold). Uses snapshot cost as potential saving.
-
-  - check_ami_unencrypted_snapshots
-      AMIs whose backing EBS snapshots are unencrypted (hygiene).
-
-Design:
-  - Dependencies injected via finops_toolset.checkers.config.setup(...).
-  - Tolerant signatures for run_check; no return values; graceful skips.
-  - Uses EBS snapshot pricing keys from your pricebook:
-        "EBS" -> "SNAPSHOT_STANDARD_GB_MONTH", "SNAPSHOT_ARCHIVE_GB_MONTH"
-  - Timezone-aware datetimes (datetime.now(timezone.utc)).
-  - Pylint-friendly, lines <= 100 chars.
+Tests:
+  - Public or shared AMI
+  - Unused AMI (not referenced by instances / launch templates / launch configs)
+  - Old AMI (age threshold)
+  - AMI backed by unencrypted EBS snapshots
+  - Snapshot monthly cost estimation (used for estimated_cost/potential_saving where relevant)
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from botocore.exceptions import ClientError
 
 from aws_checkers import config
-from aws_checkers.common import (
-    _logger,
-    _signals_str,
-    _to_utc_iso,
-)
+from aws_checkers.common import _logger, _signals_str, _to_utc_iso
 from core.retry import retry_with_backoff
 
 
-# ------------------------------- helpers -------------------------------- #
+@dataclass
+class AmiFinding:
+    """Aggregated finding for one AMI across multiple tests."""
+    ami_id: str
+    name: str
+    created_at: Optional[datetime]
+    region: str
+    flags: Set[str] = field(default_factory=set)
+    signals: Dict[str, Any] = field(default_factory=dict)
+    estimated_cost: float = 0.0
+    potential_saving: float = 0.0
+    confidence: int = 100
+
+    def add_flag(self, flag: str) -> None:
+        """Add one flag."""
+        if flag:
+            self.flags.add(flag)
+
+    def add_signals(self, more: Dict[str, Any]) -> None:
+        """Merge signals, preferring existing keys if duplicates occur."""
+        for key, val in more.items():
+            if key not in self.signals:
+                self.signals[key] = val
+
+    def set_costs_once(self, monthly_snapshot_cost: float) -> None:
+        """
+        Set costs based on monthly snapshot storage.
+
+        Multiple tests can rely on the same cost basis (e.g., unused and old). We keep:
+          - estimated_cost = max(existing, cost)
+          - potential_saving = max(existing, cost)
+        """
+        cost = float(monthly_snapshot_cost or 0.0)
+        if cost > self.estimated_cost:
+            self.estimated_cost = cost
+        if cost > self.potential_saving:
+            self.potential_saving = cost
+
 
 def _extract_writer_ec2(
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
 ) -> Tuple[Any, Any]:
-    """Accept writer/ec2 passed positionally or by keyword; prefer keywords."""
+    """Support positional or keyword injection of writer/ec2."""
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
     ec2 = kwargs.get("ec2", args[1] if len(args) >= 2 else None)
     if writer is None or ec2 is None:
-        raise TypeError(
-            "Expected 'writer' and 'ec2' "
-            f"(got writer={writer!r}, ec2={ec2!r})"
-        )
+        raise TypeError("Expected writer and ec2 to be provided.")
     return writer, ec2
 
 
-def _chunk(seq: Sequence[str], n: int) -> Iterable[List[str]]:
-    for i in range(0, len(seq), n):
-        yield list(seq[i:i + n])
+def _chunk(items: Sequence[str], chunk_size: int) -> Iterable[List[str]]:
+    """Yield list chunks of given size."""
+    for idx in range(0, len(items), chunk_size):
+        yield list(items[idx: idx + chunk_size])
 
 
-def _creation_dt(ami: Dict[str, Any]) -> Optional[datetime]:
-    cstr = (ami.get("CreationDate") or "").strip()
-    if not cstr:
+def _parse_creation_date(ami: Dict[str, Any]) -> Optional[datetime]:
+    """Parse AWS AMI CreationDate into an aware datetime in UTC."""
+    value = (ami.get("CreationDate") or "").strip()
+    if not value:
         return None
-    # e.g. "2023-05-10T12:34:56.000Z"
     try:
-        return datetime.strptime(cstr, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
-    except Exception:  # pylint: disable=broad-except
+        created = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+        return created.replace(tzinfo=timezone.utc)
+    except ValueError:
         return None
-
-
-def _gather_used_image_ids(
-    ec2,
-    log: logging.Logger,
-    autoscaling=None,  # optional
-) -> Tuple[set, int, int]:
-    """Return (image_ids_in_use, instance_count, lt_count)."""
-    used: set = set()
-    inst_count = 0
-    lt_count = 0
-
-    # Instances
-    try:
-        paginator = ec2.get_paginator("describe_instances")
-        for page in paginator.paginate():
-            for r in page.get("Reservations", []) or []:
-                for inst in r.get("Instances", []) or []:
-                    img = inst.get("ImageId")
-                    if img:
-                        used.add(img)
-                        inst_count += 1
-    except ClientError as exc:
-        log.debug("[ami] describe_instances failed: %s", exc)
-
-    # Launch templates (default + latest)
-    try:
-        lt_p = ec2.get_paginator("describe_launch_templates")
-        for page in lt_p.paginate():
-            for lt in page.get("LaunchTemplates", []) or []:
-                lt_id = lt.get("LaunchTemplateId")
-                if not lt_id:
-                    continue
-                try:
-                    vers = ec2.describe_launch_template_versions(
-                        LaunchTemplateId=lt_id,
-                        Versions=["$Latest", "$Default"],
-                    )
-                    for v in vers.get("LaunchTemplateVersions", []) or []:
-                        data = v.get("LaunchTemplateData", {}) or {}
-                        img = data.get("ImageId")
-                        if img:
-                            used.add(img)
-                            lt_count += 1
-                except ClientError as exc:
-                    log.debug("[ami] describe_launch_template_versions %s: %s", lt_id, exc)
-    except ClientError as exc:
-        log.debug("[ami] describe_launch_templates failed: %s", exc)
-
-    # Launch configurations (Auto Scaling) – optional
-    if autoscaling is not None:
-        try:
-            lc_p = autoscaling.get_paginator("describe_launch_configurations")
-            for page in lc_p.paginate():
-                for lc in page.get("LaunchConfigurations", []) or []:
-                    img = lc.get("ImageId")
-                    if img:
-                        used.add(img)
-                        lt_count += 1
-        except ClientError as exc:
-            log.debug("[ami] describe_launch_configurations failed: %s", exc)
-
-    return used, inst_count, lt_count
-
-
-def _describe_snapshots_map(
-    ec2,
-    snapshot_ids: List[str],
-    log: logging.Logger,
-) -> Dict[str, Dict[str, Any]]:
-    """Batch describe snapshots, return {snapshotId: snapshot_dict}."""
-    info: Dict[str, Dict[str, Any]] = {}
-    if not snapshot_ids:
-        return info
-
-    for chunk_ids in _chunk(snapshot_ids, 200):
-        try:
-            resp = ec2.describe_snapshots(SnapshotIds=chunk_ids)
-            for s in resp.get("Snapshots", []) or []:
-                sid = s.get("SnapshotId")
-                if sid:
-                    info[sid] = s
-        except ClientError as exc:
-            log.debug("[ami] describe_snapshots for chunk failed: %s", exc)
-    return info
 
 
 def _ami_snapshot_ids(ami: Dict[str, Any]) -> List[str]:
-    snap_ids: List[str] = []
+    """Extract backing EBS snapshot IDs from AMI block device mappings."""
+    snapshot_ids: List[str] = []
     for bdm in ami.get("BlockDeviceMappings", []) or []:
         ebs = bdm.get("Ebs") or {}
-        sid = ebs.get("SnapshotId")
-        if sid:
-            snap_ids.append(sid)
-    return snap_ids
+        snap_id = ebs.get("SnapshotId")
+        if snap_id:
+            snapshot_ids.append(str(snap_id))
+    return snapshot_ids
 
 
-def _snapshot_monthly_cost(snap: Dict[str, Any]) -> float:
-    size_gb = float(snap.get("VolumeSize") or 0.0)
-    tier = (snap.get("StorageTier") or "standard").lower()
-    p_std = config.safe_price("EBS", "SNAPSHOT_STANDARD_GB_MONTH", 0.0)
-    p_arc = config.safe_price("EBS", "SNAPSHOT_ARCHIVE_GB_MONTH", 0.0)
-    price = p_arc if tier == "archive" else p_std
-    return size_gb * price
+def _describe_snapshots_map(
+    ec2: Any,
+    snapshot_ids: List[str],
+    log: logging.Logger,
+) -> Dict[str, Dict[str, Any]]:
+    """Describe snapshots in batches and return a map snapshot_id -> snapshot dict."""
+    result: Dict[str, Dict[str, Any]] = {}
+    if not snapshot_ids:
+        return result
+
+    uniq = list(set(snapshot_ids))
+    for batch_ids in _chunk(uniq, 200):
+        try:
+            resp = ec2.describe_snapshots(SnapshotIds=batch_ids)
+        except ClientError as exc:
+            log.debug("[ami] describe_snapshots failed: %s", exc)
+            continue
+
+        for snap in resp.get("Snapshots", []) or []:
+            sid = snap.get("SnapshotId")
+            if sid:
+                result[str(sid)] = snap
+    return result
+
+
+def _snapshot_monthly_cost(snapshot: Dict[str, Any]) -> float:
+    """
+    Estimate monthly cost for a snapshot based on VolumeSize and StorageTier.
+
+    Uses project price keys:
+      EBS / SNAPSHOT_STANDARD_GB_MONTH
+      EBS / SNAPSHOT_ARCHIVE_GB_MONTH
+    """
+    size_gb = float(snapshot.get("VolumeSize") or 0.0)
+    tier = (snapshot.get("StorageTier") or "standard").lower()
+
+    price_standard = config.safe_price("EBS", "SNAPSHOT_STANDARD_GB_MONTH", 0.0)
+    price_archive = config.safe_price("EBS", "SNAPSHOT_ARCHIVE_GB_MONTH", 0.0)
+
+    unit = price_archive if tier == "archive" else price_standard
+    return size_gb * float(unit or 0.0)
 
 
 def _estimate_ami_snapshot_cost(
     ami: Dict[str, Any],
     snap_map: Dict[str, Dict[str, Any]],
 ) -> float:
-    tot = 0.0
+    """Sum monthly snapshot storage cost across all backing snapshots of an AMI."""
+    total = 0.0
     for sid in _ami_snapshot_ids(ami):
-        tot += _snapshot_monthly_cost(snap_map.get(sid, {}))
-    return tot
+        total += _snapshot_monthly_cost(snap_map.get(sid, {}))
+    return total
 
 
-# -------------------- 1) Public / shared AMIs (hygiene) ------------------ #
+def _gather_used_image_ids(
+    ec2: Any,
+    log: logging.Logger,
+    autoscaling: Optional[Any] = None,
+) -> Tuple[Set[str], int, int]:
+    """
+    Gather AMI IDs referenced by:
+      - EC2 instances
+      - Launch templates (latest + default)
+      - AutoScaling launch configurations (if autoscaling client provided)
 
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ami_public_or_shared(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    **kwargs,
-) -> None:
-    """Flag AMIs that are public or shared with other AWS accounts."""
-    log = _logger(kwargs.get("logger") or logger)
+    Returns: (used_image_ids, instances_scanned, templates_scanned)
+    """
+    used_ids: Set[str] = set()
+    instances_scanned = 0
+    templates_scanned = 0
 
+    # Instances
     try:
-        writer, ec2 = _extract_writer_ec2(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_ami_public_or_shared] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ami_public_or_shared] Skipping: checker config not provided.")
-        return
-
-    region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-
-    try:
-        imgs = ec2.describe_images(Owners=["self"]).get("Images", []) or []
+        paginator = ec2.get_paginator("describe_instances")
+        for page in paginator.paginate():
+            for res in page.get("Reservations", []) or []:
+                for inst in res.get("Instances", []) or []:
+                    img = inst.get("ImageId")
+                    if img:
+                        used_ids.add(str(img))
+                    instances_scanned += 1
     except ClientError as exc:
-        log.error("[check_ami_public_or_shared] describe_images failed: %s", exc)
-        return
+        log.debug("[ami] describe_instances failed: %s", exc)
 
-    for ami in imgs:
-        ami_id = ami.get("ImageId") or ""
-        name = ami.get("Name") or ami_id
-        is_public = bool(ami.get("Public"))
-        shared_outside = False
-        shared_ids: List[str] = []
+    # Launch templates
+    try:
+        lt_paginator = ec2.get_paginator("describe_launch_templates")
+        for page in lt_paginator.paginate():
+            for lt in page.get("LaunchTemplates", []) or []:
+                lt_id = lt.get("LaunchTemplateId")
+                if not lt_id:
+                    continue
+                try:
+                    versions = ec2.describe_launch_template_versions(
+                        LaunchTemplateId=lt_id,
+                        Versions=["$Latest", "$Default"],
+                    )
+                except ClientError as exc:
+                    log.debug("[ami] describe_launch_template_versions failed: %s", exc)
+                    continue
 
-        # Image attribute sharing
+                for ver in versions.get("LaunchTemplateVersions", []) or []:
+                    data = ver.get("LaunchTemplateData", {}) or {}
+                    img = data.get("ImageId")
+                    if img:
+                        used_ids.add(str(img))
+                    templates_scanned += 1
+    except ClientError as exc:
+        log.debug("[ami] describe_launch_templates failed: %s", exc)
+
+    # Launch configurations (Auto Scaling) - optional
+    if autoscaling is not None:
         try:
-            attr = ec2.describe_image_attribute(
-                ImageId=ami_id,
-                Attribute="launchPermission",
-            )
-            perms = attr.get("LaunchPermissions", []) or []
-            for p in perms:
-                if p.get("Group") == "all":
-                    is_public = True
-                uid = p.get("UserId")
-                if uid and str(uid) != str(config.ACCOUNT_ID or ""):
-                    shared_outside = True
-                    shared_ids.append(str(uid))
+            lc_paginator = autoscaling.get_paginator("describe_launch_configurations")
+            for page in lc_paginator.paginate():
+                for lc in page.get("LaunchConfigurations", []) or []:
+                    img = lc.get("ImageId")
+                    if img:
+                        used_ids.add(str(img))
+                    templates_scanned += 1
         except ClientError as exc:
-            log.debug("[ami] describe_image_attribute %s: %s", ami_id, exc)
+            log.debug("[ami] describe_launch_configurations failed: %s", exc)
 
-        flags: List[str] = []
-        if is_public:
-            flags.append("AMIPublic")
-        if shared_outside:
-            flags.append("AMISharedOutsideAccount")
-        if not flags:
-            continue
-
-        created = _creation_dt(ami)
-        signals = _signals_str(
-            {
-                "Region": region,
-                "ImageId": ami_id,
-                "Name": name,
-                "CreatedAt": _to_utc_iso(created),
-                "SharedWith": ",".join(shared_ids) if shared_ids else "",
-            }
-        )
-
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=ami_id,
-                name=name,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="AMI",
-                estimated_cost=0.0,
-                potential_saving=0.0,
-                flags=flags,
-                confidence=100,
-                signals=signals,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_ami_public_or_shared] write_row failed for %s: %s", ami_id, exc)
-
-        log.info("[check_ami_public_or_shared] Wrote: %s (flags=%s)", ami_id, flags)
+    return used_ids, instances_scanned, templates_scanned
 
 
-# -------- 2) Unused AMIs + estimated snapshot storage (potential save) --- #
+def _compute_public_shared_flags(
+    ec2: Any,
+    ami_id: str,
+    ami: Dict[str, Any],
+    account_id: str,
+    log: logging.Logger,
+) -> Tuple[Set[str], Dict[str, Any]]:
+    """Determine AMIPublic / AMISharedOutsideAccount and return flags + signals."""
+    flags: Set[str] = set()
+    signals: Dict[str, Any] = {}
+
+    is_public = bool(ami.get("Public"))
+    shared_outside = False
+    shared_ids: List[str] = []
+
+    try:
+        attr = ec2.describe_image_attribute(ImageId=ami_id, Attribute="launchPermission")
+        perms = attr.get("LaunchPermissions", []) or []
+        for perm in perms:
+            if perm.get("Group") == "all":
+                is_public = True
+            uid = perm.get("UserId")
+            if uid and str(uid) != str(account_id):
+                shared_outside = True
+                shared_ids.append(str(uid))
+    except ClientError as exc:
+        log.debug("[ami] describe_image_attribute failed (%s): %s", ami_id, exc)
+
+    if is_public:
+        flags.add("AMIPublic")
+    if shared_outside:
+        flags.add("AMISharedOutsideAccount")
+        signals["SharedWith"] = ",".join(shared_ids)
+
+    return flags, signals
+
+
+def _compute_unencrypted_snapshot_flag(
+    ami: Dict[str, Any],
+    snap_map: Dict[str, Dict[str, Any]],
+) -> Tuple[bool, List[str]]:
+    """Return (has_unencrypted, unencrypted_snapshot_ids)."""
+    unencrypted: List[str] = []
+    for sid in _ami_snapshot_ids(ami):
+        snap = snap_map.get(sid, {})
+        encrypted = bool(snap.get("Encrypted"))
+        if not encrypted:
+            unencrypted.append(sid)
+    return bool(unencrypted), unencrypted
+
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_ami_unused_and_snapshot_cost(  # pylint: disable=unused-argument
-    *args,
+def run_check(  # pylint: disable=unused-argument
+    *args: Any,
     logger: Optional[logging.Logger] = None,
-    min_age_days: int = 14,
-    **kwargs,
+    min_unused_age_days: int = 14,
+    old_age_days: int = 180,
+    **kwargs: Any,
 ) -> None:
     """
-    Flag AMIs not referenced by any instance / LT / LC.
-    Potential saving = sum of monthly snapshot storage tied to the AMI.
+    Run AMI checks and write one row per AMI with merged flags.
+
+    The checker writes a row only if at least one test matches.
     """
     log = _logger(kwargs.get("logger") or logger)
 
-    autoscaling = kwargs.get("autoscaling")  # optional
     try:
         writer, ec2 = _extract_writer_ec2(args, kwargs)
     except TypeError as exc:
-        log.warning("[check_ami_unused_and_snapshot_cost] Skipping: %s", exc)
+        log.warning("[ami] Skipping: %s", exc)
         return
+
+    autoscaling = kwargs.get("autoscaling")
+
     if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        log.warning("[check_ami_unused_and_snapshot_cost] Skipping: checker config not provided.")
+        log.warning("[ami] Skipping: checker config not provided.")
         return
 
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
-    min_created = now_utc - timedelta(days=int(min_age_days))
+    now = datetime.now(timezone.utc).replace(microsecond=0)
 
-    # All owned images
+    # Load AMIs
     try:
-        imgs = ec2.describe_images(Owners=["self"]).get("Images", []) or []
+        images = ec2.describe_images(Owners=["self"]).get("Images", []) or []
     except ClientError as exc:
-        log.error("[check_ami_unused_and_snapshot_cost] describe_images failed: %s", exc)
+        log.error("[ami] describe_images failed: %s", exc)
         return
 
-    # Build set of used AMI ids
-    used_ids, inst_cnt, lt_cnt = _gather_used_image_ids(ec2, log, autoscaling=autoscaling)
+    # Used AMI ids (for unused check)
+    used_ids, instances_scanned, templates_scanned = _gather_used_image_ids(
+        ec2,
+        log,
+        autoscaling=autoscaling,
+    )
 
-    # Collect all backing snapshot ids for cost calc
-    all_snap_ids: List[str] = []
-    for ami in imgs:
-        all_snap_ids.extend(_ami_snapshot_ids(ami))
-    snap_map = _describe_snapshots_map(ec2, list(set(all_snap_ids)), log)
+    # Snapshot map for cost + encryption checks
+    all_snapshot_ids: List[str] = []
+    for ami in images:
+        all_snapshot_ids.extend(_ami_snapshot_ids(ami))
+    snap_map = _describe_snapshots_map(ec2, all_snapshot_ids, log)
 
-    for ami in imgs:
-        ami_id = ami.get("ImageId") or ""
-        name = ami.get("Name") or ami_id
-        created = _creation_dt(ami)
-        if created and created > now_utc:
-            created = now_utc  # guard
-        if created and created > min_created:
-            continue  # too new, skip to avoid false positives
+    # Aggregate findings per AMI
+    findings: Dict[str, AmiFinding] = {}
 
-        if ami_id in used_ids:
-            continue  # in use somewhere
+    min_created_cutoff = now - timedelta(days=int(min_unused_age_days))
+    old_cutoff = now - timedelta(days=int(old_age_days))
 
-        est = _estimate_ami_snapshot_cost(ami, snap_map)
-        flags = ["AMIUnused"]
-
-        signals = _signals_str(
-            {
-                "Region": region,
-                "ImageId": ami_id,
-                "Name": name,
-                "CreatedAt": _to_utc_iso(created),
-                "InstancesScanned": inst_cnt,
-                "TemplatesScanned": lt_cnt,
-                "SnapshotCount": len(_ami_snapshot_ids(ami)),
-                "EstSnapshotMonthly": round(est, 2),
-                "MinAgeDays": min_age_days,
-            }
-        )
-
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=ami_id,
-                name=name,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="AMI",
-                estimated_cost=est,
-                potential_saving=est,
-                flags=flags,
-                confidence=100,
-                signals=signals,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_ami_unused_and_snapshot_cost] write_row %s: %s", ami_id, exc)
-
-        log.info("[check_ami_unused_and_snapshot_cost] Wrote: %s (est=%.2f)", ami_id, est)
-
-
-# ------------------------ 3) Old AMIs (age based) ------------------------ #
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ami_old_images(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    age_days: int = 180,
-    **kwargs,
-) -> None:
-    """
-    Flag very old AMIs (CreationDate older than 'age_days').
-    Potential saving = monthly snapshot storage estimate for the AMI.
-    """
-    log = _logger(kwargs.get("logger") or logger)
-
-    try:
-        writer, ec2 = _extract_writer_ec2(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_ami_old_images] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW and config.GET_PRICE):
-        log.warning("[check_ami_old_images] Skipping: checker config not provided.")
-        return
-
-    region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=int(age_days))).replace(microsecond=0)
-
-    try:
-        imgs = ec2.describe_images(Owners=["self"]).get("Images", []) or []
-    except ClientError as exc:
-        log.error("[check_ami_old_images] describe_images failed: %s", exc)
-        return
-
-    # Preload snapshot info map for all AMIs
-    all_snap_ids: List[str] = []
-    for ami in imgs:
-        all_snap_ids.extend(_ami_snapshot_ids(ami))
-    snap_map = _describe_snapshots_map(ec2, list(set(all_snap_ids)), log)
-
-    for ami in imgs:
-        ami_id = ami.get("ImageId") or ""
-        name = ami.get("Name") or ami_id
-        created = _creation_dt(ami)
-        if not created or created >= cutoff:
+    for ami in images:
+        ami_id = str(ami.get("ImageId") or "")
+        if not ami_id:
             continue
 
-        est = _estimate_ami_snapshot_cost(ami, snap_map)
+        name = str(ami.get("Name") or ami_id)
+        created_at = _parse_creation_date(ami)
 
-        signals = _signals_str(
+        if ami_id not in findings:
+            findings[ami_id] = AmiFinding(
+                ami_id=ami_id,
+                name=name,
+                created_at=created_at,
+                region=region,
+            )
+
+        finding = findings[ami_id]
+        finding.add_signals(
             {
                 "Region": region,
                 "ImageId": ami_id,
                 "Name": name,
-                "CreatedAt": _to_utc_iso(created),
-                "AgeDays": age_days,
-                "SnapshotCount": len(_ami_snapshot_ids(ami)),
-                "EstSnapshotMonthly": round(est, 2),
+                "CreatedAt": _to_utc_iso(created_at),
             }
         )
 
-        try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=ami_id,
-                name=name,
-                owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
-                resource_type="AMI",
-                estimated_cost=est,
-                potential_saving=est,
-                flags=["AMIOld"],
-                confidence=100,
-                signals=signals,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_ami_old_images] write_row failed for %s: %s", ami_id, exc)
+        # Common cost basis (computed once per AMI)
+        snapshot_count = len(_ami_snapshot_ids(ami))
+        monthly_snapshot_cost = _estimate_ami_snapshot_cost(ami, snap_map)
+        finding.add_signals(
+            {
+                "SnapshotCount": snapshot_count,
+                "EstSnapshotMonthly": round(monthly_snapshot_cost, 2),
+            }
+        )
 
-        log.info("[check_ami_old_images] Wrote: %s (age>%dd est=%.2f)", ami_id, age_days, est)
+        # Test 1: public/shared
+        pub_flags, pub_signals = _compute_public_shared_flags(
+            ec2=ec2,
+            ami_id=ami_id,
+            ami=ami,
+            account_id=str(config.ACCOUNT_ID),
+            log=log,
+        )
+        for flag in pub_flags:
+            finding.add_flag(flag)
+        finding.add_signals(pub_signals)
 
+        # Test 2: unused (and mature enough)
+        # "unused" means not referenced by instances/LT/LC.
+        if ami_id not in used_ids:
+            too_new = created_at is not None and created_at > min_created_cutoff
+            if not too_new:
+                finding.add_flag("AMIUnused")
+                finding.add_signals(
+                    {
+                        "MinUnusedAgeDays": int(min_unused_age_days),
+                        "InstancesScanned": instances_scanned,
+                        "TemplatesScanned": templates_scanned,
+                    }
+                )
+                # Savings basis: snapshot storage (count once even if other tests match)
+                finding.set_costs_once(monthly_snapshot_cost)
 
-# ------------- 4) AMIs backed by unencrypted EBS snapshots -------------- #
+        # Test 3: old
+        if created_at is not None and created_at < old_cutoff:
+            finding.add_flag("AMIOld")
+            finding.add_signals({"OldAgeDays": int(old_age_days)})
+            # Same savings basis as unused: snapshot storage (do not double count)
+            finding.set_costs_once(monthly_snapshot_cost)
 
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ami_unencrypted_snapshots(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    **kwargs,
-) -> None:
-    """Flag AMIs whose EBS block device snapshots are unencrypted."""
-    log = _logger(kwargs.get("logger") or logger)
+        # Test 4: unencrypted snapshots
+        has_unenc, unenc_ids = _compute_unencrypted_snapshot_flag(ami, snap_map)
+        if has_unenc:
+            finding.add_flag("AMIBackedByUnencryptedSnapshots")
+            finding.add_signals({"UnencryptedSnapshots": ",".join(unenc_ids)})
 
-    try:
-        writer, ec2 = _extract_writer_ec2(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_ami_unencrypted_snapshots] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ami_unencrypted_snapshots] Skipping: checker config not provided.")
-        return
-
-    region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-
-    try:
-        imgs = ec2.describe_images(Owners=["self"]).get("Images", []) or []
-    except ClientError as exc:
-        log.error("[check_ami_unencrypted_snapshots] describe_images failed: %s", exc)
-        return
-
-    # Preload snapshot encryption map
-    all_snap_ids: List[str] = []
-    for ami in imgs:
-        all_snap_ids.extend(_ami_snapshot_ids(ami))
-    snap_map = _describe_snapshots_map(ec2, list(set(all_snap_ids)), log)
-
-    for ami in imgs:
-        ami_id = ami.get("ImageId") or ""
-        name = ami.get("Name") or ami_id
-        created = _creation_dt(ami)
-
-        unenc: List[str] = []
-        for sid in _ami_snapshot_ids(ami):
-            enc = bool(snap_map.get(sid, {}).get("Encrypted"))
-            if not enc:
-                unenc.append(sid)
-
-        if not unenc:
+    # Write rows: only AMIs with at least one flag
+    wrote = 0
+    for finding in findings.values():
+        if not finding.flags:
             continue
 
-        signals = _signals_str(
-            {
-                "Region": region,
-                "ImageId": ami_id,
-                "Name": name,
-                "CreatedAt": _to_utc_iso(created),
-                "UnencryptedSnapshots": ",".join(unenc),
-            }
-        )
+        signals = _signals_str(finding.signals)
+        flags_sorted = sorted(finding.flags)
 
         try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
+            # config.WRITE_ROW is the standard writer wrapper used across checkers.
+            config.WRITE_ROW(  # type: ignore[call-arg]
                 writer=writer,
-                resource_id=ami_id,
-                name=name,
+                resource_id=finding.ami_id,
+                name=finding.name,
                 owner_id=config.ACCOUNT_ID,  # type: ignore[arg-type]
                 resource_type="AMI",
-                estimated_cost=0.0,
-                potential_saving=0.0,
-                flags=["AMIBackedByUnencryptedSnapshots"],
-                confidence=100,
+                estimated_cost=float(finding.estimated_cost),
+                potential_saving=float(finding.potential_saving),
+                flags=flags_sorted,
+                confidence=int(finding.confidence),
                 signals=signals,
             )
         except Exception as exc:  # pylint: disable=broad-except
-            log.warning("[check_ami_unencrypted_snapshots] write_row %s: %s", ami_id, exc)
+            log.warning("[ami] write_row failed for %s: %s", finding.ami_id, exc)
+            continue
 
-        log.info("[check_ami_unencrypted_snapshots] Wrote: %s (unencrypted snaps=%d)",
-                 ami_id, len(unenc))
+        wrote += 1
+
+    log.info("[ami] Completed. AMIs scanned=%d, rows written=%d", len(images), wrote)
