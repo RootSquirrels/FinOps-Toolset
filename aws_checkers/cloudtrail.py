@@ -64,9 +64,23 @@ def _extract_writer_client(
 # ---------------------------------------------------------------------------
 
 def _list_trails(ct: BaseClient) -> List[Dict[str, Any]]:
-    """List all trails (include shadow trails)."""
-    resp = ct.list_trails(includeShadowTrails=True)
-    return list(resp.get("Trails", []) or [])
+    """List all trails (include shadow trails) with pagination."""
+    trails: List[Dict[str, Any]] = []
+    token: Optional[str] = None
+
+    while True:
+        params: Dict[str, Any] = {"IncludeShadowTrails": True}
+        if token:
+            params["NextToken"] = token
+
+        resp = ct.list_trails(**params)
+        trails.extend(resp.get("Trails", []) or [])
+
+        token = resp.get("NextToken")
+        if not token:
+            break
+
+    return trails
 
 
 def _get_trail(ct: BaseClient, arn: str) -> Dict[str, Any]:
