@@ -508,8 +508,6 @@ def check_s3_cost_and_compliance(  # noqa: D401
     if target_region and target_region != "GLOBAL":
         buckets_by_region = {target_region: buckets_by_region.get(target_region, [])}
 
-    rows: List[Dict[str, Any]] = []
-
     for bucket_region, region_buckets in buckets_by_region.items():
         if not region_buckets:
             continue
@@ -595,15 +593,3 @@ def check_s3_cost_and_compliance(  # noqa: D401
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 log.warning("[s3] write_row failed for %s: %s", name, exc)
-
-            rows.append(
-                {
-                    "bucket": name,
-                    "region": bucket_region,
-                    "size_gb": size_gb,
-                    "objects": objects,
-                    "potential": float(best_saving or 0.0),
-                }
-            )
-
-    return rows
