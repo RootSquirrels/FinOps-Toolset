@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import boto3
-
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import boto3
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError
 
