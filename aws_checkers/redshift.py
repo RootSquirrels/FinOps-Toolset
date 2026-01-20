@@ -17,34 +17,85 @@ from core.cloudwatch import CloudWatchBatcher
 
 
 # ---------------------------------------------------------------------------
+# Call normalization
+# ---------------------------------------------------------------------------
+
+def _split_region_from_args(
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Tuple[Optional[str], Tuple[Any, ...]]:
+    """Normalize region + remaining args for orchestrator and legacy calls.
+
+    Returns (region, remaining_args).
+
+    Accepted patterns:
+      - Orchestrator: fn(writer, **kwargs) -> region in kwargs (optional)
+      - Legacy: fn(region, writer, ...) -> first arg is region str
+    """
+    region = kwargs.get("region")
+    if region:
+        return str(region), args
+
+    if args and isinstance(args[0], str) and len(args) >= 2:
+        return str(args[0]), args[1:]
+
+    return None, args
+
+
+def _infer_region_from_clients(
+    cloudwatch: Optional[BaseClient],
+    redshift: Optional[BaseClient],
+) -> str:
+    """Infer region from cloudwatch/redshift meta; fallback to 'GLOBAL'."""
+    for client in (cloudwatch, redshift):
+        if client is None:
+            continue
+        r = getattr(getattr(client, "meta", None), "region_name", None)
+        if r:
+            return str(r)
+    return "GLOBAL"
+
+
+# ---------------------------------------------------------------------------
 # Extractors
 # ---------------------------------------------------------------------------
 
 def _extract_writer_client(
     args: Tuple[Any, ...], kwargs: Dict[str, Any]
 ) -> Tuple[Any, BaseClient]:
-    """Extract (writer, client) from args/kwargs; raise if missing."""
+    """Extract (writer, redshift client) from args/kwargs; raise if missing.
+
+    Supports:
+      - Orchestrator: writer in args[0], client in kwargs['client']
+      - Legacy: client in kwargs['redshift'] or args[1]
+    """
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    client = kwargs.get("redshift", args[1] if len(args) >= 2 else None)
+    client = kwargs.get("client", kwargs.get("redshift", args[1] if len(args) >= 2 else None))
     if writer is None or client is None:
-        raise TypeError("Expected 'writer' and 'redshift'")
+        raise TypeError("Expected 'writer' and Redshift client as 'client' (or legacy 'redshift')")
     return writer, client
 
 
 def _extract_writer_cw_client(
     args: Tuple[Any, ...], kwargs: Dict[str, Any]
 ) -> Tuple[Any, BaseClient, BaseClient]:
-    """Extract (writer, cloudwatch, redshift) from args/kwargs; raise if missing."""
+    """Extract (writer, cloudwatch, redshift) from args/kwargs; raise if missing.
+
+    Supports:
+      - Orchestrator: writer in args[0], cloudwatch in kwargs['cloudwatch'],
+                      redshift in kwargs['client']
+      - Legacy: cloudwatch in kwargs['cloudwatch'] or args[1], redshift in kwargs['redshift'] or args[2]
+    """
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    cloudwatch = kwargs.get("cloudwatch", args[1] if len(args) >= 2 else None)
-    redshift = kwargs.get("redshift", args[2] if len(args) >= 3 else None)
+    cloudwatch = kwargs.get("cloudwatch", kwargs.get("cw", args[1] if len(args) >= 2 else None))
+    redshift = kwargs.get("client", kwargs.get("redshift", args[2] if len(args) >= 3 else None))
     if writer is None or cloudwatch is None or redshift is None:
-        raise TypeError("Expected 'writer', 'cloudwatch' and 'redshift'")
+        raise TypeError("Expected 'writer', 'cloudwatch' and Redshift client as 'client' (or 'redshift')")
     return writer, cloudwatch, redshift
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (unchanged)
 # ---------------------------------------------------------------------------
 
 def _paginate(
@@ -76,10 +127,7 @@ def _avg_series(points: Sequence[Tuple[datetime, float]]) -> float:
 
 
 def _node_hourly(node_type: str) -> float:
-    """Resolve hourly price for a Redshift node type via price map.
-
-    Looks up: Redshift / NODE_HOURLY.<node_type> (e.g., ra3.4xlarge)
-    """
+    """Resolve hourly price for a Redshift node type via price map."""
     key = f"NODE_HOURLY.{(node_type or '').strip()}"
     try:
         return float(chk.safe_price("REDSHIFT", key, 0.0))  # type: ignore[arg-type]
@@ -103,10 +151,7 @@ def _cw_dims_cluster(cluster_id: str) -> List[Dict[str, str]]:
 def _list_clusters(redshift: BaseClient) -> List[Dict[str, Any]]:
     """Describe provisioned Redshift clusters (serverless not included)."""
     out: List[Dict[str, Any]] = []
-    for c in _paginate(
-        redshift.describe_clusters, page_key="Clusters", token_key="Marker"
-    ):
-        # Skip serverless/unknown shapes (provisioned clusters have NodeType)
+    for c in _paginate(redshift.describe_clusters, page_key="Clusters", token_key="Marker"):
         if not c.get("NodeType"):
             continue
         out.append(c)
@@ -132,7 +177,6 @@ def _list_manual_snapshots(redshift: BaseClient) -> List[Dict[str, Any]]:
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_redshift_idle_clusters(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 14,
@@ -140,19 +184,18 @@ def check_redshift_idle_clusters(  # noqa: D401
     cpu_threshold: float = 5.0,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
-    """Flag provisioned clusters with tiny query count and low CPU for days.
-
-    Metrics:
-      - AWS/Redshift: QueriesCompleted (Sum), CPUUtilization (Average)
-    Potential saving: full monthly node cost (conservative; pause/resize/delete).
-    """
+    """Flag provisioned clusters with tiny query count and low CPU for days."""
     log = _logger(kwargs.get("logger") or logger)
 
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, cloudwatch, redshift = _extract_writer_cw_client(args, kwargs)
+        writer, cloudwatch, redshift = _extract_writer_cw_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_redshift_idle_clusters] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_clients(cloudwatch, redshift)
 
     owner = str(kwargs.get("account_id") or chk.ACCOUNT_ID or "")
     if not (owner and chk.WRITE_ROW):
@@ -166,16 +209,16 @@ def check_redshift_idle_clusters(  # noqa: D401
     start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     end = datetime.now(timezone.utc)
 
-    # Batch metrics
     batch = CloudWatchBatcher(region, client=cloudwatch)
     items: List[Tuple[str, str, str, int]] = []  # (arn, id, node_type, nodes)
 
     for idx, c in enumerate(clusters):
         cid = str(c.get("ClusterIdentifier") or f"cluster-{idx}")
-        arn = str(c.get("ClusterNamespaceArn") or c.get("ClusterNamespaceArn", cid))
+        arn = str(c.get("ClusterNamespaceArn") or cid)
         node_type = str(c.get("NodeType") or "")
         nodes = int(c.get("NumberOfNodes") or 1)
         dims = _cw_dims_cluster(cid)
+
         batch.add_q(
             id_hint=f"q_{idx}",
             namespace="AWS/Redshift",
@@ -225,8 +268,7 @@ def check_redshift_idle_clusters(  # noqa: D401
         )
 
         try:
-            # type: ignore[call-arg]
-            chk.WRITE_ROW(
+            chk.WRITE_ROW(  # type: ignore[call-arg]
                 writer=writer,
                 resource_id=arn,
                 name=cid,
@@ -255,24 +297,23 @@ def check_redshift_idle_clusters(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_redshift_stale_snapshots(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     older_than_days: int = 30,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
-    """Flag manual snapshots older than N days (storage cost with little value).
-
-    Redshift snapshot API does not always expose an exact size field uniformly;
-    when size is unavailable, emit price *rates* in signals and set saving=None.
-    """
+    """Flag manual snapshots older than N days (storage cost with little value)."""
     log = _logger(kwargs.get("logger") or logger)
 
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, redshift = _extract_writer_client(args, kwargs)
+        writer, redshift = _extract_writer_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_redshift_stale_snapshots] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_clients(None, redshift)
 
     owner = str(kwargs.get("account_id") or chk.ACCOUNT_ID or "")
     if not (owner and chk.WRITE_ROW):
@@ -284,9 +325,7 @@ def check_redshift_stale_snapshots(  # noqa: D401
         return []
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=int(older_than_days))
-    rows: List[Dict[str, Any]] = []
-
-    p_gb_mo = _snapshot_gb_month()  # may be 0.0 if key missing
+    p_gb_mo = _snapshot_gb_month()
 
     for s in snapshots:
         sid = str(s.get("SnapshotIdentifier") or "")
@@ -294,6 +333,7 @@ def check_redshift_stale_snapshots(  # noqa: D401
         cid = str(s.get("ClusterIdentifier") or "")
         created = s.get("SnapshotCreateTime")
         created_iso = _to_utc_iso(created)
+
         if not created or not isinstance(created, datetime):
             continue
         if created.tzinfo is None:
@@ -301,7 +341,6 @@ def check_redshift_stale_snapshots(  # noqa: D401
         if created > cutoff:
             continue
 
-        # Try multiple possible size fields; fall back to None
         size_mb = (
             s.get("TotalBackupSizeInMegaBytes")
             or s.get("ActualIncrementalBackupSizeInMegaBytes")
@@ -310,7 +349,6 @@ def check_redshift_stale_snapshots(  # noqa: D401
         )
         size_gb = float(size_mb) / 1024.0 if isinstance(size_mb, (int, float)) else None
 
-        # If size or price is unknown, keep potential_saving=None (conservative)
         potential = None
         if size_gb is not None and p_gb_mo > 0.0:
             potential = round(float(size_gb) * float(p_gb_mo), 2)
@@ -326,8 +364,7 @@ def check_redshift_stale_snapshots(  # noqa: D401
         )
 
         try:
-            # type: ignore[call-arg]
-            chk.WRITE_ROW(
+            chk.WRITE_ROW(  # type: ignore[call-arg]
                 writer=writer,
                 resource_id=arn,
                 name=sid or arn,
@@ -344,7 +381,3 @@ def check_redshift_stale_snapshots(  # noqa: D401
             )
         except Exception as exc:  # pylint: disable=broad-except
             log.warning("[redshift] write_row(snapshot) failed: %s", exc)
-
-        rows.append({"snapshot": sid, "potential": potential or 0.0})
-
-    return rows
