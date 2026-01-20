@@ -17,20 +17,56 @@ from core.cloudwatch import CloudWatchBatcher
 
 
 # ---------------------------------------------------------------------------
-# Extractor
+# Call normalization & Extractor
 # ---------------------------------------------------------------------------
+
+
+def _split_region_from_args(
+    args: Tuple[Any, ...], kwargs: Dict[str, Any]
+) -> Tuple[Optional[str], Tuple[Any, ...]]:
+    """Normalize region + remaining args for orchestrator and legacy calls.
+
+    Accepted patterns:
+      - Orchestrator: fn(writer, **kwargs) -> region may be in kwargs (optional)
+      - Legacy: fn(region, writer, ...) -> first arg is region str
+    """
+    region_kw = kwargs.get("region")
+    if isinstance(region_kw, str) and region_kw:
+        return region_kw, args
+
+    if args and isinstance(args[0], str) and len(args) >= 2:
+        return str(args[0]), args[1:]
+
+    return None, args
+
+
+def _infer_region_from_clients(cloudwatch: Optional[BaseClient], kafka: Optional[BaseClient]) -> str:
+    """Infer region from boto3 client meta; fallback to 'GLOBAL'."""
+    for client in (cloudwatch, kafka):
+        if client is None:
+            continue
+        r = getattr(getattr(client, "meta", None), "region_name", None)
+        if r:
+            return str(r)
+    return "GLOBAL"
 
 
 def _extract_writer_cw_client(
     args: Tuple[Any, ...], kwargs: Dict[str, Any]
 ) -> Tuple[Any, BaseClient, BaseClient]:
-    """Extract (writer, cloudwatch, client) from args/kwargs; raise if missing."""
+    """Extract (writer, cloudwatch, kafka) from args/kwargs; raise if missing.
+
+    Supports:
+      - Orchestrator: writer positional, cloudwatch=..., client=... (kafka)
+      - Legacy: fn(region, writer, cloudwatch, kafka)
+      - Back-compat: kafka may also be provided as 'kafka='
+    """
     writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
     cloudwatch = kwargs.get("cloudwatch", args[1] if len(args) >= 2 else None)
-    client = kwargs.get("kafka", args[2] if len(args) >= 3 else None)
-    if writer is None or cloudwatch is None or client is None:
-        raise TypeError("Expected 'writer', 'cloudwatch' and 'kafka'")
-    return writer, cloudwatch, client
+    kafka = kwargs.get("client", kwargs.get("kafka", args[2] if len(args) >= 3 else None))
+    if writer is None or cloudwatch is None or kafka is None:
+        raise TypeError("Expected 'writer', 'cloudwatch' and Kafka client as 'client' (or 'kafka')")
+    return writer, cloudwatch, kafka
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +110,6 @@ def _broker_hourly(instance_type: str) -> float:
         MSK / BROKER_HOURLY.<type>
     """
     it = (instance_type or "").strip()
-    # common MSK instance types come as 'kafka.m5.large' -> strip 'kafka.' prefix
     it = it.replace("kafka.", "")
     key = f"BROKER_HOURLY.{it}"
     try:
@@ -94,14 +129,12 @@ def _storage_gb_month_price() -> float:
 def _fetch_clusters(kafka: BaseClient) -> List[Dict[str, Any]]:
     """List clusters using v2 if available, else v1."""
     try:
-        # v2 (preferred)
         return list(
             _paginate(
                 kafka.list_clusters_v2, page_key="ClusterSummaryList", token_key="NextToken"
             )
         )
     except Exception:  # pylint: disable=broad-except
-        # v1 (fallback)
         return list(
             _paginate(kafka.list_clusters, page_key="ClusterInfoList", token_key="NextToken")
         )
@@ -110,7 +143,6 @@ def _fetch_clusters(kafka: BaseClient) -> List[Dict[str, Any]]:
 def _describe_cluster(kafka: BaseClient, arn: str) -> Dict[str, Any]:
     """Describe a cluster; support v2/v1 response shapes."""
     try:
-        # v2
         out = kafka.describe_cluster_v2(ClusterArn=arn)
         return out.get("ClusterInfo", {})  # type: ignore[return-value]
     except Exception:  # pylint: disable=broad-except
@@ -169,7 +201,6 @@ def _cluster_monthly_cost(
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_msk_idle_clusters(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 14,
@@ -182,11 +213,15 @@ def check_msk_idle_clusters(  # noqa: D401
     Potential saving includes broker-hours and provisioned storage.
     """
     log = _logger(kwargs.get("logger") or logger)
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, cloudwatch, kafka = _extract_writer_cw_client(args, kwargs)
+        writer, cloudwatch, kafka = _extract_writer_cw_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_msk_idle_clusters] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_clients(cloudwatch, kafka)
 
     owner = str(kwargs.get("account_id") or config.ACCOUNT_ID or "")
     if not (owner and config.WRITE_ROW):
@@ -200,7 +235,6 @@ def check_msk_idle_clusters(  # noqa: D401
     if not clusters_raw:
         return []
 
-    # Normalize shape -> (arn, name)
     clusters: List[Tuple[str, str]] = []
     for c in clusters_raw:
         arn = c.get("ClusterArn") or c.get("ClusterArnV2") or c.get("ClusterArn", "")
@@ -216,24 +250,20 @@ def check_msk_idle_clusters(  # noqa: D401
     rows: List[Dict[str, Any]] = []
 
     for idx, (arn, name) in enumerate(clusters):
-        # Describe for sizing info
         info = _describe_cluster(kafka, arn)
         group = info.get("BrokerNodeGroupInfo", {})
         count = int(info.get("NumberOfBrokerNodes") or 0)
         instance_type = str(group.get("InstanceType") or "")
         volume_gb = float(
-            (((group.get("StorageInfo") or {}).get("EbsStorageInfo") or {}).get("VolumeSize")
-             or 0.0)
+            (((group.get("StorageInfo") or {}).get("EbsStorageInfo") or {}).get("VolumeSize") or 0.0)
         )
         storage_gb = float(count) * float(volume_gb)
 
-        # Aggregate traffic
         bin_sum = _sum_series(series.get(f"bin_{idx}", []))
         bout_sum = _sum_series(series.get(f"bout_{idx}", []))
         bytes_in_gb = _gb_from_bytes(bin_sum)
         bytes_out_gb = _gb_from_bytes(bout_sum)
 
-        # Idle?
         if (
             bytes_in_gb < float(bytes_threshold_gb)
             and bytes_out_gb < float(bytes_threshold_gb)
@@ -292,7 +322,6 @@ def check_msk_idle_clusters(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_msk_overprovisioned_brokers(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 14,
@@ -307,11 +336,15 @@ def check_msk_overprovisioned_brokers(  # noqa: D401
     Target brokers = max(min_brokers, ceil(brokers * scale_down_factor)).
     """
     log = _logger(kwargs.get("logger") or logger)
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, cloudwatch, kafka = _extract_writer_cw_client(args, kwargs)
+        writer, cloudwatch, kafka = _extract_writer_cw_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_msk_overprovisioned_brokers] Skipping: %s", exc)
         return []
+
+    if not region:
+        region = _infer_region_from_clients(cloudwatch, kafka)
 
     owner = str(kwargs.get("account_id") or config.ACCOUNT_ID or "")
     if not (owner and config.WRITE_ROW):
@@ -337,7 +370,6 @@ def check_msk_overprovisioned_brokers(  # noqa: D401
 
     series = _batch_bytes_metrics(region, cloudwatch, clusters, start, end)
 
-    rows: List[Dict[str, Any]] = []
     hours = float(getattr(const, "HOURS_PER_MONTH", 730))
 
     for idx, (arn, name) in enumerate(clusters):
@@ -354,7 +386,6 @@ def check_msk_overprovisioned_brokers(  # noqa: D401
         if bytes_in_gb >= float(low_traffic_gb):
             continue
 
-        # Proposed target broker count
         target = max(int(min_brokers), int((count * float(scale_down_factor)) + 0.9999))
         if target >= count:
             continue
@@ -393,15 +424,3 @@ def check_msk_overprovisioned_brokers(  # noqa: D401
             )
         except Exception as exc:  # pylint: disable=broad-except
             log.warning("[msk] write_row(overprov) failed: %s", exc)
-
-        rows.append(
-            {
-                "arn": arn,
-                "name": name,
-                "brokers": count,
-                "target": target,
-                "potential": potential or 0.0,
-            }
-        )
-
-    return rows
