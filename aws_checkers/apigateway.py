@@ -6,23 +6,61 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from botocore.exceptions import ClientError
 from botocore.client import BaseClient
+from botocore.exceptions import ClientError
 
 from aws_checkers import config
-from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher
+from core.retry import retry_with_backoff
 from finops_toolset import config as const
 
 
 # ---------------------------------------------------------------------------
-# Logger & extractors (template-consistent)
+# Logger & call normalization
 # ---------------------------------------------------------------------------
 
 def _logger(fallback: Optional[logging.Logger]) -> logging.Logger:
     """Return a usable logger from fallback or config.LOGGER."""
     return fallback or config.LOGGER or logging.getLogger(__name__)
 
+
+def _split_region_from_args(
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Tuple[Optional[str], Tuple[Any, ...]]:
+    """Normalize region + remaining args for orchestrator and legacy calls.
+
+    Returns:
+      (region, remaining_args)
+
+    Accepted patterns:
+      - Orchestrator: fn(writer, **kwargs) -> region in kwargs (optional)
+      - Legacy: fn(region, writer, ...) -> first arg is region str
+    """
+    region = kwargs.get("region")
+    if region:
+        return str(region), args
+
+    if args and isinstance(args[0], str) and len(args) >= 2:
+        return str(args[0]), args[1:]
+
+    return None, args
+
+
+def _infer_region_from_clients(cloudwatch: Optional[BaseClient], client: Optional[BaseClient]) -> str:
+    """Infer region from cloudwatch/client meta; fallback to 'GLOBAL'."""
+    for c in (cloudwatch, client):
+        if c is None:
+            continue
+        r = getattr(getattr(c, "meta", None), "region_name", None)
+        if r:
+            return str(r)
+    return "GLOBAL"
+
+
+# ---------------------------------------------------------------------------
+# Extractors (orchestrator-compatible)
+# ---------------------------------------------------------------------------
 
 def _extract_writer_client(
     args: Tuple[Any, ...], kwargs: Dict[str, Any]
@@ -59,15 +97,6 @@ def _safe_price(service: str, key: str, default: float = 0.0) -> float:
         return float(default)
 
 
-def _iso(dt: Optional[datetime]) -> str:
-    """Return UTC ISO-8601 string, or empty string if missing."""
-    if not dt:
-        return ""
-    if not dt.tzinfo:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
-
-
 def _paginate(fetch_fn, *, page_key: str, token_name: str = "position", **kwargs: Any):
     """Generic paginator for API Gateway list calls (varies by version)."""
     token: Optional[str] = None
@@ -98,16 +127,13 @@ def _ratio(numer: float, denom: float) -> float:
 # Metrics building (REST & HTTP APIs)
 # ---------------------------------------------------------------------------
 
-def _build_rest_stage_queries(
-    api_name: str, stage_name: str, idx: int
-) -> List[Dict[str, Any]]:
+def _build_rest_stage_queries(api_name: str, stage_name: str, idx: int) -> List[Dict[str, Any]]:
     """Create CloudWatchBatcher.add_q specs for a REST API stage."""
     dims = [
         {"Name": "ApiName", "Value": api_name},
         {"Name": "Stage", "Value": stage_name},
     ]
-    q = []
-    # Requests count
+    q: List[Dict[str, Any]] = []
     q.append(
         {
             "Id": f"cnt_{idx}",
@@ -118,7 +144,6 @@ def _build_rest_stage_queries(
             "Period": 3600,
         }
     )
-    # Cache hits/misses (present when cache enabled)
     q.append(
         {
             "Id": f"hit_{idx}",
@@ -187,7 +212,6 @@ def _run_cw_queries(
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_apigw_low_cache_hit_ratio(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 14,
@@ -195,24 +219,18 @@ def check_apigw_low_cache_hit_ratio(  # noqa: D401
     min_requests_sum: float = 100.0,
     **kwargs: Any,
 ) -> None:
-    """Flag REST API stages with cache enabled but low cache hit ratio.
-
-    Pricing keys: APIGW.CACHE_HR.<size> (hourly). Potential saving = hourly × 730.
-
-    Args:
-        writer: CSV writer (positional 1 or kwarg)
-        client: apigateway (REST) boto3 client (positional 2 or kwarg)
-        cloudwatch: (kwarg) CloudWatch client
-        lookback_days: days to aggregate
-        hit_ratio_threshold: minimum acceptable cache hit ratio (0..1)
-        min_requests_sum: only consider stages with requests >= this threshold
-    """
+    """Flag REST API stages with cache enabled but low cache hit ratio."""
     log = _logger(kwargs.get("logger") or logger)
+
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, cloudwatch, apigw = _extract_writer_cw_client(args, kwargs)
+        writer, cloudwatch, apigw = _extract_writer_cw_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_apigw_low_cache_hit_ratio] Skipping: %s", exc)
         return
+
+    if not region:
+        region = _infer_region_from_clients(cloudwatch, apigw)
 
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
         log.warning("[check_apigw_low_cache_hit_ratio] Skipping: missing config.")
@@ -221,7 +239,6 @@ def check_apigw_low_cache_hit_ratio(  # noqa: D401
     start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     end = datetime.now(timezone.utc)
 
-    # Enumerate REST APIs and their stages
     try:
         apis = list(_paginate(apigw.get_rest_apis, page_key="items", token_name="position"))
     except ClientError as exc:
@@ -229,7 +246,6 @@ def check_apigw_low_cache_hit_ratio(  # noqa: D401
         return
 
     stage_specs: List[Tuple[str, str, str, float]] = []
-    # (api_id, api_name, stage_name, cache_size_gb)
     for api in apis:
         api_id = api.get("id", "")
         api_name = api.get("name", api_id)
@@ -252,25 +268,21 @@ def check_apigw_low_cache_hit_ratio(  # noqa: D401
     if not stage_specs:
         return
 
-    # Build one batched CW request for all stages
     queries: List[Dict[str, Any]] = []
     for idx, (_, api_name, stage_name, _) in enumerate(stage_specs):
         queries.extend(_build_rest_stage_queries(api_name, stage_name, idx))
 
     series = _run_cw_queries(region, cloudwatch, queries, start, end)
 
-    # Evaluate each stage
     for idx, (api_id, api_name, stage_name, cache_size_gb) in enumerate(stage_specs):
         hit = _sum_series(series.get(f"hit_{idx}", []))
         miss = _sum_series(series.get(f"miss_{idx}", []))
         req = _sum_series(series.get(f"cnt_{idx}", []))
         ratio = _ratio(hit, hit + miss)
 
-        # Only flag when there's traffic but poor caching
         if req < float(min_requests_sum) or ratio >= float(hit_ratio_threshold):
             continue
 
-        # Hourly cache price for the size, monthly and potential
         price_key = f"CACHE_HR.{cache_size_gb:g}"
         hourly = _safe_price("APIGW", price_key, 0.0)
         monthly = hourly * const.HOURS_PER_MONTH if hourly > 0.0 else 0.0
@@ -280,8 +292,7 @@ def check_apigw_low_cache_hit_ratio(  # noqa: D401
         flags = ["CacheEnabled", f"CacheSizeGB={cache_size_gb:g}", "LowHitRatio"]
 
         try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
+            config.WRITE_ROW(  # type: ignore[call-arg]
                 writer=writer,
                 resource_id=resource_id,
                 name=f"{api_name}:{stage_name}",
@@ -289,13 +300,15 @@ def check_apigw_low_cache_hit_ratio(  # noqa: D401
                 resource_type="APIGatewayStage",
                 region=region,
                 state="InService",
-                creation_date="",  # not exposed on get_stages; leave blank
+                creation_date="",
                 estimated_cost=round(monthly, 2) if monthly else 0.0,
                 potential_saving=round(potential, 2) if potential else None,
                 flags=flags,
                 confidence=85,
-                signals=f"requests_sum={int(req)}|cache_hit_ratio={round(ratio,3)}|"
-                        f"cache_size_gb={cache_size_gb:g}",
+                signals=(
+                    f"requests_sum={int(req)}|cache_hit_ratio={round(ratio, 3)}|"
+                    f"cache_size_gb={cache_size_gb:g}"
+                ),
             )
         except Exception as exc:  # pylint: disable=broad-except
             log.warning("[apigw] write_row(cache-hr) failed: %s", exc)
@@ -307,27 +320,24 @@ def check_apigw_low_cache_hit_ratio(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_apigw_idle_rest_apis(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 14,
     requests_threshold: float = 50.0,
     **kwargs: Any,
 ) -> None:
-    """Flag REST APIs with near-zero requests over the lookback window.
-
-    Args:
-        writer: CSV writer (positional 1 or kwarg)
-        client: apigateway (REST) boto3 client (positional 2 or kwarg)
-        cloudwatch: (kwarg) CloudWatch client
-        requests_threshold: minimum total requests to consider active
-    """
+    """Flag REST APIs with near-zero requests over the lookback window."""
     log = _logger(kwargs.get("logger") or logger)
+
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, cloudwatch, apigw = _extract_writer_cw_client(args, kwargs)
+        writer, cloudwatch, apigw = _extract_writer_cw_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_apigw_idle_rest_apis] Skipping: %s", exc)
         return
+
+    if not region:
+        region = _infer_region_from_clients(cloudwatch, apigw)
 
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
         log.warning("[check_apigw_idle_rest_apis] Skipping: missing config.")
@@ -342,8 +352,7 @@ def check_apigw_idle_rest_apis(  # noqa: D401
         log.warning("[apigw] get_rest_apis failed: %s", exc)
         return
 
-    # Build metrics for all {api,stage} and sum per API
-    stage_index: List[Tuple[str, str, str]] = []  # (api_id, api_name, stage_name)
+    stage_index: List[Tuple[str, str, str]] = []
     for api in apis:
         api_id = api.get("id", "")
         api_name = api.get("name", api_id)
@@ -361,11 +370,10 @@ def check_apigw_idle_rest_apis(  # noqa: D401
 
     queries: List[Dict[str, Any]] = []
     for idx, (_, api_name, stage_name) in enumerate(stage_index):
-        queries.extend(_build_rest_stage_queries(api_name, stage_name, idx=idx)[:1])  # only Count
+        queries.extend(_build_rest_stage_queries(api_name, stage_name, idx=idx)[:1])
 
     series = _run_cw_queries(region, cloudwatch, queries, start, end)
 
-    # Aggregate per API across stages
     requests_sum_by_api: Dict[str, float] = {}
     for idx, (api_id, _api_name, _stage) in enumerate(stage_index):
         cnt = _sum_series(series.get(f"cnt_{idx}", []))
@@ -378,11 +386,9 @@ def check_apigw_idle_rest_apis(  # noqa: D401
         if req >= float(requests_threshold):
             continue
 
-        # Hygiene finding: no base cost modeled here
         resource_id = f"apigw:{api_id}"
         try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
+            config.WRITE_ROW(  # type: ignore[call-arg]
                 writer=writer,
                 resource_id=resource_id,
                 name=api_name,
@@ -407,26 +413,24 @@ def check_apigw_idle_rest_apis(  # noqa: D401
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_apigw_idle_http_apis(  # noqa: D401
-    region: str,
     *args: Any,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 14,
     requests_threshold: float = 50.0,
     **kwargs: Any,
 ) -> None:
-    """Flag HTTP APIs (API Gateway v2) with ~zero requests.
-
-    Args:
-        writer: CSV writer (positional 1 or kwarg)
-        client: apigatewayv2 boto3 client (positional 2 or kwarg)
-        cloudwatch: (kwarg) CloudWatch client
-    """
+    """Flag HTTP APIs (API Gateway v2) with ~zero requests."""
     log = _logger(kwargs.get("logger") or logger)
+
+    region, norm_args = _split_region_from_args(args, kwargs)
     try:
-        writer, cloudwatch, apigw2 = _extract_writer_cw_client(args, kwargs)
+        writer, cloudwatch, apigw2 = _extract_writer_cw_client(norm_args, kwargs)
     except TypeError as exc:
         log.warning("[check_apigw_idle_http_apis] Skipping: %s", exc)
         return
+
+    if not region:
+        region = _infer_region_from_clients(cloudwatch, apigw2)
 
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
         log.warning("[check_apigw_idle_http_apis] Skipping: missing config.")
@@ -441,7 +445,7 @@ def check_apigw_idle_http_apis(  # noqa: D401
         log.warning("[apigw2] get_apis failed: %s", exc)
         return
 
-    stage_index: List[Tuple[str, str]] = []  # (api_id, stage_name)
+    stage_index: List[Tuple[str, str]] = [] # (api_id, stage_name)
     names_by_id: Dict[str, str] = {}
 
     for api in apis:
@@ -480,8 +484,7 @@ def check_apigw_idle_http_apis(  # noqa: D401
 
         resource_id = f"apigw2:{api_id}"
         try:
-            # type: ignore[call-arg]
-            config.WRITE_ROW(
+            config.WRITE_ROW(  # type: ignore[call-arg]
                 writer=writer,
                 resource_id=resource_id,
                 name=name,
