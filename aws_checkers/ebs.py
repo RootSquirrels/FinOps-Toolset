@@ -79,6 +79,16 @@ def _extract_writer_ec2_cw(
     return writer, ec2, cloudwatch
 
 
+def _is_managed_snapshot(tags: Dict[str, str]) -> bool:
+    # AWS Backup
+    if any(k.startswith("aws:backup:") for k in tags):
+        return True
+    # AWS DLM (some orgs use aws:dlm:*, others dlm:*)
+    if any(k.startswith("aws:dlm:") or k.startswith("dlm:") for k in tags):
+        return True
+    return False
+
+
 # ------------------------------- inventories ------------------------------- #
 
 @retry_with_backoff(exceptions=(ClientError,))
@@ -156,15 +166,7 @@ def _ensure_ami_snapshot_ids(ec2, log: logging.Logger) -> Set[str]:
     used: Set[str] = set()
     try:
         paginator = ec2.get_paginator("describe_images")
-        try:
-            # Include self-owned AMIs and AMIs shared to this account (more conservative
-            # for "orphan" detection).
-            pages = paginator.paginate(ExecutableUsers=["self"])
-        except ClientError:
-            # Fallback for partitions/permissions where ExecutableUsers may fail.
-            pages = paginator.paginate(Owners=["self"])
-
-        for page in pages:
+        for page in paginator.paginate(Owners=["self"]):
             for img in page.get("Images", []) or []:
                 for bdm in img.get("BlockDeviceMappings", []) or []:
                     ebs = bdm.get("Ebs") or {}
@@ -237,221 +239,147 @@ def _gp2_to_gp3_saving(vol: Dict[str, Any]) -> float:
     return size * max(0.0, _EBS_GB_MONTH["gp2"] - _EBS_GB_MONTH["gp3"])
 
 
-def _snapshot_upper_bound_monthly_cost(snap: Dict[str, Any]) -> float:
-    """Upper-bound monthly cost estimate for a snapshot.
-
-    EC2 does not expose the actual billable snapshot size (used blocks) via
-    DescribeSnapshots, so using VolumeSize is a worst-case approximation.
-    We keep this value as an *upper bound* and expose it in signals.
-    """
-    size_gib = float(snap.get("VolumeSize") or 0.0)
-    return size_gib * _SNAPSHOT_GB_MONTH
-
-
-def _is_managed_snapshot(tags: Dict[str, str]) -> bool:
-    """Return True when snapshot is managed by AWS Backup / DLM policies."""
-    # AWS Backup adds multiple aws:backup:* tags (recovery point ARN, job id, etc.)
-    if any(k.startswith("aws:backup:") for k in tags):
-        return True
-    # DLM-managed snapshots commonly use aws:dlm:* (or sometimes dlm:*).
-    if any(k.startswith("aws:dlm:") or k.startswith("dlm:") for k in tags):
-        return True
-    return False
+def _snapshot_monthly_cost_guesstimate(snap: Dict[str, Any]) -> float:
+    size = float(snap.get("VolumeSize") or 0.0)
+    return size * _SNAPSHOT_GB_MONTH
 
 
 # --------------------------------- checks --------------------------------- #
 
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_unattached_volumes(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    **kwargs,
-) -> None:
-    """Flag 'available' EBS volumes (not attached)."""
-    log = _logger(kwargs.get("logger") or logger)
-    try:
-        writer, ec2 = _extract_writer_ec2(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_ebs_unattached_volumes] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_unattached_volumes] Skipping: config not provided.")
-        return
+_EBS_ALREADY_RAN: Set[Tuple[int, str, str]] = set()
 
-    region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    for v in _ensure_volumes(ec2, log):
-        if str(v.get("State")) != "available":
+
+def _writer_key(writer: Any) -> int:
+    """Best-effort stable identity for the underlying output stream."""
+    for attr in ("f", "fp", "stream", "file", "buffer", "raw"):
+        stream = getattr(writer, attr, None)
+        if stream is not None:
+            return id(stream)
+    inner = getattr(writer, "writer", None)
+    if inner is not None:
+        for attr in ("f", "fp", "stream", "file", "buffer", "raw"):
+            stream = getattr(inner, attr, None)
+            if stream is not None:
+                return id(stream)
+        return id(inner)
+    return id(writer)
+
+
+def _dedupe_key(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    return (
+        str(row.get("resource_id") or ""),
+        str(row.get("resource_type") or ""),
+        str(row.get("region") or ""),
+        str(row.get("owner_id") or ""),
+    )
+
+
+def _merge_flags(existing: List[str], incoming: List[str]) -> List[str]:
+    if not incoming:
+        return existing
+    if not existing:
+        return list(incoming)
+    seen = set(existing)
+    for f in incoming:
+        if f not in seen:
+            existing.append(f)
+            seen.add(f)
+    return existing
+
+
+def _merge_signals(
+    existing: Dict[str, Any],
+    incoming: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not incoming:
+        return existing
+    if not existing:
+        return dict(incoming)
+    for k, v in incoming.items():
+        if k not in existing:
+            existing[k] = v
             continue
-        tags = tags_to_dict(v.get("Tags"))
-        app_id, app, env = tag_triplet(tags)
-        est = _volume_monthly_cost(v)
-
-        config.WRITE_ROW(
-            writer=writer,
-            resource_id=str(v.get("VolumeId")),
-            name=str(v.get("VolumeId")),
-            resource_type="EBSVolume",
-            region=region,
-            owner_id=config.ACCOUNT_ID,
-            flags=["EBSUnattachedVolume"],
-            estimated_cost=0.0,
-            potential_saving=est,
-            signals={
-                "Region": region,
-                "Type": v.get("VolumeType"),
-                "Encrypted": bool(v.get("Encrypted")),
-                "AZ": v.get("AvailabilityZone"),
-            },
-            state=str(v.get("State") or ""),
-            creation_date=_iso(v.get("CreateTime")),
-            storage_gb=float(v.get("Size") or 0.0),
-            app_id=app_id,
-            app=app,
-            env=env,
-        )
-
-    log.info("[ebs] Completed check_ebs_unattached_volumes")
+        if existing.get(k) in (None, "", "NULL") and v not in (None, "", "NULL"):
+            existing[k] = v
+    return existing
 
 
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_gp2_not_gp3(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    **kwargs,
-) -> None:
-    """Flag gp2 volumes as gp3 migration candidates; include potential saving."""
-    log = _logger(kwargs.get("logger") or logger)
+def _max_float(a: Any, b: Any) -> float:
     try:
-        writer, ec2 = _extract_writer_ec2(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_ebs_gp2_not_gp3] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_gp2_not_gp3] Skipping: config not provided.")
+        fa = float(a)
+    except Exception:  # pylint: disable=broad-except
+        fa = 0.0
+    try:
+        fb = float(b)
+    except Exception:  # pylint: disable=broad-except
+        fb = 0.0
+    return fa if fa >= fb else fb
+
+
+def _collect_row(
+    rows: Dict[Tuple[str, str, str, str], Dict[str, Any]],
+    row: Dict[str, Any],
+) -> None:
+    """Collect/merge a finding row for unique output (one row per resource)."""
+    key = _dedupe_key(row)
+    existing = rows.get(key)
+    if existing is None:
+        if row.get("flags") is None:
+            row["flags"] = []
+        if row.get("signals") is None:
+            row["signals"] = {}
+        rows[key] = row
         return
 
-    region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    for v in _ensure_volumes(ec2, log):
-        if str(v.get("VolumeType")).lower() != "gp2":
+    existing["flags"] = _merge_flags(
+        list(existing.get("flags") or []), list(row.get("flags") or [])
+    )
+    existing["signals"] = _merge_signals(
+        dict(existing.get("signals") or {}), dict(row.get("signals") or {})
+    )
+    existing["estimated_cost"] = _max_float(
+        existing.get("estimated_cost"), row.get("estimated_cost")
+    )
+    existing["potential_saving"] = _max_float(
+        existing.get("potential_saving"), row.get("potential_saving")
+    )
+
+    for k, v in row.items():
+        if k in ("flags", "signals", "estimated_cost", "potential_saving"):
             continue
-        tags = tags_to_dict(v.get("Tags"))
-        app_id, app, env = tag_triplet(tags)
-        est = _volume_monthly_cost(v)
-        pot = _gp2_to_gp3_saving(v)
-
-        config.WRITE_ROW(
-            writer=writer,
-            resource_id=str(v.get("VolumeId")),
-            name=str(v.get("VolumeId")),
-            resource_type="EBSVolume",
-            region=region,
-            owner_id=config.ACCOUNT_ID,
-            flags=["EBSGp2ToGp3Candidate"],
-            estimated_cost=est,
-            potential_saving=pot,
-            signals={
-                "Region": region,
-                "Type": v.get("VolumeType"),
-                "Encrypted": bool(v.get("Encrypted")),
-                "AZ": v.get("AvailabilityZone"),
-                "SavingPerGB": round(
-                    max(0.0, _EBS_GB_MONTH["gp2"] - _EBS_GB_MONTH["gp3"]), 4
-                ),
-            },
-            state=str(v.get("State") or ""),
-            creation_date=_iso(v.get("CreateTime")),
-            storage_gb=float(v.get("Size") or 0.0),
-            app_id=app_id,
-            app=app,
-            env=env,
-        )
-
-    log.info("[ebs] Completed check_ebs_gp2_not_gp3")
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_unencrypted_volumes(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    **kwargs,
-) -> None:
-    """Flag unencrypted EBS volumes."""
-    log = _logger(kwargs.get("logger") or logger)
-    try:
-        writer, ec2 = _extract_writer_ec2(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_ebs_unencrypted_volumes] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_unencrypted_volumes] Skipping: config not provided.")
-        return
-
-    region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    for v in _ensure_volumes(ec2, log):
-        if bool(v.get("Encrypted")):
-            continue
-        tags = tags_to_dict(v.get("Tags"))
-        app_id, app, env = tag_triplet(tags)
-        est = _volume_monthly_cost(v)
-
-        config.WRITE_ROW(
-            writer=writer,
-            resource_id=str(v.get("VolumeId")),
-            name=str(v.get("VolumeId")),
-            resource_type="EBSVolume",
-            region=region,
-            owner_id=config.ACCOUNT_ID,
-            flags=["EBSVolumeUnencrypted"],
-            estimated_cost=est,
-            potential_saving=0.0,
-            signals={"Region": region, "Type": v.get("VolumeType"), "AZ": v.get("AvailabilityZone")},
-            state=str(v.get("State") or ""),
-            creation_date=_iso(v.get("CreateTime")),
-            storage_gb=float(v.get("Size") or 0.0),
-            app_id=app_id,
-            app=app,
-            env=env,
-        )
-
-    log.info("[ebs] Completed check_ebs_unencrypted_volumes")
+        cur = existing.get(k)
+        if cur in (None, "", "NULL") and v not in (None, "", "NULL"):
+            existing[k] = v
 
 
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    window_days: int = 7,
-    **kwargs,
-) -> None:
-    """Heuristic: flag attached volumes with very low I/O in the lookback window."""
-    log = _logger(kwargs.get("logger") or logger)
-    try:
-        writer, ec2, cw = _extract_writer_ec2_cw(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_ebs_volumes_low_utilization] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_volumes_low_utilization] Skipping: config not provided.")
-        return
-    if CloudWatchBatcher is None or cw is None:
-        log.debug("[ebs] CloudWatchBatcher unavailable; skipping low-util check.")
-        return
+def _cw_low_util_rows(
+    cloudwatch,
+    vols: List[Dict[str, Any]],
+    region: str,
+    window_days: int,
+    log: logging.Logger,
+) -> List[Dict[str, Any]]:
+    if CloudWatchBatcher is None or cloudwatch is None:
+        return []
 
-    region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    vols = [v for v in _ensure_volumes(ec2, log) if str(v.get("State")) == "in-use"]
-    if not vols:
-        log.info("[ebs] No in-use volumes for low-utilization check")
-        return
+    in_use = [v for v in vols if str(v.get("State")) == "in-use"]
+    if not in_use:
+        return []
 
     start = datetime.now(timezone.utc) - timedelta(days=int(window_days))
     end = datetime.now(timezone.utc)
 
     try:
-        batch = CloudWatchBatcher(region=region, client=cw)
-        for v in vols:
+        batch = CloudWatchBatcher(region=region, client=cloudwatch)
+        for v in in_use:
             vid = str(v.get("VolumeId"))
             dims = [("VolumeId", vid)]
-            for metric in ("VolumeReadBytes", "VolumeWriteBytes",
-                           "VolumeReadOps", "VolumeWriteOps"):
+            for metric in (
+                "VolumeReadBytes",
+                "VolumeWriteBytes",
+                "VolumeReadOps",
+                "VolumeWriteOps",
+            ):
                 batch.add_q(
                     id_hint=f"{metric}_{vid}",
                     namespace="AWS/EBS",
@@ -461,283 +389,342 @@ def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
                     period=3600,
                 )
         results = batch.execute(start=start, end=end)
-    except ClientError as exc:
-        log.debug("[ebs] CloudWatch metrics failed: %s", exc)
-        return
     except Exception as exc:  # pylint: disable=broad-except
-        log.debug("[ebs] CloudWatch batch error: %s", exc)
-        return
+        log.debug("[ebs] CloudWatch batch failed: %s", exc)
+        return []
 
-    def _sum(mid: str) -> float:
+    def _last(mid: str) -> float:
         series = results.get(mid)
         if isinstance(series, list) and series:
-            total = 0.0
-            for item in series:
-                try:
-                    total += float(item[1])
-                except Exception:  # pylint: disable=broad-except
-                    continue
-            return total
+            try:
+                return float(series[-1][1])
+            except Exception:  # pylint: disable=broad-except
+                return 0.0
         if isinstance(series, dict):
             vals = series.get("Values") or []
-            total = 0.0
-            for v in vals:
-                try:
-                    total += float(v)
-                except Exception:  # pylint: disable=broad-except
-                    continue
-            return total
+            try:
+                return float(vals[-1]) if vals else 0.0
+            except Exception:  # pylint: disable=broad-except
+                return 0.0
         return 0.0
 
-    for v in vols:
+    out: List[Dict[str, Any]] = []
+    for v in in_use:
         vid = str(v.get("VolumeId"))
-        rb = _sum(f"VolumeReadBytes_{vid}")
-        wb = _sum(f"VolumeWriteBytes_{vid}")
-        ro = _sum(f"VolumeReadOps_{vid}")
-        wo = _sum(f"VolumeWriteOps_{vid}")
+        rb = _last(f"VolumeReadBytes_{vid}")
+        wb = _last(f"VolumeWriteBytes_{vid}")
+        ro = _last(f"VolumeReadOps_{vid}")
+        wo = _last(f"VolumeWriteOps_{vid}")
 
-        # Very low across board (simple heuristic)
-        hours = max(1, int(window_days) * 24)
-        max_bytes = 5 * 1024 * 1024 * hours
-        max_ops = 10 * hours
-        if rb + wb > max_bytes or ro + wo > max_ops:
+        # Same heuristic as before
+        if rb + wb > 5 * 1024 * 1024 or ro + wo > 10:
             continue
 
         tags = tags_to_dict(v.get("Tags"))
         app_id, app, env = tag_triplet(tags)
         est = _volume_monthly_cost(v)
 
-        config.WRITE_ROW(
-            writer=writer,
-            resource_id=vid,
-            name=vid,
-            resource_type="EBSVolume",
-            region=region,
-            owner_id=config.ACCOUNT_ID,
-            flags=["EBSLowUtilization"],
-            estimated_cost=est,
-            potential_saving=0.0,
-            signals={
-                "Region": region,
-                "ReadBytes": int(rb),
-                "WriteBytes": int(wb),
-                "ReadOps": int(ro),
-                "WriteOps": int(wo),
-                "LookbackDays": int(window_days),
-            },
-            state=str(v.get("State") or ""),
-            creation_date=_iso(v.get("CreateTime")),
-            storage_gb=float(v.get("Size") or 0.0),
-            app_id=app_id,
-            app=app,
-            env=env,
+        out.append(
+            {
+                "resource_id": vid,
+                "name": vid,
+                "resource_type": "EBSVolume",
+                "region": region,
+                "owner_id": config.ACCOUNT_ID,
+                "flags": ["EBSLowUtilization"],
+                "estimated_cost": est,
+                "potential_saving": 0.0,
+                "signals": {
+                    "Region": region,
+                    "ReadBytes": int(rb),
+                    "WriteBytes": int(wb),
+                    "ReadOps": int(ro),
+                    "WriteOps": int(wo),
+                    "LookbackDays": int(window_days),
+                },
+                "state": str(v.get("State") or ""),
+                "creation_date": _iso(v.get("CreateTime")),
+                "storage_gb": float(v.get("Size") or 0.0),
+                "app_id": app_id,
+                "app": app,
+                "env": env,
+            }
         )
-
-    log.info("[ebs] Completed check_ebs_volumes_low_utilization")
+    return out
 
 
 @retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    max_workers: Optional[int] = None,
-    **kwargs,
-) -> None:
-    """Flag EBS snapshots that are PUBLIC or shared with other accounts."""
-    log = _logger(kwargs.get("logger") or logger)
-    try:
-        writer, ec2 = _extract_writer_ec2(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_ebs_snapshots_public_or_shared] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_snapshots_public_or_shared] Skipping: config not provided.")
-        return
-
-    region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    snaps = _ensure_snapshots(ec2, log)
-    # Only completed snapshots with an id
-    subset: List[Dict[str, Any]] = []
-    for snap in snaps:
-        if not (snap.get("SnapshotId") and snap.get("State") == "completed"):
-            continue
-        # Skip AWS-managed snapshots (Backup/DLM) to reduce API calls and noise.
-        tags = tags_to_dict(snap.get("Tags"))
-        if _is_managed_snapshot(tags):
-            continue
-        subset.append(snap)
-
-    if not subset:
-        log.info("[ebs] No eligible snapshots for public/shared check")
-        return
-
-    sid_list = [str(s["SnapshotId"]) for s in subset]
-    attrs = _ensure_snapshot_attrs(ec2, sid_list, log, max_workers)
-
-    for s in subset:
-        sid = str(s["SnapshotId"])
-        perms = attrs.get(sid, [])
-        # 'public' only makes sense for unencrypted snaps
-        is_public = (not bool(s.get("Encrypted"))) and any(p.get("Group") == "all" for p in perms)
-        shared_to = [p.get("UserId") for p in perms if p.get("UserId")]
-        shared_to = [x for x in shared_to if x and x != str(config.ACCOUNT_ID)]
-        if not is_public and not shared_to:
-            continue
-
-        tags = tags_to_dict(s.get("Tags"))
-        if _is_managed_snapshot(tags):
-            continue
-        app_id, app, env = tag_triplet(tags)
-
-        flags: List[str] = []
-        if is_public:
-            flags.append("EBSSnapshotPublic")
-        if shared_to and not is_public:
-            flags.append("EBSSnapshotShared")
-        if is_public and "EBSSnapshotShared" in flags:
-            flags = ["EBSSnapshotPublic"]
-
-        config.WRITE_ROW(
-            writer=writer,
-            resource_id=sid,
-            name=sid,
-            resource_type="EBSSnapshot",
-            region=region,
-            owner_id=config.ACCOUNT_ID,
-            flags=flags,
-            estimated_cost=0.0,
-            potential_saving=0.0,
-            signals={
-                "Region": region,
-                "KmsKeyId": s.get("KmsKeyId") or "NULL",
-                "VolumeSizeGiB": s.get("VolumeSize"),
-                "StorageTier": s.get("StorageTier") or "NULL",
-                "SharedCount": len(shared_to),
-                "SharedTo": ";".join(shared_to) if shared_to else "NULL",
-                "Public": is_public,
-            },
-            state=str(s.get("State") or ""),
-            creation_date=_iso(s.get("StartTime")),
-            storage_gb=float(s.get("VolumeSize") or 0.0),
-            app_id=app_id,
-            app=app,
-            env=env,
-        )
-
-    log.info("[ebs] Completed check_ebs_snapshots_public_or_shared")
-
-
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_snapshot_stale(  # pylint: disable=unused-argument
+def check_ebs_volumes_and_snapshots(  # pylint: disable=unused-argument
     *args,
     logger: Optional[logging.Logger] = None,
     lookback_days: int = 90,
+    window_days: int = 7,
+    max_workers: Optional[int] = None,
     **kwargs,
 ) -> None:
-    """Flag snapshots older than `lookback_days`."""
+    """
+    Global EBS checker (KMS-style): computes all EBS volume & snapshot flags
+    and writes *one row per resource* (no duplicates across sub-checks).
+
+    Preferred entrypoint.
+    """
     log = _logger(kwargs.get("logger") or logger)
+
     try:
-        writer, ec2 = _extract_writer_ec2(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_ebs_snapshot_stale] Skipping: %s", exc)
-        return
+        writer, ec2, cloudwatch = _extract_writer_ec2_cw(args, kwargs)
+    except TypeError:
+        try:
+            writer, ec2 = _extract_writer_ec2(args, kwargs)
+            cloudwatch = kwargs.get("cloudwatch", None)
+        except TypeError as exc:
+            log.warning("[check_ebs_volumes_and_snapshots] Skipping: %s", exc)
+            return
+
     if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_snapshot_stale] Skipping: config not provided.")
+        log.warning("[check_ebs_volumes_and_snapshots] Skipping: config not provided.")
         return
 
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=int(lookback_days))
-    for s in _ensure_snapshots(ec2, log):
-        st = s.get("StartTime")
-        if not isinstance(st, datetime):
-            continue
-        st = st if st.tzinfo else st.replace(tzinfo=timezone.utc)
-        if st > cutoff:
+    run_key = (_writer_key(writer), region, str(config.ACCOUNT_ID))
+    if run_key in _EBS_ALREADY_RAN:
+        log.info("[ebs] Skipping duplicate EBS run for %s", region)
+        return
+    _EBS_ALREADY_RAN.add(run_key)
+
+    rows: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+
+    vols = _ensure_volumes(ec2, log)
+    snaps = _ensure_snapshots(ec2, log)
+
+    # ------------------------------ volume checks ------------------------------ #
+
+    for v in vols:
+        vid = str(v.get("VolumeId") or "")
+        if not vid:
             continue
 
-        tags = tags_to_dict(s.get("Tags"))
+        tags = tags_to_dict(v.get("Tags"))
         app_id, app, env = tag_triplet(tags)
-        upper = _snapshot_upper_bound_monthly_cost(s)
+        est = _volume_monthly_cost(v)
 
-        config.WRITE_ROW(
-            writer=writer,
-            resource_id=str(s.get("SnapshotId")),
-            name=str(s.get("SnapshotId")),
-            resource_type="EBSSnapshot",
-            region=region,
-            owner_id=config.ACCOUNT_ID,
-            flags=["EBSSnapshotOld"],
-            estimated_cost=0.0,
-            potential_saving=upper,
-            signals={
-                "Region": region,
-                "AgeDays": int((datetime.now(timezone.utc) - st).days),
-                "StorageTier": s.get("StorageTier") or "NULL",
-                "CostEstimation": "upper_bound_volume_size",
-                "UpperBoundMonthlyCost": round(upper, 6),
-            },
-            state=str(s.get("State") or ""),
-            creation_date=_iso(s.get("StartTime")),
-            storage_gb=float(s.get("VolumeSize") or 0.0),
-            app_id=app_id,
-            app=app,
-            env=env,
-        )
+        if str(v.get("State")) == "available":
+            _collect_row(
+                rows,
+                {
+                    "resource_id": vid,
+                    "name": vid,
+                    "resource_type": "EBSVolume",
+                    "region": region,
+                    "owner_id": config.ACCOUNT_ID,
+                    "flags": ["EBSUnattachedVolume"],
+                    "estimated_cost": est,
+                    "potential_saving": est,
+                    "signals": {
+                        "Region": region,
+                        "Type": v.get("VolumeType"),
+                        "Encrypted": bool(v.get("Encrypted")),
+                        "AZ": v.get("AvailabilityZone"),
+                    },
+                    "state": str(v.get("State") or ""),
+                    "creation_date": _iso(v.get("CreateTime")),
+                    "storage_gb": float(v.get("Size") or 0.0),
+                    "app_id": app_id,
+                    "app": app,
+                    "env": env,
+                },
+            )
 
-    log.info("[ebs] Completed check_ebs_snapshot_stale")
+        if str(v.get("VolumeType") or "").lower() == "gp2":
+            pot = _gp2_to_gp3_saving(v)
+            _collect_row(
+                rows,
+                {
+                    "resource_id": vid,
+                    "name": vid,
+                    "resource_type": "EBSVolume",
+                    "region": region,
+                    "owner_id": config.ACCOUNT_ID,
+                    "flags": ["EBSGp2ToGp3Candidate"],
+                    "estimated_cost": est,
+                    "potential_saving": pot,
+                    "signals": {
+                        "Region": region,
+                        "Type": v.get("VolumeType"),
+                        "Encrypted": bool(v.get("Encrypted")),
+                        "AZ": v.get("AvailabilityZone"),
+                        "SavingPerGB": round(
+                            max(0.0, _EBS_GB_MONTH["gp2"] - _EBS_GB_MONTH["gp3"]), 4
+                        ),
+                    },
+                    "state": str(v.get("State") or ""),
+                    "creation_date": _iso(v.get("CreateTime")),
+                    "storage_gb": float(v.get("Size") or 0.0),
+                    "app_id": app_id,
+                    "app": app,
+                    "env": env,
+                },
+            )
 
+        if not bool(v.get("Encrypted")):
+            _collect_row(
+                rows,
+                {
+                    "resource_id": vid,
+                    "name": vid,
+                    "resource_type": "EBSVolume",
+                    "region": region,
+                    "owner_id": config.ACCOUNT_ID,
+                    "flags": ["EBSVolumeUnencrypted"],
+                    "estimated_cost": est,
+                    "potential_saving": 0.0,
+                    "signals": {
+                        "Region": region,
+                        "Type": v.get("VolumeType"),
+                        "AZ": v.get("AvailabilityZone"),
+                    },
+                    "state": str(v.get("State") or ""),
+                    "creation_date": _iso(v.get("CreateTime")),
+                    "storage_gb": float(v.get("Size") or 0.0),
+                    "app_id": app_id,
+                    "app": app,
+                    "env": env,
+                },
+            )
 
-@retry_with_backoff(exceptions=(ClientError,))
-def check_ebs_orphan_snapshots(  # pylint: disable=unused-argument
-    *args,
-    logger: Optional[logging.Logger] = None,
-    **kwargs,
-) -> None:
-    """Flag snapshots not referenced by AMIs you own."""
-    log = _logger(kwargs.get("logger") or logger)
-    try:
-        writer, ec2 = _extract_writer_ec2(args, kwargs)
-    except TypeError as exc:
-        log.warning("[check_ebs_orphan_snapshots] Skipping: %s", exc)
-        return
-    if not (config.ACCOUNT_ID and config.WRITE_ROW):
-        log.warning("[check_ebs_orphan_snapshots] Skipping: config not provided.")
-        return
+    # CW low util check (optional)
+    for r in _cw_low_util_rows(cloudwatch, vols, region, window_days, log):
+        _collect_row(rows, r)
 
-    region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
+    # ------------------------------ snapshot checks ---------------------------- #
+
     used_ids = _ensure_ami_snapshot_ids(ec2, log)
 
-    for s in _ensure_snapshots(ec2, log):
-        sid = str(s.get("SnapshotId"))
-        if not sid or sid in used_ids:
+    eligible_snaps = [
+        s for s in snaps
+        if s.get("SnapshotId") and s.get("State") == "completed"
+    ]
+    sid_list = [str(s["SnapshotId"]) for s in eligible_snaps]
+    attrs = _ensure_snapshot_attrs(ec2, sid_list, log, max_workers) if sid_list else {}
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(lookback_days))
+
+    for s in snaps:
+        sid = str(s.get("SnapshotId") or "")
+        if not sid:
             continue
 
         tags = tags_to_dict(s.get("Tags"))
         app_id, app, env = tag_triplet(tags)
-        upper = _snapshot_upper_bound_monthly_cost(s)
+        est = _snapshot_monthly_cost_guesstimate(s)
 
-        config.WRITE_ROW(
-            writer=writer,
-            resource_id=sid,
-            name=sid,
-            resource_type="EBSSnapshot",
-            region=region,
-            owner_id=config.ACCOUNT_ID,
-            flags=["EBSSnapshotOrphan"],
-            estimated_cost=0.0,
-            potential_saving=upper,
-            signals={
-                "Region": region,
-                "CostEstimation": "upper_bound_volume_size",
-                "UpperBoundMonthlyCost": round(upper, 6),
-            },
-            state=str(s.get("State") or ""),
-            creation_date=_iso(s.get("StartTime")),
-            storage_gb=float(s.get("VolumeSize") or 0.0),
-            app_id=app_id,
-            app=app,
-            env=env,
-            referenced_in="",
-        )
+        st = s.get("StartTime")
+        if isinstance(st, datetime):
+            st_dt = st if st.tzinfo else st.replace(tzinfo=timezone.utc)
+            if st_dt < cutoff:
+                _collect_row(
+                    rows,
+                    {
+                        "resource_id": sid,
+                        "name": sid,
+                        "resource_type": "EBSSnapshot",
+                        "region": region,
+                        "owner_id": config.ACCOUNT_ID,
+                        "flags": ["EBSSnapshotOld"],
+                        "estimated_cost": est,
+                        "potential_saving": est,
+                        "signals": {
+                            "Region": region,
+                            "AgeDays": int((datetime.now(timezone.utc) - st_dt).days),
+                            "StorageTier": s.get("StorageTier") or "NULL",
+                        },
+                        "state": str(s.get("State") or ""),
+                        "creation_date": _iso(s.get("StartTime")),
+                        "storage_gb": float(s.get("VolumeSize") or 0.0),
+                        "app_id": app_id,
+                        "app": app,
+                        "env": env,
+                    },
+                )
 
-    log.info("[ebs] Completed check_ebs_orphan_snapshots")
+        if sid not in used_ids and not _is_managed_snapshot(tags):
+            _collect_row(
+                rows,
+                {
+                    "resource_id": sid,
+                    "name": sid,
+                    "resource_type": "EBSSnapshot",
+                    "region": region,
+                    "owner_id": config.ACCOUNT_ID,
+                    "flags": ["EBSSnapshotOrphan"],
+                    "estimated_cost": est,
+                    "potential_saving": est,
+                    "signals": {"Region": region},
+                    "state": str(s.get("State") or ""),
+                    "creation_date": _iso(s.get("StartTime")),
+                    "storage_gb": float(s.get("VolumeSize") or 0.0),
+                    "app_id": app_id,
+                    "app": app,
+                    "env": env,
+                    "referenced_in": "",
+                },
+            )
+
+        if s.get("State") == "completed":
+            perms = attrs.get(sid, [])
+            is_public = (not bool(s.get("Encrypted"))) and any(
+                p.get("Group") == "all" for p in perms
+            )
+            shared_to = [p.get("UserId") for p in perms if p.get("UserId")]
+            shared_to = [x for x in shared_to if x and x != str(config.ACCOUNT_ID)]
+            if is_public or shared_to:
+                flags: List[str] = []
+                if is_public:
+                    flags.append("EBSSnapshotPublic")
+                if shared_to and not is_public:
+                    flags.append("EBSSnapshotShared")
+                if is_public and "EBSSnapshotShared" in flags:
+                    flags = ["EBSSnapshotPublic"]
+
+                _collect_row(
+                    rows,
+                    {
+                        "resource_id": sid,
+                        "name": sid,
+                        "resource_type": "EBSSnapshot",
+                        "region": region,
+                        "owner_id": config.ACCOUNT_ID,
+                        "flags": flags,
+                        "estimated_cost": 0.0,
+                        "potential_saving": 0.0,
+                        "signals": {
+                            "Region": region,
+                            "KmsKeyId": s.get("KmsKeyId") or "NULL",
+                            "VolumeSizeGiB": s.get("VolumeSize"),
+                            "StorageTier": s.get("StorageTier") or "NULL",
+                            "SharedCount": len(shared_to),
+                            "SharedTo": ";".join(shared_to) if shared_to else "NULL",
+                            "Public": is_public,
+                        },
+                        "state": str(s.get("State") or ""),
+                        "creation_date": _iso(s.get("StartTime")),
+                        "storage_gb": float(s.get("VolumeSize") or 0.0),
+                        "app_id": app_id,
+                        "app": app,
+                        "env": env,
+                    },
+                )
+
+    # ------------------------------- flush write ------------------------------- #
+
+    ordered = sorted(
+        rows.values(),
+        key=lambda r: (str(r.get("resource_type") or ""), str(r.get("resource_id") or "")),
+    )
+    for row in ordered:
+        try:
+            # type: ignore[call-arg]
+            config.WRITE_ROW(writer=writer, **row)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.warning("[ebs] write_row failed for %s: %s", row.get("resource_id"), exc)
+
+    log.info("[ebs] Completed check_ebs_volumes_and_snapshots (rows=%d)", len(rows))
