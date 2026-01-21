@@ -40,6 +40,7 @@ from aws_checkers.common import _logger
 
 
 # Output CSV headers produced by the profiler (canonical)
+#ignores referenced_in, only used by AMI
 _REQUIRED_COLUMNS: Tuple[str, ...] = (
     "Resource_ID",
     "Name",
@@ -55,8 +56,7 @@ _REQUIRED_COLUMNS: Tuple[str, ...] = (
     "ApplicationID",
     "Application",
     "Environment",
-    "Referenced_In",
-    "Flagged",
+    "FlaggedForReview",
     "Confidence",
     "Signals",
 )

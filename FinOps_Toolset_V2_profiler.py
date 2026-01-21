@@ -581,32 +581,15 @@ def main():
                     writer=writer,
                     acm=clients["acm"],
                 )
+
                 #roadmap: ignore slave instances (sap db)
                 run_check(
                     profiler, "check_ec2_underutilized_instances",
-                    region, ec2_checks.check_ec2_underutilized_instances,
+                    region, ec2_checks.check_ec2_resources,
                     writer=writer, ec2=clients["ec2"], cloudwatch=clients["cloudwatch"],
+                    autoscaling=clients["autoscaling"],
                     # knobs: lookback_days=14, cpu_avg_threshold=5.0, cpu_max_threshold=10.0,
                     #        net_avg_bps_threshold=100_000
-                )
-
-                run_check(
-                    profiler, "check_ec2_stopped_instances", region,
-                    ec2_checks.check_ec2_stopped_instances, writer=writer,
-                    ec2=clients["ec2"], cloudwatch=clients["cloudwatch"],
-                    # knobs: stale_days=14
-                )
-
-                run_check(
-                    profiler, "check_ec2_old_generation_instances", region,
-                    ec2_checks.check_ec2_old_generation_instances, writer=writer,
-                    ec2=clients["ec2"], cloudwatch=clients["cloudwatch"],
-                )
-
-                run_check(
-                    profiler, "check_ec2_unused_security_groups", region,
-                    ec2_checks.check_ec2_unused_security_groups, writer=writer,
-                    ec2=clients["ec2"], cloudwatch=clients["cloudwatch"],
                 )
 
                 # CloudFront is global; no impact to put it in the region loop
