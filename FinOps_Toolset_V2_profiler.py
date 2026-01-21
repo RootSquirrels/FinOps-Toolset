@@ -703,51 +703,11 @@ def main():
                             # knobs: age_days=180
                         )
 
-
                 run_check(
-                    profiler, "check_loggroups_no_retention", region,
-                    lg_checks.check_loggroups_no_retention, writer=writer,
+                    profiler, "check_loggroups", region,
+                    lg_checks.check_loggroups, writer=writer,
                     logs=clients["logs"], cloudwatch=clients["cloudwatch"],
                 )
-
-                run_check(
-                    profiler, "check_loggroups_stale", region,
-                    lg_checks.check_loggroups_stale, writer=writer,
-                    logs=clients["logs"], cloudwatch=clients["cloudwatch"],
-                    # knobs: lookback_days=14
-                )
-
-                run_check(
-                    profiler, "check_loggroups_large_storage",
-                    region, lg_checks.check_loggroups_large_storage,
-                    writer=writer, logs=clients["logs"], cloudwatch=clients["cloudwatch"],
-                    # knobs: min_gb=50.0
-                )
-
-                run_check(
-                    profiler, "check_loggroups_unencrypted", region,
-                    lg_checks.check_loggroups_unencrypted, writer=writer,
-                    logs=clients["logs"], cloudwatch=clients["cloudwatch"],
-                )
-
-                run_check(
-                    profiler, "check_loggroups_high_ingestion", region,
-                    lg_checks.check_loggroups_high_ingestion, writer=writer,
-                    logs=clients["logs"], cloudwatch=clients["cloudwatch"],
-                )
-
-                run_check(
-                    profiler, "check_loggroups_high_ingestion_no_retention", region,
-                    lg_checks.check_loggroups_high_ingestion_no_retention, writer=writer,
-                    logs=clients["logs"], cloudwatch=clients["cloudwatch"],
-                )
-
-                run_check(
-                    profiler, "check_loggroups_retention_too_long", region,
-                    lg_checks.check_loggroups_retention_too_long, writer=writer,
-                    logs=clients["logs"], cloudwatch=clients["cloudwatch"],
-                )
-
 
                 run_check(
                     profiler, "check_rds_manual_snapshots_old", region,
@@ -1042,16 +1002,16 @@ def main():
                     # knobs: older_than_days=90, max_task_defs=200
                 )
 
-                run_check(
-                    profiler,
-                    "check_csv_sanity",
-                    "global",
-                    csv_sanity_checks.check_csv_sanity,
-                    writer,                       # ignored but kept for run_check compatibility
-                    csv_path=OUTPUT_FILE,
-                    strict=False,                 # True = raise error if issues exist
-                    dedupe_key="resource_id",     # or "resource_id_type_region"
-                )
+        run_check(
+            profiler,
+            "check_csv_sanity",
+            "global",
+            csv_sanity_checks.check_csv_sanity,
+            writer,                       # ignored but kept for run_check compatibility
+            csv_path=OUTPUT_FILE,
+            strict=False,                 # True = raise error if issues exist
+            dedupe_key="resource_id",     # or "resource_id_type_region"
+        )
 
         profiler.dump_csv()
         profiler.log_summary(top_n=30)
