@@ -224,15 +224,22 @@ def _extract_writer_ec2_pricing(
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
 ) -> Tuple[Any, Any, Any]:
-    """Extract (writer, ec2, pricing) from args/kwargs."""
-    writer = kwargs.get("writer", args[0] if len(args) >= 1 else None)
-    ec2 = kwargs.get("ec2", args[1] if len(args) >= 2 else None)
-    pricing_client = kwargs.get("pricing", args[2] if len(args) >= 3 else None)
+    """
+    Extract (writer, ec2, pricing) in a run_check-compatible way.
+    """
+    writer = kwargs.get("writer")
+    if writer is None and args:
+        writer = args[0]
+
+    ec2 = kwargs.get("ec2")
+    pricing_client = kwargs.get("pricing")
+
     if writer is None or ec2 is None or pricing_client is None:
         raise TypeError(
             "Expected 'writer', 'ec2', and 'pricing' "
             f"(got writer={writer!r}, ec2={ec2!r}, pricing={pricing_client!r})"
         )
+
     return writer, ec2, pricing_client
 
 
