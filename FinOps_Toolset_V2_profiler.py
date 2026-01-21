@@ -64,7 +64,7 @@ from aws_checkers import (
     redshift as rs_checks, glue as glue_checks, ecs as ecs_checks,
     commitments as commitments_checks, graviton as graviton_checks,
 )
-
+from aws_checkers.tests import test_csv_sanity as csv_sanity_checks
 #endregion
 
 # Configure logging
@@ -1057,6 +1057,17 @@ def main():
                     region, ecs_checks.check_ecs_old_task_definitions,
                     writer=writer, client=clients["ecs"],
                     # knobs: older_than_days=90, max_task_defs=200
+                )
+
+                run_check(
+                    profiler,
+                    "check_csv_sanity",
+                    "global",
+                    csv_sanity_checks.check_csv_sanity,
+                    writer,                       # ignored but kept for run_check compatibility
+                    csv_path=OUTPUT_FILE,
+                    strict=False,                 # True = raise error if issues exist
+                    dedupe_key="resource_id",     # or "resource_id_type_region"
                 )
 
         profiler.dump_csv()
