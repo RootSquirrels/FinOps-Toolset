@@ -62,6 +62,7 @@ from aws_checkers import (
     ecr as ecr_checks, ssm as ssm_checks, sagemaker as sm_checks, apigateway as apigw_checks,
     msk as msk_checks, cloudtrail as ct_checks, stepfunctions as sfn_checks,
     redshift as rs_checks, glue as glue_checks, ecs as ecs_checks,
+    commitments as commitments_checks,
 )
 
 #endregion
@@ -377,9 +378,10 @@ def main():
             try:
                 s3_global = boto3.client("s3", config=SDK_CONFIG)
                 cloudwatch_global = boto3.client("cloudwatch", config=SDK_CONFIG)
+                ce = boto3.client("ce", config=SDK_CONFIG)
                 region="GLOBAL"
             except Exception as e: # pylint: disable=broad-except
-                logging.error("[main] Failed to create global S3 client: %s", e)
+                logging.error("[main] Failed to create global client: %s", e)
                 s3_global = boto3.client("s3")  # fallback
 
 
@@ -397,6 +399,12 @@ def main():
                 # mpu_check_max_buckets=50,
                 # mpu_per_bucket_limit=100,
                 # mpu_per_upload_parts_limit=20,
+            )
+
+            run_check(
+                profiler, "check_commitments_recommendations",
+                region, commitments_checks.check_commitments_recommendations,
+                writer=writer, costexplorer=ce,
             )
 
             # -------- Per-region steps
