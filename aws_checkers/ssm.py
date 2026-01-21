@@ -47,6 +47,15 @@ def _to_utc(dt_obj: datetime) -> datetime:
     return dt_obj.astimezone(timezone.utc)
 
 
+def _client_service_name(obj: Any) -> str:
+    try:
+        meta = getattr(obj, "meta", None)
+        service_model = getattr(meta, "service_model", None)
+        return str(getattr(service_model, "service_name", "") or "")
+    except Exception:  # pylint: disable=broad-except
+        return ""
+
+
 def _extract_writer_ssm(
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
@@ -54,31 +63,34 @@ def _extract_writer_ssm(
     """
     Extract (writer, ssm) in a run_check-compatible way.
 
-    Supports:
-      - fn(writer, ssm, ...)
-      - fn(region, writer, ssm, ...)  (orchestrators that inject region positionally)
-      - fn(..., writer=..., ssm=...)
+    - writer: kw 'writer' or first non-string positional arg after region
+    - ssm: kw 'ssm' or any positional arg that is a boto3 'ssm' client
     """
     writer = kwargs.get("writer")
     ssm = kwargs.get("ssm")
 
-    # Positional fallback:
-    # common patterns:
-    #   (writer, ssm, ...)
-    #   (region, writer, ssm, ...)
-    if writer is None or ssm is None:
-        if len(args) >= 2:
-            # assume (writer, ssm, ...)
-            writer = writer or args[0]
-            ssm = ssm or args[1]
-        elif len(args) >= 3:
-            # assume (region, writer, ssm, ...)
-            writer = writer or args[1]
-            ssm = ssm or args[2]
+    # Determine writer from positionals:
+    if writer is None:
+        # Typical run_check patterns:
+        #   fn(region, writer, ...)
+        #   fn(writer, ...)
+        if args:
+            if isinstance(args[0], str) and len(args) >= 2:
+                writer = args[1]
+            else:
+                writer = args[0]
+
+    # Determine ssm from positionals if not in kwargs
+    if ssm is None:
+        for obj in args:
+            if _client_service_name(obj) == "ssm":
+                ssm = obj
+                break
 
     if writer is None or ssm is None:
         raise TypeError(
-            "Expected 'writer' and 'ssm' (got writer=%r, ssm=%r)" % (writer, ssm)
+            "Expected 'writer' and 'ssm' "
+            f"(got writer={writer!r}, ssm={ssm!r})"
         )
     return writer, ssm
 

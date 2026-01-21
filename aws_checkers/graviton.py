@@ -221,35 +221,52 @@ def _instance_type_exists(ec2, instance_type: str, log: logging.Logger) -> bool:
 
 # -------------------------- extractors (run_check) ------------------------- #
 
+def _client_service_name(obj: Any) -> str:
+    try:
+        meta = getattr(obj, "meta", None)
+        service_model = getattr(meta, "service_model", None)
+        return str(getattr(service_model, "service_name", "") or "")
+    except Exception:  # pylint: disable=broad-except
+        return ""
+
+
 def _extract_writer_ec2_pricing(
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
 ) -> Tuple[Any, Any, Any]:
     """
-    Extract (writer, ec2, pricing) in a run_check-compatible way.
+    Extract (writer, ec2, pricing) in a run_check-compatible way even if kwargs
+    are not forwarded by the orchestrator.
 
-    Compatible with orchestrators that pass ec2/pricing as kwargs OR positionals:
-      args[0] -> writer
-      args[1] -> ec2 (optional fallback)
-      args[2] -> pricing (optional fallback)
+    - writer: kw 'writer' or first non-string positional arg after region
+    - ec2: kw 'ec2' or any positional boto3 client with service_name 'ec2'
+    - pricing: kw 'pricing' or any positional boto3 client with service_name 'pricing'
     """
     writer = kwargs.get("writer")
-    if writer is None and args:
-        writer = args[0]
-
     ec2 = kwargs.get("ec2")
-    if ec2 is None and len(args) >= 2:
-        ec2 = args[1]
-
     pricing_client = kwargs.get("pricing")
-    if pricing_client is None and len(args) >= 3:
-        pricing_client = args[2]
+
+    if writer is None:
+        if args:
+            if isinstance(args[0], str) and len(args) >= 2:
+                writer = args[1]
+            else:
+                writer = args[0]
+
+    if ec2 is None or pricing_client is None:
+        for obj in args:
+            svc = _client_service_name(obj)
+            if ec2 is None and svc == "ec2":
+                ec2 = obj
+            elif pricing_client is None and svc == "pricing":
+                pricing_client = obj
 
     if writer is None or ec2 is None or pricing_client is None:
         raise TypeError(
             "Expected 'writer', 'ec2', and 'pricing' "
             f"(got writer={writer!r}, ec2={ec2!r}, pricing={pricing_client!r})"
         )
+
     return writer, ec2, pricing_client
 
 
