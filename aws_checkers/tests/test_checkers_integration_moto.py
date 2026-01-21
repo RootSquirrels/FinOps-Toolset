@@ -19,7 +19,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from test_checkers_generic import (  # reuse invariants
+from .test_checkers_generic import (  # reuse invariants
         _discover_checker_modules,
         _assert_row_schema_invariants,
     )
