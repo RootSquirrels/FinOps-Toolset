@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import atexit
 import concurrent.futures as cf
 import logging
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from botocore.exceptions import ClientError
@@ -14,10 +16,10 @@ from aws_checkers import config
 from aws_checkers.common import (
     _logger,
     _to_utc_iso,
-    tags_to_dict,
-    tag_triplet,
-    _safe_workers,
     iter_chunks,
+    tag_triplet,
+    tags_to_dict,
+    _safe_workers,
 )
 from core.retry import retry_with_backoff
 from core.cloudwatch import CloudWatchBatcher
@@ -29,6 +31,191 @@ _VOL_INV: Dict[int, List[Dict[str, Any]]] = {}
 _SNAP_INV: Dict[int, List[Dict[str, Any]]] = {}
 _AMI_SNAP_IDS: Dict[int, Set[str]] = {}
 _SNAP_ATTRS: Dict[int, Dict[str, List[Dict[str, Any]]]] = {}  # client_id -> {sid: perms}
+
+
+# ------------------------------ unified writer ------------------------------ #
+
+_UNIFIED_LOCK = Lock()
+_UNIFIED_WRITERS: Dict[Tuple[Any, int], "UnifiedRowWriter"] = {}
+_UNIFIED_REGISTERED = False
+
+
+def _writer_identity(writer: Any) -> Tuple[Any, int]:
+    """
+    Attempt to derive a stable identity for the *output target* behind `writer`.
+    This helps unify outputs even if the profiler creates a new DictWriter per check.
+    """
+    # Common patterns: csv.DictWriter has .writer (csv writer), may have .f / .fp / .stream.
+    for attr in ("f", "fp", "stream", "file", "buffer", "raw"):
+        stream = getattr(writer, attr, None)
+        if stream is not None:
+            return (type(writer), id(stream))
+
+    inner = getattr(writer, "writer", None)
+    if inner is not None:
+        for attr in ("f", "fp", "stream", "file", "buffer", "raw"):
+            stream = getattr(inner, attr, None)
+            if stream is not None:
+                return (type(writer), id(stream))
+        return (type(writer), id(inner))
+
+    return (type(writer), id(writer))
+
+
+def _merge_flags(existing: List[str], incoming: List[str]) -> List[str]:
+    if not incoming:
+        return existing
+    if not existing:
+        return list(incoming)
+    seen = set(existing)
+    merged = list(existing)
+    for f in incoming:
+        if f not in seen:
+            merged.append(f)
+            seen.add(f)
+    return merged
+
+
+def _merge_signals(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    if not incoming:
+        return existing
+    if not existing:
+        return dict(incoming)
+    merged = dict(existing)
+    # Prefer existing value unless it's empty/"NULL"
+    for k, v in incoming.items():
+        if k not in merged:
+            merged[k] = v
+            continue
+        cur = merged.get(k)
+        if cur in (None, "", "NULL") and v not in (None, "", "NULL"):
+            merged[k] = v
+    return merged
+
+
+def _max_float(a: Any, b: Any) -> float:
+    try:
+        fa = float(a)
+    except Exception:  # pylint: disable=broad-except
+        fa = 0.0
+    try:
+        fb = float(b)
+    except Exception:  # pylint: disable=broad-except
+        fb = 0.0
+    return fa if fa >= fb else fb
+
+
+class UnifiedRowWriter:
+    """
+    Wrap a CSV writer-like object and unify duplicate resources across checks.
+    Rows are buffered & merged, then flushed once at interpreter exit.
+
+    This avoids duplicate lines in the final CSV when the same resource is flagged
+    by multiple checks.
+    """
+
+    __slots__ = ("_base", "_rows", "_flushed", "_lock")
+
+    def __init__(self, base_writer: Any) -> None:
+        self._base = base_writer
+        self._rows: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        self._flushed = False
+        self._lock = Lock()
+
+    def writerow(self, row: Dict[str, Any]) -> None:
+        """
+        Buffer the row. If a row already exists for the same resource key,
+        merge flags/signals and keep the max costs to avoid double counting.
+        """
+        rid = str(row.get("resource_id") or "")
+        rtype = str(row.get("resource_type") or "")
+        region = str(row.get("region") or "")
+        owner = str(row.get("owner_id") or "")
+        key = (rid, rtype, region, owner)
+
+        with self._lock:
+            existing = self._rows.get(key)
+            if existing is None:
+                self._rows[key] = dict(row)
+                # normalize flags/signals if present
+                if "flags" in self._rows[key] and self._rows[key]["flags"] is None:
+                    self._rows[key]["flags"] = []
+                if "signals" in self._rows[key] and self._rows[key]["signals"] is None:
+                    self._rows[key]["signals"] = {}
+                return
+
+            # Merge flags
+            existing_flags = existing.get("flags") or []
+            incoming_flags = row.get("flags") or []
+            existing["flags"] = _merge_flags(list(existing_flags), list(incoming_flags))
+
+            # Merge signals
+            existing_signals = existing.get("signals") or {}
+            incoming_signals = row.get("signals") or {}
+            existing["signals"] = _merge_signals(
+                dict(existing_signals), dict(incoming_signals)
+            )
+
+            # Costs: keep max to avoid double counting across checks
+            existing["estimated_cost"] = _max_float(
+                existing.get("estimated_cost"), row.get("estimated_cost")
+            )
+            existing["potential_saving"] = _max_float(
+                existing.get("potential_saving"), row.get("potential_saving")
+            )
+
+            # Prefer existing non-empty fields; fill gaps from incoming row
+            for k, v in row.items():
+                if k in ("flags", "signals", "estimated_cost", "potential_saving"):
+                    continue
+                cur = existing.get(k)
+                if cur in (None, "", "NULL") and v not in (None, "", "NULL"):
+                    existing[k] = v
+
+    def writerows(self, rows: List[Dict[str, Any]]) -> None:
+        for r in rows:
+            self.writerow(r)
+
+    def flush(self) -> None:
+        """Flush buffered unified rows to the underlying writer once."""
+        with self._lock:
+            if self._flushed:
+                return
+            self._flushed = True
+            # Stable-ish output order: by resource_type then resource_id
+            for _, row in sorted(
+                self._rows.items(), key=lambda kv: (kv[0][1], kv[0][0])
+            ):
+                self._base.writerow(row)
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate any other attribute access to the base writer
+        return getattr(self._base, name)
+
+
+def _flush_all_unified_writers() -> None:
+    with _UNIFIED_LOCK:
+        writers = list(_UNIFIED_WRITERS.values())
+    for uw in writers:
+        try:
+            uw.flush()
+        except Exception:  # pylint: disable=broad-except
+            # Avoid crashing at interpreter shutdown
+            continue
+
+
+def _unified_writer(writer: Any) -> UnifiedRowWriter:
+    global _UNIFIED_REGISTERED  # pylint: disable=global-statement
+    ident = _writer_identity(writer)
+    with _UNIFIED_LOCK:
+        uw = _UNIFIED_WRITERS.get(ident)
+        if uw is None:
+            uw = UnifiedRowWriter(writer)
+            _UNIFIED_WRITERS[ident] = uw
+        if not _UNIFIED_REGISTERED:
+            atexit.register(_flush_all_unified_writers)
+            _UNIFIED_REGISTERED = True
+    return uw
 
 
 # ------------------------------ pricing helpers ---------------------------- #
@@ -253,6 +440,7 @@ def check_ebs_unattached_volumes(  # pylint: disable=unused-argument
         log.warning("[check_ebs_unattached_volumes] Skipping: config not provided.")
         return
 
+    uwriter = _unified_writer(writer)
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
     for v in _ensure_volumes(ec2, log):
         if str(v.get("State")) != "available":
@@ -262,7 +450,7 @@ def check_ebs_unattached_volumes(  # pylint: disable=unused-argument
         est = _volume_monthly_cost(v)
 
         config.WRITE_ROW(
-            writer=writer,
+            writer=uwriter,
             resource_id=str(v.get("VolumeId")),
             name=str(v.get("VolumeId")),
             resource_type="EBSVolume",
@@ -305,6 +493,7 @@ def check_ebs_gp2_not_gp3(  # pylint: disable=unused-argument
         log.warning("[check_ebs_gp2_not_gp3] Skipping: config not provided.")
         return
 
+    uwriter = _unified_writer(writer)
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
     for v in _ensure_volumes(ec2, log):
         if str(v.get("VolumeType")).lower() != "gp2":
@@ -315,7 +504,7 @@ def check_ebs_gp2_not_gp3(  # pylint: disable=unused-argument
         pot = _gp2_to_gp3_saving(v)
 
         config.WRITE_ROW(
-            writer=writer,
+            writer=uwriter,
             resource_id=str(v.get("VolumeId")),
             name=str(v.get("VolumeId")),
             resource_type="EBSVolume",
@@ -343,6 +532,7 @@ def check_ebs_gp2_not_gp3(  # pylint: disable=unused-argument
 
     log.info("[ebs] Completed check_ebs_gp2_not_gp3")
 
+
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ebs_unencrypted_volumes(  # pylint: disable=unused-argument
     *args,
@@ -360,6 +550,7 @@ def check_ebs_unencrypted_volumes(  # pylint: disable=unused-argument
         log.warning("[check_ebs_unencrypted_volumes] Skipping: config not provided.")
         return
 
+    uwriter = _unified_writer(writer)
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
     for v in _ensure_volumes(ec2, log):
         if bool(v.get("Encrypted")):
@@ -369,7 +560,7 @@ def check_ebs_unencrypted_volumes(  # pylint: disable=unused-argument
         est = _volume_monthly_cost(v)
 
         config.WRITE_ROW(
-            writer=writer,
+            writer=uwriter,
             resource_id=str(v.get("VolumeId")),
             name=str(v.get("VolumeId")),
             resource_type="EBSVolume",
@@ -378,7 +569,11 @@ def check_ebs_unencrypted_volumes(  # pylint: disable=unused-argument
             flags=["EBSVolumeUnencrypted"],
             estimated_cost=est,
             potential_saving=0.0,
-            signals={"Region": region, "Type": v.get("VolumeType"), "AZ": v.get("AvailabilityZone")},
+            signals={
+                "Region": region,
+                "Type": v.get("VolumeType"),
+                "AZ": v.get("AvailabilityZone"),
+            },
             state=str(v.get("State") or ""),
             creation_date=_iso(v.get("CreateTime")),
             storage_gb=float(v.get("Size") or 0.0),
@@ -411,6 +606,7 @@ def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
         log.debug("[ebs] CloudWatchBatcher unavailable; skipping low-util check.")
         return
 
+    uwriter = _unified_writer(writer)
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
     vols = [v for v in _ensure_volumes(ec2, log) if str(v.get("State")) == "in-use"]
     if not vols:
@@ -425,8 +621,12 @@ def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
         for v in vols:
             vid = str(v.get("VolumeId"))
             dims = [("VolumeId", vid)]
-            for metric in ("VolumeReadBytes", "VolumeWriteBytes",
-                           "VolumeReadOps", "VolumeWriteOps"):
+            for metric in (
+                "VolumeReadBytes",
+                "VolumeWriteBytes",
+                "VolumeReadOps",
+                "VolumeWriteOps",
+            ):
                 batch.add_q(
                     id_hint=f"{metric}_{vid}",
                     namespace="AWS/EBS",
@@ -471,7 +671,7 @@ def check_ebs_volumes_low_utilization(  # pylint: disable=unused-argument
         est = _volume_monthly_cost(v)
 
         config.WRITE_ROW(
-            writer=writer,
+            writer=uwriter,
             resource_id=vid,
             name=vid,
             resource_type="EBSVolume",
@@ -517,9 +717,9 @@ def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
         log.warning("[check_ebs_snapshots_public_or_shared] Skipping: config not provided.")
         return
 
+    uwriter = _unified_writer(writer)
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
     snaps = _ensure_snapshots(ec2, log)
-    # Only completed snapshots with an id
     subset = [s for s in snaps if s.get("SnapshotId") and s.get("State") == "completed"]
     if not subset:
         log.info("[ebs] No eligible snapshots for public/shared check")
@@ -531,8 +731,9 @@ def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
     for s in subset:
         sid = str(s["SnapshotId"])
         perms = attrs.get(sid, [])
-        # 'public' only makes sense for unencrypted snaps
-        is_public = (not bool(s.get("Encrypted"))) and any(p.get("Group") == "all" for p in perms)
+        is_public = (not bool(s.get("Encrypted"))) and any(
+            p.get("Group") == "all" for p in perms
+        )
         shared_to = [p.get("UserId") for p in perms if p.get("UserId")]
         shared_to = [x for x in shared_to if x and x != str(config.ACCOUNT_ID)]
         if not is_public and not shared_to:
@@ -550,7 +751,7 @@ def check_ebs_snapshots_public_or_shared(  # pylint: disable=unused-argument
             flags = ["EBSSnapshotPublic"]
 
         config.WRITE_ROW(
-            writer=writer,
+            writer=uwriter,
             resource_id=sid,
             name=sid,
             resource_type="EBSSnapshot",
@@ -597,6 +798,7 @@ def check_ebs_snapshot_stale(  # pylint: disable=unused-argument
         log.warning("[check_ebs_snapshot_stale] Skipping: config not provided.")
         return
 
+    uwriter = _unified_writer(writer)
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
     cutoff = datetime.now(timezone.utc) - timedelta(days=int(lookback_days))
     for s in _ensure_snapshots(ec2, log):
@@ -612,7 +814,7 @@ def check_ebs_snapshot_stale(  # pylint: disable=unused-argument
         est = _snapshot_monthly_cost_guesstimate(s)
 
         config.WRITE_ROW(
-            writer=writer,
+            writer=uwriter,
             resource_id=str(s.get("SnapshotId")),
             name=str(s.get("SnapshotId")),
             resource_type="EBSSnapshot",
@@ -654,6 +856,7 @@ def check_ebs_orphan_snapshots(  # pylint: disable=unused-argument
         log.warning("[check_ebs_orphan_snapshots] Skipping: config not provided.")
         return
 
+    uwriter = _unified_writer(writer)
     region = getattr(getattr(ec2, "meta", None), "region_name", "") or ""
     used_ids = _ensure_ami_snapshot_ids(ec2, log)
 
@@ -667,7 +870,7 @@ def check_ebs_orphan_snapshots(  # pylint: disable=unused-argument
         est = _snapshot_monthly_cost_guesstimate(s)
 
         config.WRITE_ROW(
-            writer=writer,
+            writer=uwriter,
             resource_id=sid,
             name=sid,
             resource_type="EBSSnapshot",
