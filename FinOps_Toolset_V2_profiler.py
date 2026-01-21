@@ -62,7 +62,7 @@ from aws_checkers import (
     ecr as ecr_checks, ssm as ssm_checks, sagemaker as sm_checks, apigateway as apigw_checks,
     msk as msk_checks, cloudtrail as ct_checks, stepfunctions as sfn_checks,
     redshift as rs_checks, glue as glue_checks, ecs as ecs_checks,
-    commitments as commitments_checks,
+    commitments as commitments_checks, graviton as graviton_checks,
 )
 
 #endregion
@@ -199,6 +199,7 @@ def init_clients(region: str):
         "apigatewayv2": boto3.client("apigatewayv2", region_name=region, config=SDK_CONFIG),
         "apigateway": boto3.client("apigateway", region_name=region, config=SDK_CONFIG),
         "redshift": boto3.client("redshift", region_name=region, config=SDK_CONFIG),
+        "pricing": boto3.client("pricing", config=SDK_CONFIG),
     }
 
 
@@ -429,6 +430,12 @@ def main():
                 run_check(
                     profiler, check_name="eni",
                     region=region, fn=eni, writer=writer, ec2=clients["ec2"],
+                )
+
+                run_check(
+                    profiler, "check_ec2_graviton_candidates",
+                    region, graviton_checks.check_ec2_graviton_candidates,
+                    writer, ec2=clients["ec2"], pricing=clients["pricing"],
                 )
 
                 run_check(profiler, check_name="check_unused_efs_filesystems", region=region,
