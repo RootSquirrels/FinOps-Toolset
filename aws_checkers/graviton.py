@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import json
 import logging
+from threading import Lock
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from botocore.exceptions import ClientError
 
 from aws_checkers import config
-from aws_checkers.common import _logger, _signals_str
+from aws_checkers.common import _logger
 from core.retry import retry_with_backoff
 from finops_toolset import config as const
 
@@ -209,6 +210,7 @@ def _instance_type_exists(ec2, instance_type: str, log: logging.Logger) -> bool:
     except ClientError as exc:
         code = (exc.response.get("Error", {}) or {}).get("Code", "")
         if code in ("UnauthorizedOperation", "AccessDenied", "AccessDeniedException"):
+            # Conservative fallback: treat as exists only if it looks like a Graviton family.
             guess = instance_type.split(".")[0].endswith("g")
             _TYPE_EXISTS_CACHE[key] = guess
             return guess
@@ -217,8 +219,7 @@ def _instance_type_exists(ec2, instance_type: str, log: logging.Logger) -> bool:
         return False
 
 
-# -------------------------- extractors (template) -------------------------- #
-
+# -------------------------- extractors (run_check) ------------------------- #
 
 def _extract_writer_ec2_pricing(
     args: Tuple[Any, ...],
@@ -226,25 +227,55 @@ def _extract_writer_ec2_pricing(
 ) -> Tuple[Any, Any, Any]:
     """
     Extract (writer, ec2, pricing) in a run_check-compatible way.
+
+    Compatible with orchestrators that pass ec2/pricing as kwargs OR positionals:
+      args[0] -> writer
+      args[1] -> ec2 (optional fallback)
+      args[2] -> pricing (optional fallback)
     """
     writer = kwargs.get("writer")
     if writer is None and args:
         writer = args[0]
 
     ec2 = kwargs.get("ec2")
+    if ec2 is None and len(args) >= 2:
+        ec2 = args[1]
+
     pricing_client = kwargs.get("pricing")
+    if pricing_client is None and len(args) >= 3:
+        pricing_client = args[2]
 
     if writer is None or ec2 is None or pricing_client is None:
         raise TypeError(
             "Expected 'writer', 'ec2', and 'pricing' "
             f"(got writer={writer!r}, ec2={ec2!r}, pricing={pricing_client!r})"
         )
-
     return writer, ec2, pricing_client
 
 
-# --------------------------------- checker -------------------------------- #
+# ----------------------- global run guard (per run) ----------------------- #
 
+_ALREADY_RAN_LOCK = Lock()
+_ALREADY_RAN: set[Tuple[int, str, str]] = set()
+
+
+def _writer_key(writer: Any) -> int:
+    """Best-effort stable identity for the underlying output stream."""
+    for attr in ("f", "fp", "stream", "file", "buffer", "raw"):
+        stream = getattr(writer, attr, None)
+        if stream is not None:
+            return id(stream)
+    inner = getattr(writer, "writer", None)
+    if inner is not None:
+        for attr in ("f", "fp", "stream", "file", "buffer", "raw"):
+            stream = getattr(inner, attr, None)
+            if stream is not None:
+                return id(stream)
+        return id(inner)
+    return id(writer)
+
+
+# --------------------------------- checker -------------------------------- #
 
 @retry_with_backoff(exceptions=(ClientError,))
 def check_ec2_graviton_candidates(  # pylint: disable=unused-argument
@@ -254,7 +285,7 @@ def check_ec2_graviton_candidates(  # pylint: disable=unused-argument
     min_monthly_saving_usd: float = 5.0,
     **kwargs: Any,
 ) -> None:
-    """Identify Graviton migration candidates and write one row per instance."""
+    """Identify Graviton migration candidates and write ONE row per instance."""
     log = _logger(kwargs.get("logger") or logger)
 
     try:
@@ -267,6 +298,14 @@ def check_ec2_graviton_candidates(  # pylint: disable=unused-argument
     if not (owner and config.WRITE_ROW):
         log.warning("[check_ec2_graviton_candidates] Skipping: missing config.")
         return
+
+    # Prevent duplicate execution (e.g., if orchestrator calls multiple wrappers)
+    run_key = (_writer_key(writer), str(region), owner)
+    with _ALREADY_RAN_LOCK:
+        if run_key in _ALREADY_RAN:
+            log.info("[graviton] Skipping duplicate run for %s", region)
+            return
+        _ALREADY_RAN.add(run_key)
 
     # Enumerate running instances
     instances: List[Dict[str, Any]] = []
@@ -287,7 +326,9 @@ def check_ec2_graviton_candidates(  # pylint: disable=unused-argument
         return
 
     hours = float(getattr(const, "HOURS_PER_MONTH", 730.0))
-    emitted = 0
+
+    # Dedup rows by instance id (extra safety)
+    rows: Dict[str, Dict[str, Any]] = {}
 
     for inst in instances:
         if _is_windows(inst):
@@ -323,40 +364,45 @@ def check_ec2_graviton_candidates(  # pylint: disable=unused-argument
             continue
 
         instance_id = str(inst.get("InstanceId") or "")
+        if not instance_id:
+            continue
         name = _instance_name(inst.get("Tags") or []) or instance_id
 
-        signals = {
-            "region": region,
-            "instance_type": itype,
-            "target_type": target_type,
-            "hourly_x86": round(cur_hourly, 6),
-            "hourly_arm": round(tgt_hourly, 6),
-            "hours_per_month": round(hours, 1),
-            "pricing_model": "OnDemand/Linux/Shared",
+        signals: Dict[str, Any] = {
+            "Region": region,
+            "InstanceType": itype,
+            "TargetType": target_type,
+            "HourlyX86USD": round(cur_hourly, 6),
+            "HourlyArmUSD": round(tgt_hourly, 6),
+            "HoursPerMonth": round(hours, 1),
+            "PricingModel": "OnDemand/Linux/Shared",
         }
 
+        rows[instance_id] = {
+            "resource_id": instance_id,
+            "name": name,
+            "resource_type": "EC2Instance",
+            "region": region,
+            "owner_id": owner,
+            "flags": ["EC2GravitonCandidate"],
+            "estimated_cost": round(monthly_cost, 2),
+            "potential_saving": round(monthly_saving, 2),
+            "confidence": 80,
+            "signals": signals,
+            "state": str((inst.get("State") or {}).get("Name") or ""),
+            "creation_date": "",
+            "instance_type": itype,
+            "target_instance_type": target_type,
+        }
+
+    emitted = 0
+    for row in rows.values():
         try:
             # type: ignore[call-arg]
-            config.WRITE_ROW(
-                writer=writer,
-                resource_id=instance_id,
-                name=name,
-                resource_type="EC2Instance",
-                region=region,
-                owner_id=owner,
-                flags=["EC2GravitonCandidate"],
-                estimated_cost=round(monthly_cost, 2),
-                potential_saving=round(monthly_saving, 2),
-                confidence=80,
-                signals=_signals_str(signals),
-                state=str((inst.get("State") or {}).get("Name") or ""),
-                creation_date="",
-                instance_type=itype,
-                target_instance_type=target_type,
-            )
+            config.WRITE_ROW(writer=writer, **row)
             emitted += 1
         except Exception as exc:  # pylint: disable=broad-except
-            log.debug("[graviton] failed to write row for %s: %s", instance_id, exc)
+            log.debug("[graviton] failed to write row for %s: %s", row.get("resource_id"), exc)
 
     log.info(
         "[graviton] Completed check_ec2_graviton_candidates in %s (rows=%d)",

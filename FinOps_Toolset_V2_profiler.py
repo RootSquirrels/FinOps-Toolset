@@ -657,14 +657,8 @@ def main():
                           cloudtrail=clients['cloudtrail'], kms=clients['kms'])
                           # lookback_days=90,  # optional override
 
-                run_check(profiler, "check_ssm_plaintext_parameters", region,
-                          ssm_checks.check_ssm_plaintext_parameters,
-                          writer=writer, ssm=clients["ssm"])
-                run_check(profiler, "check_ssm_stale_parameters", region,
-                          ssm_checks.check_ssm_stale_parameters,
-                          writer=writer, ssm=clients["ssm"])
-                run_check(profiler, "check_ssm_maintenance_windows_gaps", region,
-                          ssm_checks.check_ssm_maintenance_windows_gaps,
+                run_check(profiler, "check_ssm_resources", region,
+                          ssm_checks.check_ssm_resources,
                           writer=writer, ssm=clients["ssm"])
 
                 run_check(profiler, check_name="check_nat_gateways",
