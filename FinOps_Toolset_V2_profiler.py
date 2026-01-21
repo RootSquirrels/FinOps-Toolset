@@ -756,6 +756,24 @@ def main():
                     logs=clients["logs"], cloudwatch=clients["cloudwatch"],
                 )
 
+                run_check(
+                    profiler, "check_loggroups_high_ingestion", region,
+                    lg_checks.check_loggroups_high_ingestion, writer=writer,
+                    logs=clients["logs"], cloudwatch=clients["cloudwatch"],
+                )
+
+                run_check(
+                    profiler, "check_loggroups_high_ingestion_no_retention", region,
+                    lg_checks.check_loggroups_high_ingestion_no_retention, writer=writer,
+                    logs=clients["logs"], cloudwatch=clients["cloudwatch"],
+                )
+
+                run_check(
+                    profiler, "check_loggroups_retention_too_long", region,
+                    lg_checks.check_loggroups_retention_too_long, writer=writer,
+                    logs=clients["logs"], cloudwatch=clients["cloudwatch"],
+                )
+
 
                 run_check(
                     profiler, "check_rds_manual_snapshots_old", region,

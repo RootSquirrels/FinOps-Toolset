@@ -1,7 +1,25 @@
-"""Checkers: Amazon S3 (cost & compliance, single row per bucket)."""
+"""Checkers: Amazon S3 (cost & compliance, single row per bucket).
+
+This checker relies primarily on CloudWatch S3 Storage Metrics:
+  - AWS/S3 BucketSizeBytes (daily, delayed)
+  - AWS/S3 NumberOfObjects (daily, delayed)
+
+Because these metrics can be delayed and because CloudWatch is regional,
+this module:
+  1) Ensures the CloudWatch client is created in the bucket's region.
+  2) Uses the maximum value observed in the lookback window (more robust).
+  3) Adds a best-effort fallback to S3 Inventory reports when CW metrics are missing
+     (e.g., many buckets show 0 objects and 0 cost).
+
+The output remains one CSV row per bucket and preserves the existing features.
+"""
 
 from __future__ import annotations
 
+import csv
+import gzip
+import io
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -36,6 +54,10 @@ _PUBLIC_POLICY_MARKERS: Tuple[str, ...] = (
     "\"AWS\":\"*\"",
 )
 
+# Inventory guardrails (keep the checker fast/safe)
+_INV_MAX_FILES: int = 10
+_INV_MAX_TOTAL_BYTES: int = 50 * 1024 * 1024  # 50 MiB compressed/uncompressed best-effort
+
 
 def _safe_price(service: str, key: str, default: float = 0.0) -> float:
     """Resolve a price via chk.safe_price(service, key, default)."""
@@ -49,21 +71,6 @@ def _safe_price(service: str, key: str, default: float = 0.0) -> float:
 # Pagination helpers
 # ---------------------------------------------------------------------------
 
-def _paginate(fn, page_key: str, token_key: str, **kwargs: Any) -> Iterable[Dict[str, Any]]:
-    """Generic paginator for list/describe APIs returning a token key."""
-    token: Optional[str] = None
-    while True:
-        params = dict(kwargs)
-        if token:
-            params[token_key] = token
-        page = fn(**params)
-        for item in page.get(page_key, []) or []:
-            yield item
-        token = page.get(token_key)
-        if not token:
-            break
-
-
 def _bytes_to_gib(num: float) -> float:
     """Convert bytes to GiB."""
     try:
@@ -73,10 +80,10 @@ def _bytes_to_gib(num: float) -> float:
 
 
 def _latest_metric_value(points: List[Tuple[datetime, float]]) -> float:
-    """Return the latest available metric value from a CloudWatch series.
+    """Return a robust metric value from a CloudWatch time series.
 
-    S3 storage metrics can be delayed; relying on the most recent timestamp often yields
-    empty/zero values. We therefore take the maximum value in the window (best-effort).
+    S3 storage metrics can be delayed; relying on the newest timestamp can yield empty.
+    We take the maximum in the window as best-effort.
     """
     if not points:
         return 0.0
@@ -90,7 +97,7 @@ def _latest_metric_value(points: List[Tuple[datetime, float]]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# S3 inventory helpers
+# S3 bucket discovery helpers
 # ---------------------------------------------------------------------------
 
 def _bucket_region(s3: BaseClient, name: str) -> str:
@@ -121,6 +128,10 @@ def _list_buckets_by_region(s3: BaseClient) -> Dict[str, List[Tuple[str, str]]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# CloudWatch metrics (primary source)
+# ---------------------------------------------------------------------------
+
 def _fetch_sizes_and_counts(
     region: str,
     cloudwatch: BaseClient,
@@ -146,7 +157,7 @@ def _fetch_sizes_and_counts(
         cw = boto3.client("cloudwatch", region_name=region)
 
     batch = CloudWatchBatcher(region, client=cw)
-    # Sizes (avg last day) per storage type, + objects
+
     for idx, name in enumerate(buckets):
         for jdx, st in enumerate(_SIZE_TYPES):
             batch.add_q(
@@ -186,6 +197,258 @@ def _fetch_sizes_and_counts(
 
     return size_gb, objects
 
+
+# ---------------------------------------------------------------------------
+# S3 Inventory fallback (secondary source)
+# ---------------------------------------------------------------------------
+
+def _parse_s3_arn_bucket(arn: str) -> Optional[str]:
+    """Extract bucket name from arn:aws:s3:::bucket."""
+    if not arn:
+        return None
+    prefix = "arn:aws:s3:::"
+    if arn.startswith(prefix):
+        return arn[len(prefix):]
+    return None
+
+
+def _list_inventory_configs(s3: BaseClient, bucket: str) -> List[Dict[str, Any]]:
+    """List S3 inventory configurations for a bucket."""
+    configs: List[Dict[str, Any]] = []
+    token: Optional[str] = None
+    while True:
+        params: Dict[str, Any] = {"Bucket": bucket}
+        if token:
+            params["ContinuationToken"] = token
+        resp = s3.list_bucket_inventory_configurations(**params)
+        configs.extend(resp.get("InventoryConfigurationList", []) or [])
+        token = resp.get("NextContinuationToken")
+        if not token:
+            break
+    return configs
+
+
+def _find_latest_manifest_key(
+    s3: BaseClient,
+    dst_bucket: str,
+    prefix: str,
+) -> Optional[str]:
+    """Return the newest manifest.json key under the given prefix (lexicographic)."""
+    latest: Optional[str] = None
+    token: Optional[str] = None
+    while True:
+        params: Dict[str, Any] = {"Bucket": dst_bucket, "Prefix": prefix}
+        if token:
+            params["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**params)
+        for obj in resp.get("Contents", []) or []:
+            key = obj.get("Key")
+            if not key:
+                continue
+            if not key.endswith("manifest.json"):
+                continue
+            if latest is None or str(key) > latest:
+                latest = str(key)
+        token = resp.get("NextContinuationToken")
+        if not token:
+            break
+    return latest
+
+
+def _read_json_object(s3: BaseClient, bucket: str, key: str) -> Optional[Dict[str, Any]]:
+    """Read an S3 object and parse it as JSON."""
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=key)
+        raw = resp["Body"].read()
+        return json.loads(raw.decode("utf-8"))
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
+def _open_inventory_stream(body_bytes: bytes, key: str) -> io.TextIOBase:
+    """Open inventory file bytes as a text stream (supports .gz)."""
+    if key.endswith(".gz"):
+        gz = gzip.GzipFile(fileobj=io.BytesIO(body_bytes))
+        return io.TextIOWrapper(gz, encoding="utf-8", newline="")
+    return io.TextIOWrapper(io.BytesIO(body_bytes), encoding="utf-8", newline="")
+
+
+def _aggregate_inventory_csv(
+    s3: BaseClient,
+    dst_bucket: str,
+    file_keys: List[str],
+    schema: str,
+    logger: logging.Logger,
+) -> Tuple[int, float, Dict[str, float], bool, str]:
+    """Aggregate inventory CSV files.
+
+    Returns:
+      (object_count, total_bytes, bytes_by_storage_class, complete, note)
+    """
+    cols = [c.strip() for c in (schema or "").split(",") if c.strip()]
+    idx_size = cols.index("Size") if "Size" in cols else -1
+    idx_sc = cols.index("StorageClass") if "StorageClass" in cols else -1
+
+    if idx_size < 0:
+        return 0, 0.0, {}, False, "InventorySchemaMissingSize"
+
+    obj_count = 0
+    total_bytes = 0.0
+    by_sc: Dict[str, float] = {}
+
+    processed_files = 0
+    processed_bytes = 0
+
+    for key in file_keys:
+        if processed_files >= _INV_MAX_FILES:
+            return obj_count, total_bytes, by_sc, False, "InventoryPartialMaxFiles"
+        processed_files += 1
+
+        try:
+            resp = s3.get_object(Bucket=dst_bucket, Key=key)
+            raw = resp["Body"].read()
+        except ClientError as exc:
+            logger.debug("Inventory get_object failed: %s/%s: %s", dst_bucket, key, exc)
+            continue
+
+        processed_bytes += len(raw)
+        if processed_bytes > _INV_MAX_TOTAL_BYTES:
+            return obj_count, total_bytes, by_sc, False, "InventoryPartialMaxBytes"
+
+        stream = _open_inventory_stream(raw, key)
+        reader = csv.reader(stream)
+        try:
+            for row in reader:
+                if not row or len(row) <= idx_size:
+                    continue
+                try:
+                    size = float(row[idx_size] or 0.0)
+                except Exception:  # pylint: disable=broad-except
+                    size = 0.0
+
+                if size < 0.0:
+                    size = 0.0
+
+                obj_count += 1
+                total_bytes += size
+
+                if idx_sc >= 0 and len(row) > idx_sc:
+                    sc = (row[idx_sc] or "UNKNOWN").strip() or "UNKNOWN"
+                    by_sc[sc] = by_sc.get(sc, 0.0) + size
+        finally:
+            try:
+                stream.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+    return obj_count, total_bytes, by_sc, True, "InventoryComplete"
+
+
+def _inventory_fallback(
+    s3: BaseClient,
+    bucket_name: str,
+    logger: logging.Logger,
+) -> Tuple[Optional[int], Optional[float], Dict[str, float], Dict[str, Any]]:
+    """Try to compute bucket object count and size via S3 Inventory.
+
+    Returns:
+      object_count (or None), size_gb (or None), storageclass_gb (bytes->GiB map),
+      inv_signals (diagnostics)
+    """
+    inv_signals: Dict[str, Any] = {"InventoryUsed": False}
+
+    try:
+        configs = _list_inventory_configs(s3, bucket_name)
+    except ClientError as exc:
+        inv_signals["InventoryError"] = f"ListConfigsFailed:{exc.response.get('Error', {}).get('Code', 'Unknown')}"
+        return None, None, {}, inv_signals
+
+    # Pick the first enabled config (simple + deterministic)
+    chosen: Optional[Dict[str, Any]] = None
+    for cfg in configs:
+        if cfg.get("IsEnabled") is True:
+            chosen = cfg
+            break
+
+    if not chosen:
+        inv_signals["InventoryNote"] = "NoEnabledInventoryConfig"
+        return None, None, {}, inv_signals
+
+    inv_id = str(chosen.get("Id") or "inventory")
+    dest = (chosen.get("Destination") or {}).get("S3BucketDestination") or {}
+    dst_arn = str(dest.get("Bucket") or "")
+    dst_bucket = _parse_s3_arn_bucket(dst_arn)
+    if not dst_bucket:
+        inv_signals["InventoryNote"] = "InventoryDestinationBucketUnknown"
+        return None, None, {}, inv_signals
+
+    prefix = str(dest.get("Prefix") or "")
+    if prefix and not prefix.endswith("/"):
+        prefix = f"{prefix}/"
+
+    # Common inventory layout:
+    #   <prefix><source-bucket>/<config-id>/<YYYY-MM-DD>/manifest.json
+    base_prefix = f"{prefix}{bucket_name}/{inv_id}/"
+    manifest_key = _find_latest_manifest_key(s3, dst_bucket, base_prefix)
+
+    if not manifest_key:
+        inv_signals["InventoryNote"] = "NoManifestFound"
+        inv_signals["InventoryDestination"] = dst_bucket
+        inv_signals["InventoryBasePrefix"] = base_prefix
+        return None, None, {}, inv_signals
+
+    manifest = _read_json_object(s3, dst_bucket, manifest_key)
+    if not manifest:
+        inv_signals["InventoryNote"] = "ManifestUnreadable"
+        inv_signals["InventoryManifest"] = manifest_key
+        return None, None, {}, inv_signals
+
+    # Identify format and files
+    fmt = str((manifest.get("fileFormat") or manifest.get("format") or "")).upper()
+    schema = str(manifest.get("fileSchema") or "")
+    files = manifest.get("files") or []
+    file_keys: List[str] = []
+    for f in files:
+        k = f.get("key")
+        if k:
+            file_keys.append(str(k))
+
+    inv_signals["InventoryUsed"] = True
+    inv_signals["InventoryId"] = inv_id
+    inv_signals["InventoryDestination"] = dst_bucket
+    inv_signals["InventoryManifest"] = manifest_key
+    inv_signals["InventoryFormat"] = fmt
+
+    if not file_keys:
+        inv_signals["InventoryNote"] = "NoInventoryFiles"
+        return None, None, {}, inv_signals
+
+    # Only implement CSV/CSV.GZ aggregation (most common). ORC/Parquet skipped (safe).
+    if fmt not in {"CSV", "CSV_GZ", "CSV.GZ", ""}:
+        inv_signals["InventoryNote"] = "InventoryFormatUnsupported"
+        return None, None, {}, inv_signals
+
+    obj_count, total_bytes, by_sc_bytes, complete, note = _aggregate_inventory_csv(
+        s3=s3,
+        dst_bucket=dst_bucket,
+        file_keys=file_keys,
+        schema=schema,
+        logger=logger,
+    )
+
+    inv_signals["InventoryComplete"] = complete
+    inv_signals["InventoryNote"] = note
+    inv_signals["InventoryFilesSeen"] = min(len(file_keys), _INV_MAX_FILES)
+
+    size_gb = round(_bytes_to_gib(total_bytes), 3) if total_bytes > 0 else 0.0
+    by_sc_gb = {k: round(_bytes_to_gib(v), 3) for k, v in by_sc_bytes.items()}
+
+    return obj_count, size_gb, by_sc_gb, inv_signals
+
+
+# ---------------------------------------------------------------------------
+# Compliance helpers
+# ---------------------------------------------------------------------------
 
 def _acl_public_flags(acl: Dict[str, Any]) -> Tuple[bool, bool]:
     """Return (public_all_users, public_auth_users) from ACL grants."""
@@ -312,8 +575,16 @@ def _collect_bucket_metadata(
     except ClientError:
         info["Logging"] = "Unknown"
 
+    # Useful: Versioning enabled but no lifecycle (often leads to unbounded noncurrent versions)
+    if str(info.get("Versioning", "")).lower() == "enabled" and int(info.get("LifecycleRules") or 0) == 0:
+        flags.append("VersioningNoLifecycle")
+
     return info, flags
 
+
+# ---------------------------------------------------------------------------
+# Savings heuristic (enhanced with optional storage class breakdown)
+# ---------------------------------------------------------------------------
 
 def _lifecycle_savings_estimate(
     size_gb: float,
@@ -327,6 +598,7 @@ def _lifecycle_savings_estimate(
     version_fraction: float,
     min_size_gb_for_lifecycle: float,
     min_objects_for_versions: int,
+    std_portion_gb: Optional[float] = None,
 ) -> Tuple[Optional[float], List[str], Dict[str, Any], Optional[str]]:
     """Estimate potential monthly savings for bucket changes (heuristic)."""
     flags: List[str] = []
@@ -336,36 +608,36 @@ def _lifecycle_savings_estimate(
     if size_gb <= 0.0 or p_std <= 0.0:
         return None, flags, signals, breakdown
 
-    base_cost = size_gb * p_std
+    # If we know how much is Standard (from inventory), target lifecycle only on that portion.
+    std_target_gb = float(std_portion_gb) if isinstance(std_portion_gb, (int, float)) else float(size_gb)
+    std_target_gb = max(0.0, min(float(size_gb), std_target_gb))
+    base_cost = std_target_gb * p_std
 
-    # Heuristic: Lifecycle to IA/Glacier (only if no lifecycle already)
     best_saving: float = 0.0
     best_action: Optional[str] = None
 
-    if lifecycle_rules == 0 and size_gb >= float(min_size_gb_for_lifecycle):
-        cold_gb = size_gb * float(max(0.0, min(1.0, assumed_cold_fraction)))
-        warm_gb = size_gb - cold_gb
+    # Heuristic: Lifecycle to IA/Glacier (only if no lifecycle already)
+    if lifecycle_rules == 0 and std_target_gb >= float(min_size_gb_for_lifecycle):
+        cold_gb = std_target_gb * float(max(0.0, min(1.0, assumed_cold_fraction)))
+        warm_gb = std_target_gb - cold_gb
 
-        # IA option
         ia_cost = warm_gb * p_std + cold_gb * p_ia
         save_ia = max(0.0, base_cost - ia_cost)
 
-        # Glacier option
         gl_cost = warm_gb * p_std + cold_gb * p_glacier
         save_gl = max(0.0, base_cost - gl_cost)
 
         if save_ia > best_saving:
             best_saving = save_ia
             best_action = "AddLifecycleToIA"
-            breakdown = f"Base={base_cost:.2f}; IA={ia_cost:.2f}; Save={save_ia:.2f}"
+            breakdown = f"StdBase={base_cost:.2f}; Std+IA={ia_cost:.2f}; Save={save_ia:.2f}"
         if save_gl > best_saving:
             best_saving = save_gl
             best_action = "AddLifecycleToGlacier"
-            breakdown = f"Base={base_cost:.2f}; Glacier={gl_cost:.2f}; Save={save_gl:.2f}"
+            breakdown = f"StdBase={base_cost:.2f}; Std+Glacier={gl_cost:.2f}; Save={save_gl:.2f}"
 
     # Heuristic: Versioning overhead (if enabled and many objects)
     if str(versioning).lower() == "enabled" and objects >= int(min_objects_for_versions):
-        # estimate extra storage from versions
         extra_gb = size_gb * float(max(0.0, min(1.0, version_fraction)))
         extra_cost = extra_gb * p_std
         signals["VersioningExtraGB"] = round(extra_gb, 3)
@@ -380,7 +652,12 @@ def _lifecycle_savings_estimate(
         flags.append(best_action)
         signals["BestSavingUSD"] = round(best_saving, 2)
         signals["BestAction"] = best_action
+        if std_portion_gb is not None:
+            signals["StdPortionGBUsedForSavings"] = round(std_target_gb, 3)
         return round(best_saving, 2), flags, signals, breakdown
+
+    if std_portion_gb is not None:
+        signals["StdPortionGBUsedForSavings"] = round(std_target_gb, 3)
 
     return None, flags, signals, breakdown
 
@@ -433,6 +710,10 @@ def check_s3_cost_and_compliance(  # noqa: D401
 
     buckets_by_region = _list_buckets_by_region(s3)
 
+
+    # Cache inventory results so we don't read inventory multiple times per bucket
+    inv_cache: Dict[str, Tuple[Optional[int], Optional[float], Dict[str, float], Dict[str, Any]]] = {}
+
     for bucket_region, items in buckets_by_region.items():
         names = [n for n, _created in items]
         created_map = {n: c for n, c in items}
@@ -451,11 +732,39 @@ def check_s3_cost_and_compliance(  # noqa: D401
 
         for name in names:
             created_iso = created_map.get(name, "")
-            size_gb = float(sizes.get(name, 0.0))
-            objects = int(counts.get(name, 0))
+
+            cw_size_gb = float(sizes.get(name, 0.0))
+            cw_objects = int(counts.get(name, 0))
+
+            size_gb = cw_size_gb
+            objects = cw_objects
+            data_source = "cloudwatch"
+            inv_signals: Dict[str, Any] = {"InventoryUsed": False}
+
+            # Inventory fallback only when CW indicates empty
+            if cw_size_gb <= 0.0 and cw_objects <= 0:
+                if name not in inv_cache:
+                    inv_cache[name] = _inventory_fallback(s3=s3, bucket_name=name, logger=log)
+                inv_objects, inv_size_gb, by_sc_gb, inv_signals = inv_cache[name]
+
+                if isinstance(inv_objects, int) and isinstance(inv_size_gb, float):
+                    objects = max(0, inv_objects)
+                    size_gb = max(0.0, inv_size_gb)
+                    data_source = "inventory"
+                    inv_signals["InventoryStorageClassGB"] = by_sc_gb
 
             # Compliance metadata + flags
             meta, flags = _collect_bucket_metadata(s3, name)
+
+            # If inventory provides storage-class distribution, estimate "Standard portion"
+            std_portion_gb: Optional[float] = None
+            by_sc = inv_signals.get("InventoryStorageClassGB")
+            if isinstance(by_sc, dict):
+                # Inventory storage class strings are typically like: STANDARD, STANDARD_IA, GLACIER, DEEP_ARCHIVE...
+                # We'll treat these as already-cold, so lifecycle savings should target only "STANDARD".
+                std_gb = by_sc.get("STANDARD")
+                if isinstance(std_gb, (int, float)):
+                    std_portion_gb = float(std_gb)
 
             # Savings heuristic (lifecycle, versioning)
             best_saving, add_flags, signals, breakdown = _lifecycle_savings_estimate(
@@ -470,6 +779,7 @@ def check_s3_cost_and_compliance(  # noqa: D401
                 version_fraction=version_fraction,
                 min_size_gb_for_lifecycle=min_size_gb_for_lifecycle,
                 min_objects_for_versions=min_objects_for_versions,
+                std_portion_gb=std_portion_gb,
             )
             if breakdown:
                 signals["SavingsBreakdown"] = breakdown
@@ -477,8 +787,20 @@ def check_s3_cost_and_compliance(  # noqa: D401
             # Merge flags (dedup)
             flags = sorted(set(flags) | set(add_flags))
 
-            # Estimated bucket monthly cost (Standard baseline)
+            # Estimated monthly cost (baseline Standard per-GB-month).
+            # If we have storage class breakdown via inventory, cost is still baseline but we expose breakdown in signals.
             estimated_cost = round(size_gb * p_std, 2) if p_std > 0.0 else 0.0
+
+            # Signals
+            signals_blob: Dict[str, Any] = {
+                **meta,
+                **signals,
+                "StorageGB": round(size_gb, 3),
+                "ObjectCount": objects,
+                "StdGBMonthUSD": p_std,
+                "DataSource": data_source,
+                **inv_signals,
+            }
 
             try:
                 # type: ignore[call-arg]
@@ -497,15 +819,7 @@ def check_s3_cost_and_compliance(  # noqa: D401
                     potential_saving=best_saving,
                     flags=flags,
                     confidence=85 if best_saving else 70,
-                    signals=_signals_str(
-                        {
-                            **meta,
-                            **signals,
-                            "StorageGB": round(size_gb, 3),
-                            "ObjectCount": objects,
-                            "StdGBMonthUSD": p_std,
-                        }
-                    ),
+                    signals=_signals_str(signals_blob),
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 log.warning("[s3] write_row failed for %s: %s", name, exc)
