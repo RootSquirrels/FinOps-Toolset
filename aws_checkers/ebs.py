@@ -79,6 +79,16 @@ def _extract_writer_ec2_cw(
     return writer, ec2, cloudwatch
 
 
+def _is_managed_snapshot(tags: Dict[str, str]) -> bool:
+    # AWS Backup
+    if any(k.startswith("aws:backup:") for k in tags):
+        return True
+    # AWS DLM (some orgs use aws:dlm:*, others dlm:*)
+    if any(k.startswith("aws:dlm:") or k.startswith("dlm:") for k in tags):
+        return True
+    return False
+
+
 # ------------------------------- inventories ------------------------------- #
 
 @retry_with_backoff(exceptions=(ClientError,))
@@ -636,7 +646,7 @@ def check_ebs_volumes_and_snapshots(  # pylint: disable=unused-argument
                     },
                 )
 
-        if sid not in used_ids:
+        if sid not in used_ids and not _is_managed_snapshot(tags):
             _collect_row(
                 rows,
                 {
